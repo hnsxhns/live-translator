@@ -61,7 +61,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO APP_BUNDLE_ID="$BUNDLE_ID" MARKETING_VERSION="$MARKETING_VERSION" \
             CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
             | tee build/sim.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
-          test -d build/sim/Build/Products/Debug-iphonesimulator/LiveTranslator.app
+          grep -q "BUILD SUCCEEDED" build/sim.log || { grep -E "error:" build/sim.log | sort -u | head -20; exit 1; }
 
       - name: Run in iPad simulator
         working-directory: ipad/ios
@@ -108,6 +108,7 @@ jobs:
             APP_BUNDLE_ID="$BUNDLE_ID" MARKETING_VERSION="$MARKETING_VERSION" \
             CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
             | tee build/device.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" build/device.log || exit 1
           mkdir -p ipa/Payload
           cp -R build/device/Build/Products/Release-iphoneos/LiveTranslator.app ipa/Payload/
           (cd ipa && zip -qry ../LiveTranslator.ipa Payload)

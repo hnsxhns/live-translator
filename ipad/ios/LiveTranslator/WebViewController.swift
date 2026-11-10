@@ -101,8 +101,8 @@ final class WebViewController: UIViewController, WKUIDelegate, WKNavigationDeleg
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         guard let url = action.request.url else { return decisionHandler(.allow) }
-        let internal = (url.host == "127.0.0.1") || ["about", "blob", "data"].contains(url.scheme ?? "")
-        if internal { return decisionHandler(.allow) }
+        let inApp = (url.host == "127.0.0.1") || ["about", "blob", "data"].contains(url.scheme ?? "")
+        if inApp { return decisionHandler(.allow) }
         UIApplication.shared.open(url)
         decisionHandler(.cancel)
     }
