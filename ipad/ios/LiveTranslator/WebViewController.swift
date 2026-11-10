@@ -8,14 +8,6 @@ final class WebViewController: UIViewController, WKUIDelegate, WKNavigationDeleg
     private var server: LocalServer!
     private var webView: WKWebView!
     private let status = UILabel()
-    private let output = OutputFolder()
-
-    /// Answer a request from the page (window.ltNativeReply(id, result)).
-    private func reply(_ id: Any?, _ result: [String: Any]) {
-        guard let id, let json = try? JSONSerialization.data(withJSONObject: result),
-              let text = String(data: json, encoding: .utf8) else { return }
-        webView.evaluateJavaScript("window.ltNativeReply && window.ltNativeReply(\(id), \(text))")
-    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -126,25 +118,6 @@ final class WebViewController: UIViewController, WKUIDelegate, WKNavigationDeleg
             share(name: m["name"] as? String ?? "file", base64: m["b64"] as? String ?? "", text: m["text"] as? String)
         case "log":
             NSLog("LT: %@", (m["msg"] as? String) ?? "")
-        case "pickOutputFolder":                                   // Output Folder (Backup/, Outputs/)
-            let id = m["id"]
-            output.pick(from: self) { [weak self] name, error in
-                self?.reply(id, ["ok": name != nil, "name": name ?? "", "error": error ?? ""])
-            }
-        case "outputFolder":
-            reply(m["id"], ["name": OutputFolder.url()?.lastPathComponent ?? ""])
-        case "saveFile":
-            let id = m["id"]
-            guard let data = Data(base64Encoded: m["b64"] as? String ?? "") else {
-                reply(id, ["ok": false, "error": "dữ liệu file không hợp lệ"]); return
-            }
-            let err = OutputFolder.save(sub: m["sub"] as? String ?? "Outputs", name: m["name"] as? String ?? "file", data: data)
-            reply(id, ["ok": err == nil, "error": err ?? ""])
-        case "openBackup":
-            let id = m["id"]
-            output.pickBackup(from: self) { [weak self] name, text in
-                self?.reply(id, ["ok": text != nil, "name": name ?? "", "text": text ?? ""])
-            }
         default:
             break
         }

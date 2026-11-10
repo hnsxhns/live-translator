@@ -636,7 +636,6 @@ async function makeJournal(apiKey, lib, template, dayDocs, sessionText, instruct
   const name = `NhatKy_${safeName(stem(template.name))}_${isoDate(d).replaceAll("-", "")}_${pad(d.getHours())}${pad(d.getMinutes())}.pdf`;
   const bytes = await fillTemplate(buf, res.fields || [], res.placements || [], layout);
   const blob = new Blob([bytes], { type: "application/pdf" });
-  await idbPut("files", "journal/" + name, blob);
   return { name, blob, preview: res.preview || "" };
 }
 
@@ -1017,7 +1016,6 @@ export async function solutionPdf(lib, session, summary) {
   const bytes = await writePdf(blocks);
   const name = `LoiGiai_${safeName(ex.title).slice(0, 50)}_${isoDate(d).replaceAll("-", "")}_${pad(d.getHours())}${pad(d.getMinutes())}.pdf`;
   const blob = new Blob([bytes], { type: "application/pdf" });
-  await idbPut("files", "solution/" + name, blob);
   return { name, blob };
 }
 
@@ -1108,9 +1106,8 @@ export class LearningUI {
     item("📓  Journal — điền nhật ký buổi học (PDF)", () => this.journal(), n > 0);
     item("🏆  Certificate — chứng chỉ & chia sẻ", () => this.certificate());
     body.append(el("hr", "lsep"));
-    const out = this.app.outputFolderName();
-    item("📂  Output Folder — " + (out ? (out.length > 40 ? "…" + out.slice(-38) : out) : "chọn nơi lưu backup & kết quả"),
-         () => this.app.chooseOutputFolder());
+    const outs = (this.lib.data.outputs || []).length;
+    item(`📋  List Outputs — các file đã tạo${outs ? ` (${outs})` : ""}`, () => this.listOutputs());
     this.app.sheet("🎓 Learning", body);
   }
 
@@ -1153,11 +1150,130 @@ export class LearningUI {
     this.app.scrollEnd(w);
   }
 
-  /** A file made by the Learning menu: saved into <Output Folder>/Outputs when one is set (TestFlight app). */
-  async keepOutput(name, blob) {
-    const saved = await this.app.saveOutput("Outputs", name, blob);
-    if (saved) this.app.setStatus(`✓ Đã lưu vào Output Folder/Outputs: ${name}`, "ok");
-    return saved;
+  // ---- List Outputs: every file the app created (kept on the iPad), with clear names, sortable, tap to open ----
+  static OUT_KINDS = {
+    takeaways: ["📄", "Ý chính (Key takeaways)"],
+    journal: ["📓", "Nhật ký buổi học"],
+    solution: ["✏", "Lời giải bài tập"],
+    backup: ["💾", "Backup phiên nghe"],
+  };
+
+  /** Keep a file the app made and list it in List Outputs. title: what it is; info: {day, detail}. */
+  async addOutput(kind, name, blob, title, info = {}) {
+    await this.ready;
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    const key = "out/" + id;
+    await idbPut("files", key, blob);
+    (this.lib.data.outputs = this.lib.data.outputs || []).push({ id, key, kind, name, title: clean(title),
+      detail: clean(info.detail || ""), day: info.day || 0, created: new Date().toISOString(), size: blob.size,
+      type: blob.type || "application/octet-stream" });
+    await this.lib.save();
+  }
+
+  /** Files made by earlier versions (journals, solutions) that are not in the list yet. */
+  async adoptOldOutputs() {
+    const known = new Set((this.lib.data.outputs || []).map((o) => o.key));
+    const keys = await idb("files", "readonly", (s) => s.getAllKeys()).catch(() => []);
+    let added = false;
+    for (const key of keys || []) {
+      const k = String(key);
+      const kind = k.startsWith("solution/") ? "solution" : k.startsWith("journal/") ? "journal" : null;
+      if (!kind || known.has(k)) continue;
+      const name = k.slice(k.indexOf("/") + 1);
+      const m = /_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})\.pdf$/.exec(name);
+      const created = m ? new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]).toISOString() : new Date(0).toISOString();
+      const what = name.replace(/^(LoiGiai_|NhatKy_)/, "").replace(/_\d{8}_\d{4}\.pdf$/, "").replace(/_/g, " ");
+      const blob = await idbGet("files", k);
+      (this.lib.data.outputs = this.lib.data.outputs || []).push({ id: k, key: k, kind, name,
+        title: kind === "solution" ? `Lời giải: ${what}` : `Nhật ký: ${what}`, detail: "", day: 0, created,
+        size: blob?.size || 0, type: "application/pdf" });
+      added = true;
+    }
+    if (added) await this.lib.save();
+  }
+
+  async listOutputs() {
+    await this.ready;
+    await this.adoptOldOutputs();
+    const body = el("div", "lform");
+    const bar = el("div", "actions");
+    const sortSel = el("select", "wide");
+    for (const [v, t] of [["new", "Mới nhất trước"], ["old", "Cũ nhất trước"], ["kind", "Theo loại file"],
+                          ["name", "Theo tên (A → Z)"], ["day", "Theo buổi học"], ["size", "Theo dung lượng"]]) {
+      sortSel.append(new Option(t, v));
+    }
+    const kindSel = el("select", "wide");
+    kindSel.append(new Option("Tất cả loại file", ""));
+    for (const [k, [icon, label]] of Object.entries(LearningUI.OUT_KINDS)) kindSel.append(new Option(`${icon} ${label}`, k));
+    try { sortSel.value = localStorage.getItem("lt_out_sort") || "new"; } catch { /* private mode */ }
+    bar.append(el("b", "", "Sắp xếp:"), sortSel, el("b", "", "Lọc:"), kindSel);
+    const list = el("div", "outlist");
+    const info = el("p", "muted", "");
+    const fmtWhen = (iso) => {
+      const d = new Date(iso);
+      return d.getTime() ? `${pad(d.getHours())}:${pad(d.getMinutes())} · ${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}` : "";
+    };
+    const fmtSize = (n) => (n > 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1e3))} KB`);
+    const open = async (o) => {
+      const blob = await idbGet("files", o.key);
+      if (!blob) { alert("Không tìm thấy file này nữa."); return; }
+      openBlob(blob, o.name);
+    };
+    const fill = () => {
+      const outs = [...(this.lib.data.outputs || [])].filter((o) => !kindSel.value || o.kind === kindSel.value);
+      const by = sortSel.value;
+      const cmp = {
+        new: (a, b) => b.created.localeCompare(a.created),
+        old: (a, b) => a.created.localeCompare(b.created),
+        kind: (a, b) => a.kind.localeCompare(b.kind) || b.created.localeCompare(a.created),
+        name: (a, b) => a.title.localeCompare(b.title, "vi"),
+        day: (a, b) => (a.day || 999) - (b.day || 999) || b.created.localeCompare(a.created),
+        size: (a, b) => b.size - a.size,
+      }[by];
+      outs.sort(cmp);
+      list.replaceChildren();
+      let group = null;
+      for (const o of outs) {
+        const [icon, label] = LearningUI.OUT_KINDS[o.kind] || ["📄", "File"];
+        if (by === "kind" && group !== o.kind) { group = o.kind; list.append(el("div", "outgroup", `${icon} ${label}`)); }
+        if (by === "day") {
+          const g = o.day ? `Buổi ${o.day}` : "Không theo buổi";
+          if (group !== g) { group = g; list.append(el("div", "outgroup", g)); }
+        }
+        const row = el("div", "outrow");
+        const main = el("div", "outmain");
+        main.append(el("div", "outtitle", `${icon} ${o.title}`),
+                    el("div", "outmeta", [label, o.day ? `Buổi ${o.day}` : "", fmtWhen(o.created), fmtSize(o.size)].filter(Boolean).join(" · ")),
+                    ...(o.detail ? [el("div", "outmeta", o.detail)] : []),
+                    el("div", "outfile", o.name));
+        main.onclick = () => open(o);
+        const btns = el("div", "outbtns");
+        const openB = el("button", "", "Mở");
+        openB.onclick = () => open(o);
+        const shareB = el("button", "", "Lưu / Chia sẻ");
+        shareB.onclick = async () => { const b = await idbGet("files", o.key); if (b) shareBlob(b, o.name); };
+        const delB = el("button", "", "Xoá");
+        delB.onclick = async () => {
+          if (!confirm(`Xoá "${o.title}" khỏi danh sách và khỏi iPad?\nFile đã lưu ra ngoài (app Tệp, email...) không bị ảnh hưởng.`)) return;
+          await idbDel("files", o.key).catch(() => {});
+          this.lib.data.outputs = (this.lib.data.outputs || []).filter((x) => x.id !== o.id);
+          await this.lib.save();
+          fill();
+        };
+        btns.append(openB, shareB, delB);
+        row.append(main, btns);
+        list.append(row);
+      }
+      const total = (this.lib.data.outputs || []).length;
+      info.textContent = total
+        ? `${outs.length}/${total} file. Chạm vào một file để mở; “Lưu / Chia sẻ” để lưu vào app Tệp, gửi Mail, AirDrop...`
+        : "Chưa có file nào. Các file app tạo ra (Xuất PDF ý chính, Backup, nhật ký, lời giải bài tập) sẽ hiện ở đây.";
+    };
+    sortSel.onchange = () => { try { localStorage.setItem("lt_out_sort", sortSel.value); } catch { /* */ } fill(); };
+    kindSel.onchange = fill;
+    body.append(bar, info, list);
+    this.app.sheet("📋 List Outputs — các file đã tạo", body, true);
+    fill();
   }
 
   // ---- Folder / Refresh ----
@@ -1857,8 +1973,9 @@ export class LearningUI {
     } else if (kind === "exsummary" && ok && answer) {
       try {
         const out = await solutionPdf(this.lib, s, answer);
-        const kept = await this.keepOutput(out.name, out.blob);
-        this.chatNote(`Hoàn thành bài tập "${s.ex.title}". File PDF lời giải` + (kept ? " (đã lưu vào Output Folder/Outputs)" : "") + ":\n");
+        await this.addOutput("solution", out.name, out.blob, `Lời giải: ${s.ex.title}`,
+          { day: s.ex.day, detail: `${s.ex.steps.length} bước${s.ex.whole_file ? " · cả file" : ""}` });
+        this.chatNote(`Hoàn thành bài tập "${s.ex.title}". File PDF lời giải (cũng có trong 📋 List Outputs):\n`);
         this.fileLinks(out.name, out.blob);
       } catch (e) {
         this.chatNote(`Chưa tạo được file PDF lời giải: ${e.message || e}`, true);
@@ -1959,7 +2076,7 @@ export class LearningUI {
       `Hãy điền nhật ký buổi học cho ${when} theo đúng mẫu "${template.name}", dựa trên tài liệu của ` +
       "buổi này và nội dung thầy giảng trên màn hình. Viết ngắn gọn, cụ thể, đúng từng mục trong mẫu, " +
       "rồi trả lại file PDF đã điền để tải về.",
-      { kind: "journal", label: `Journal · ${when} · mẫu ${template.name.slice(0, 30)}`,
+      { kind: "journal", day, label: `Journal · ${when} · mẫu ${template.name.slice(0, 30)}`,
         doc_ids: docs.filter((x) => x.id !== template.id).map((x) => x.id), template: template.id });
   }
 
@@ -1976,7 +2093,10 @@ export class LearningUI {
     try {
       const out = await makeJournal(this.app.apiKey, this.lib, template, dayDocs, session, instruction);
       if (out.preview) emit("chat_piece", out.preview.trim() + "\n");
-      if (await this.keepOutput(out.name, out.blob)) emit("chat_piece", "(đã lưu vào Output Folder/Outputs)\n");
+      const when = (job.label || "").replace(/^Journal · /, "").replace(/ · mẫu .*$/, "");
+      await this.addOutput("journal", out.name, out.blob, `Nhật ký: ${when || "buổi học"}`,
+        { day: job.day || 0, detail: `Mẫu ${template.name}` });
+      emit("chat_piece", "(file cũng có trong 📋 List Outputs)\n");
       this.fileLinks(out.name, out.blob);
     } catch (e) {
       const why = e instanceof ClaudeError ? friendlyError(e) : String(e?.message || e).slice(0, 200);
