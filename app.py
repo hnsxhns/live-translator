@@ -22,7 +22,7 @@ import anthropic
 import numpy as np
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.7.2"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.7.3"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # Live words come from Vosk (streaming); Whisper base.en then corrects each finished utterance.
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base.en")
@@ -1056,8 +1056,11 @@ class MainWindow:
 
         root.title(f"Live Translator v{APP_VERSION} — EN → VI")
         root.resizable(True, True)
-        w, h = 1280, 800
-        root.geometry(f"{w}x{h}+{(root.winfo_screenwidth() - w) // 2}+{max(0, (root.winfo_screenheight() - h) // 2 - 30)}")
+        # 1280x800, but never bigger than the screen (small laptops, Mac "larger text", 150% scaling);
+        # leave room for the Mac menu bar / Dock or the Windows taskbar
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(1280, sw - 20), min(800, sh - (110 if IS_MAC else 80))
+        root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 2 - 30)}")
         root.minsize(700, 450)
 
         text_font = tkfont.Font(family=UI_FONT, size=13)

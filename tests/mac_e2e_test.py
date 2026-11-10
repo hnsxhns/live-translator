@@ -124,6 +124,10 @@ while not mw.ready and time.time() - t0 < 120:          # models loaded?
     root.update()
     time.sleep(0.05)
 check("speech_models_ready", mw.ready, f"{time.time() - t0:.1f}s")
+x, y, ww, wh = root.winfo_rootx(), root.winfo_rooty(), root.winfo_width(), root.winfo_height()
+sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+check("window_fits_screen", x >= 0 and y >= 0 and x + ww <= sw and y + wh <= sh,
+      f"window {ww}x{wh} at ({x},{y}), screen {sw}x{sh}")
 shot("2_main_ready")
 
 mw.toggle_onoff()                                         # ON -> starts listening (fake mic)
