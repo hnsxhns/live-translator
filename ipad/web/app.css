@@ -104,7 +104,7 @@ button { cursor: pointer; touch-action: manipulation; }
   padding: 0; }
 .edge.open { background: #8a8a8a; }
 .strip { position: relative; display: grid; min-height: 0; }
-.edgeLearn { position: absolute; left: 3px; bottom: 8px; width: 28px; height: 132px; border: 0; border-radius: 6px;
+.edgeLearn { position: absolute; left: 3px; bottom: 8px; width: 28px; height: 168px; border: 0; border-radius: 6px;
   background: #8a3f22; color: #fff; font-weight: 700; font-size: 12px; white-space: pre; line-height: 1.2; padding: 0; }
 .learnBtn { border: 0; border-radius: 6px; background: #f3e3dc; color: #8a3f22; font-weight: 700; font-size: 13px;
   padding: 0 8px; margin: 4px 0; }

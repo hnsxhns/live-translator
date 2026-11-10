@@ -49,12 +49,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * `prompt` is either the user's text or a full list of messages (multi-turn chat).
  */
 export async function claudeStream(apiKey, { system, prompt, effort, onPiece, model, thinking, maxTokens = 4000,
-                                             format, timeoutMs }) {
+                                             format, timeoutMs, retries = 1 }) {
   const messages = Array.isArray(prompt) ? prompt : [{ role: "user", content: prompt }];
   const m = model || MODEL;
   const usesFiles = JSON.stringify(messages).includes('"type":"file"');
   for (const useFallback of [true, false]) {
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt <= retries; attempt++) {
       const body = { model: m, max_tokens: maxTokens, system, messages, stream: true,
                      output_config: { effort } };
       if (format) body.output_config.format = format;           // structured (JSON schema) output
@@ -117,8 +117,8 @@ export async function claudeStream(apiKey, { system, prompt, effort, onPiece, mo
         const msg = String(e?.message || e).toLowerCase();
         // only the optional fallback setting is worth retrying without
         if (useFallback && !out && e instanceof ClaudeError && e.status === 400 && msg.includes("fallback")) break;
-        const retryable = !out && attempt === 0 && (!(e instanceof ClaudeError) || e.status === 429 ||
-                          e.status >= 500 || e.type === "overloaded_error");
+        const retryable = !out && attempt < retries && (!(e instanceof ClaudeError) || e.status === 429 ||
+                          e.status >= 500 || e.type === "overloaded_error" || e.type === "timeout");
         if (retryable) { await sleep(1500); continue; }
         throw e;
       } finally {
@@ -147,7 +147,7 @@ export async function askJson(apiKey, system, content, schema, { effort = "low",
   let last;
   for (const useFormat of [true, false]) {
     try {
-      const text = await claudeStream(apiKey, { system, prompt, effort, maxTokens, timeoutMs: LONG_TIMEOUT,
+      const text = await claudeStream(apiKey, { system, prompt, effort, maxTokens, timeoutMs: LONG_TIMEOUT, retries: 2,
                                                 format: useFormat ? { type: "json_schema", schema } : undefined });
       return parseJson(text);
     } catch (e) {
@@ -159,7 +159,7 @@ export async function askJson(apiKey, system, content, schema, { effort = "low",
 }
 
 export function parseJson(text) {
-  const t = text.trim().replace(/^```(?:json)?s*|s*```$/g, "");
+  const t = text.trim().replace(/^```(?:json)?\s*|\s*```$/g, "");
   const a = t.indexOf("{"), b = t.lastIndexOf("}");
   if (a < 0 || b < a) throw new Error("Claude không trả về JSON");
   return JSON.parse(t.slice(a, b + 1));

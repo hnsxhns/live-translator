@@ -14,6 +14,28 @@ import { LearningUI, shareBlob, takeawaysPdf } from "./learning.js";
 
 // Running inside the TestFlight app (ipad/ios): files ship in the app, updates come from TestFlight.
 const NATIVE = !!(window.LT_NATIVE && window.webkit?.messageHandlers?.lt);
+const nativeWaiting = new Map();
+let nativeSeq = 0;
+window.ltNativeReply = (id, result) => {
+  const done = nativeWaiting.get(id);
+  nativeWaiting.delete(id);
+  done?.(result);
+};
+/** Ask the TestFlight app to do something only it can (Output Folder); resolves with its answer. */
+function nativeCall(type, extra = {}) {
+  return new Promise((resolve) => {
+    const id = ++nativeSeq;
+    nativeWaiting.set(id, resolve);
+    window.webkit.messageHandlers.lt.postMessage({ type, id, ...extra });
+  });
+}
+async function toBase64(blob) {
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
 const LABEL = NATIVE ? `v${window.LT_NATIVE.version} (${window.LT_NATIVE.build})` : upd.BUILD_LABEL;
 
 const TEACHER_MINUTES = 10;   // whoever has spoken this long becomes "Teacher" (several -> Teacher 1, 2...)
@@ -234,7 +256,7 @@ class App {
     $("toggle").onclick = () => this.toggleOnOff();
     $("btnLogout").onclick = () => this.logout();
     $("btnBackup").onclick = () => this.backupSession();
-    $("btnRestore").onclick = () => $("restorePick").click();
+    $("btnRestore").onclick = () => this.pickRestore();
     $("restorePick").onchange = (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) this.restoreSession(f); };
     $("btnVersion").textContent = LABEL;
     $("btnVersion").onclick = () => this.showVersions();
@@ -630,6 +652,7 @@ class App {
         $("send").disabled = false;
         $("send").textContent = "Gửi ➤";
         if (!this.panelSide) { this.unread = true; this.refreshPanelBtn(); }
+        else $("prompt").focus({ preventScroll: true });
         // guided exercise: put the next step's prompt in the box (or finish the solution); links in the answer
         this.learning.onChatEnd(this.chatLog[this.chatLog.length - 1] || null, !this.chatFailed);
         break;
@@ -663,7 +686,8 @@ class App {
     if (!this.lastSummary.trim()) { alert("Chưa có ý chính nào để xuất."); return; }
     try {
       const { name, blob } = await takeawaysPdf(this.lastSummary);
-      if (await shareBlob(blob, name)) this.setStatus(`✓ Đã xuất PDF: ${name}`, "ok");
+      if (await this.saveOutput("Outputs", name, blob)) this.setStatus(`✓ Đã xuất PDF: ${name}  (Output Folder/Outputs)`, "ok");
+      else if (await shareBlob(blob, name)) this.setStatus(`✓ Đã xuất PDF: ${name}`, "ok");
     } catch (e) {
       alert("Không xuất được PDF: " + (e.message || e));
     }
@@ -781,12 +805,61 @@ class App {
     const name = `LiveTranslator_backup_${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}.json`;
     const file = new Blob([JSON.stringify(this.sessionData(), null, 1)], { type: "application/json" });
     try {
+      if (await this.saveOutput("Backup", name, file)) {
+        this.setStatus(`✓ Đã backup: ${name}  (Output Folder/Backup)`, "ok");
+        return;
+      }
       // iPad share sheet: "Lưu vào Tệp", AirDrop, Mail...
       if (!(await shareBlob(file, name))) return;
       this.setStatus(`✓ Đã backup: ${name}`, "ok");
     } catch (e) {
       if (e?.name !== "AbortError") alert("Backup lỗi: " + (e.message || e));
     }
+  }
+
+  // ---------------- Output Folder (as on the desktop: Backup/ and Outputs/) ----------------
+  outputFolderName() {
+    return loadConfig().output_folder || "";
+  }
+
+  async chooseOutputFolder() {
+    if (!NATIVE) {
+      alert("Output Folder cần app Live Translator cài qua TestFlight: trên trình duyệt, Safari không cho trang web " +
+            "tự ghi file vào một thư mục.\n\nỞ bản web, Backup và các file PDF được lưu qua nút Chia sẻ → “Lưu vào Tệp” " +
+            "(iPad nhớ thư mục bạn chọn lần trước).");
+      return;
+    }
+    const r = await nativeCall("pickOutputFolder");
+    if (!r?.ok) {
+      if (r?.error) alert("Không tạo được thư mục con: " + r.error);
+      return;
+    }
+    const cfg = loadConfig();
+    cfg.output_folder = r.name;
+    saveConfig(cfg);
+    this.setStatus(`✓ Output Folder: ${r.name}  (Backup, Outputs)`, "ok");
+    this.learning.chatNote(`Output Folder: ${r.name}\n• Backup/ — nơi mặc định để lưu và mở file backup\n` +
+                           "• Outputs/ — Key takeaways, nhật ký, lời giải bài tập được lưu tự động vào đây");
+  }
+
+  /** Save a file into <Output Folder>/<sub> (TestFlight app with a folder chosen). False if not possible. */
+  async saveOutput(sub, name, blob) {
+    if (!NATIVE || !this.outputFolderName()) return false;
+    const r = await nativeCall("saveFile", { sub, name, b64: await toBase64(blob) });
+    if (!r?.ok) {
+      this.setStatus(`Không lưu được vào Output Folder (${r?.error || "lỗi"}) — dùng Chia sẻ để lưu.`, "err");
+      return false;
+    }
+    return true;
+  }
+
+  async pickRestore() {
+    if (NATIVE && this.outputFolderName()) {
+      const r = await nativeCall("openBackup");
+      if (r?.ok) this.restoreSession(new File([r.text], r.name, { type: "application/json" }));
+      return;
+    }
+    $("restorePick").click();
   }
 
   async restoreSession(file) {
@@ -996,5 +1069,9 @@ window.app = app;
 $("sheetClose").onclick = () => $("sheet").close();
 upd.setPrefs({ last: upd.BUILD_ID });
 registerSW();
+if (NATIVE) nativeCall("outputFolder").then((r) => {
+  const cfg = loadConfig();
+  if ((r?.name || "") !== (cfg.output_folder || "")) { cfg.output_folder = r?.name || ""; saveConfig(cfg); }
+});
 app.showLogin();
 app.prepareModels();

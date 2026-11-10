@@ -134,7 +134,7 @@ export class Translator {
     try {
       out = await claudeStream(this.getKey(), {
         system: Translator.SYSTEM, prompt, effort: "low", model: this.model, thinking: this.thinking, maxTokens: 1500,
-        timeoutMs: 30_000,
+        timeoutMs: 20_000,
         onPiece: (p) => this.emit("vi_piece", [uid, g, p]),
       });
     } catch (e) {
@@ -210,7 +210,7 @@ export class Chatter {
       let answer = "";
       try {
         answer = await claudeStream(this.getKey(), { system: Chatter.SYSTEM, prompt: Chatter.withCache(messages),
-                                                     effort: "medium", maxTokens: 16000, timeoutMs: LONG_TIMEOUT,
+                                                     effort: "medium", maxTokens: 16000, timeoutMs: LONG_TIMEOUT, retries: 2,
                                                      onPiece: (p) => this.emit("chat_piece", p) });
       } catch (e) {
         this.emit("chat_error", `[${friendlyError(e)}]`);

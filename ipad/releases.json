@@ -78,6 +78,19 @@
         "Chờ Claude lâu hơn khi gửi kèm tài liệu (hết lỗi 'hết thời gian chờ' khi tạo Agenda).",
         "Bài tập lớn, Summary chọn file, Agenda chi tiết, link tên file, Xuất PDF ý chính (từ 1.8.3)."
       ]
+    },
+    {
+      "version": "1.8.5",
+      "build": 7,
+      "channel": "beta",
+      "date": "2026-11-11",
+      "notes": [
+        "Đủ tính năng như bản Windows 1.8.5.",
+        "📂 Output Folder (menu Learning): chọn một thư mục trong app Tệp; app tạo Backup/ và Outputs/ — Backup, Key takeaways, nhật ký, lời giải bài tập được lưu thẳng vào đó (app TestFlight).",
+        "Lưu sẵn câu trả lời: Agenda, Summary theo sách, Hỏi Claude về tài liệu mở ra ngay lần sau (có Tạo lại / Tạo mới / Hỏi lại).",
+        "Bài tập: tiến độ được lưu — mở lại để làm tiếp, hoặc tích 'Làm lại từ đầu'; các bước được chuẩn bị sẵn ngay khi chọn bài.",
+        "Giải từng bước gọn hơn: Claude mang kết quả sang bước sau, báo trước thông tin cần điền cho bước kế tiếp (mẫu điền sẵn trong ô nhập)."
+      ]
     }
   ]
 }
