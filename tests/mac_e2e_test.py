@@ -260,15 +260,25 @@ check("speakers_two_voices_two_labels", len(distinct) == 2,
 # --- EN/VI rows level ---
 mw._align_all()
 pump(1)
-diffs = []
-for tag in mw.left.tag_names():
-    if tag.startswith("b") and tag[1:].isdigit() and mw.right.tag_ranges(tag):
-        ya = mw.left.count("1.0", mw.left.tag_ranges(tag)[0], "update", "ypixels")
-        yb = mw.right.count("1.0", mw.right.tag_ranges(tag)[0], "update", "ypixels")
-        ya = (ya[0] if isinstance(ya, tuple) else ya) or 0
-        yb = (yb[0] if isinstance(yb, tuple) else yb) or 0
+def ypix(w, a, b):
+    v = w.count(a, b, "update", "ypixels")
+    return (v[0] if isinstance(v, tuple) else v) or 0
+
+
+diffs, rows = [], []
+for tag in sorted((t for t in mw.left.tag_names() if t.startswith("b") and t[1:].isdigit()), key=lambda t: int(t[1:])):
+    if mw.right.tag_ranges(tag):
+        uid = tag[1:]
+        ya, yb = ypix(mw.left, "1.0", mw.left.tag_ranges(tag)[0]), ypix(mw.right, "1.0", mw.right.tag_ranges(tag)[0])
         diffs.append(abs(ya - yb))
-check("en_vi_rows_level", diffs and max(diffs) <= 3, f"{len(diffs)} rows, max offset {max(diffs) if diffs else '-'} px")
+        rows.append({"uid": uid, "y_en": ya, "y_vi": yb,
+                     "h_en": mw._row_height(mw.left, int(uid)), "h_vi": mw._row_height(mw.right, int(uid)),
+                     "pad_en": mw.left.tag_cget(f"pad{uid}", "spacing3"), "pad_vi": mw.right.tag_cget(f"pad{uid}", "spacing3"),
+                     "en": mw.left.get(*mw.left.tag_ranges(tag))[:50], "vi": mw.right.get(*mw.right.tag_ranges(tag))[:30]})
+results["rows"] = rows
+results["totals"] = {"en": ypix(mw.left, "1.0", "end"), "vi": ypix(mw.right, "1.0", "end"),
+                     "tk": root.tk.call("info", "patchlevel")}
+check("en_vi_rows_level", diffs and max(diffs) <= 3, f"{len(diffs)} rows, offsets {diffs} px")
 
 # --- takeaways: timestamped, history kept ---
 mw.toggle_onoff()                                       # OFF -> final summary
@@ -311,15 +321,37 @@ for side in ("left", "right"):
         q = "Xin chào Claude, hãy tóm tắt bài học hôm nay giúp tôi: ắ ằ ẳ ẵ ặ ơ ư đ."
         mw.prompt.delete("1.0", "end")
         mw.prompt.insert("1.0", q)
-        mw.prompt.focus_set()
-        if isinstance(mw.prompt, tk.Text):              # Mac: Tk text box, press Enter for real
-            mw.prompt.event_generate("<Return>")
+        how = ""
+        if isinstance(mw.prompt, tk.Text):              # Mac: Tk text box
+            # a window started from a script is not the active app on macOS, so key presses may not
+            # reach it; try to bring it to the front first
+            subprocess.run(["osascript", "-e", 'tell application "System Events" to set frontmost of '
+                            f'(first process whose unix id is {os.getpid()}) to true'], capture_output=True)
+            root.lift()
+            mw.prompt.focus_force()
+            pump(0.5)
+            mw.prompt.event_generate("<KeyPress-Return>", keysym="Return")
+            pump(3)
+            how = "real Enter key event"
+            if mw.prompt.get("1.0", "end").strip():     # key not delivered: run the Enter binding itself
+                bound = mw.prompt.bind("<Return>")
+                class Ev: state = 0
+                mw._prompt_enter(Ev())
+                how = (f"key event not delivered (focus={root.focus_get()}); Enter binding present={bool(bound)},"
+                       " ran the Enter handler")
         else:                                            # Windows: native box (Enter is polled by the app)
             mw.prompt._enter = True
+            how = "native box Enter flag"
         pump(4)
         chat = mw.chat.get("1.0", "end")
-        check("enter_sends_prompt_vietnamese_intact", q in chat and mw.prompt.get("1.0", "end").strip() == "",
-              chat.strip()[:200])
+        check("enter_sends_prompt_vietnamese_intact",
+              q in chat and mw.prompt.get("1.0", "end").strip() == "" and (
+                  not isinstance(mw.prompt, tk.Text) or bool(mw.prompt.bind("<Return>"))),
+              f"{how}; chat: {chat.strip()[:160]}")
+        # Shift+Enter must make a new line, not send
+        class EvShift: state = 1
+        if isinstance(mw.prompt, tk.Text):
+            check("shift_enter_does_not_send", mw._prompt_enter(EvShift()) is None)
         shot("07_chat_answer")
     mw.toggle_panel(side)
     pump(0.5)
