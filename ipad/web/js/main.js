@@ -95,11 +95,46 @@ class App {
     $("loginVersion").textContent = LABEL;
     $("loginBtn").onclick = () => this.loginKey();
     $("key").onkeydown = (e) => { if (e.key === "Enter") this.loginKey(); };
+    // a key pasted by any means (long-press → Paste too) logs in at once
+    $("key").addEventListener("paste", () => setTimeout(() => this.keyEntered(), 0));
+    $("pasteKey").onclick = () => this.pasteKey();
+    $("getKey").addEventListener("click", () => {
+      $("loginStatus").textContent = "Sau khi copy key ở trang Claude, quay lại đây và bấm 📋 Dán.";
+      $("loginStatus").className = "status";
+    });
+    const guide = (open) => {
+      $("guide").hidden = !open;
+      $("guideBtn").setAttribute("aria-expanded", String(open));
+      $("guideBtn").textContent = open ? "❓ Ẩn hướng dẫn" : "❓ Hướng dẫn chi tiết";
+      if (open) $("guide").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    };
+    $("guideBtn").onclick = () => guide($("guide").hidden);
+    $("guideClose").onclick = () => guide(false);
     if (cfg.remember && cfg.api_key) {
       this.loginBusy(true, "Đang tự động đăng nhập...");
       checkKey(cfg.api_key).then(() => this.loginOk(cfg.api_key))
         .catch(() => this.loginFail("Phiên đăng nhập đã lưu không còn dùng được. Hãy đăng nhập lại."));
     }
+  }
+
+  /** Paste the key from the clipboard (iPad asks once to allow pasting). */
+  async pasteKey() {
+    try {
+      const text = (await navigator.clipboard.readText()).trim();
+      if (!text) throw new Error("empty");
+      $("key").value = text;
+      this.keyEntered();
+    } catch {
+      $("key").focus();
+      this.loginFail("Không đọc được bộ nhớ tạm. Chạm giữ vào ô nhập key → chọn Dán.");
+    }
+  }
+
+  keyEntered() {
+    const key = $("key").value.trim().replace(/\s+/g, "");
+    $("key").value = key;
+    if (/^sk-ant-[\w-]{20,}$/.test(key)) this.loginKey();
+    else if (key) this.loginFail("Đây chưa phải API key (key bắt đầu bằng sk-ant-). Xem ❓ Hướng dẫn chi tiết.");
   }
 
   loginBusy(on, msg) {

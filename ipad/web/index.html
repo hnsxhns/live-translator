@@ -20,17 +20,61 @@
 
 <!-- ============ Login ============ -->
 <div id="login" class="login" hidden>
+  <div class="loginWrap">
   <div class="card">
-    <h1>Đăng nhập bằng API key</h1>
+    <h1>Đăng nhập Claude</h1>
     <p class="sub">Live Translator cho iPad · <span id="loginVersion"></span></p>
-    <input id="key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="sk-ant-...">
+    <a id="getKey" class="getKey" href="https://platform.claude.com/settings/keys" target="_blank" rel="noopener">
+      <span class="gkIcon">1</span>
+      <span><b>Đăng nhập Claude bằng Google / email để lấy API key</b>
+        <small>Mở trang Claude → đăng nhập → Create Key → Copy, rồi quay lại đây</small></span>
+    </a>
+    <div class="step2"><span class="gkIcon">2</span> Dán key vừa copy rồi bấm Đăng nhập</div>
+    <div class="keyRow">
+      <input id="key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="sk-ant-...">
+      <button id="pasteKey" class="paste" type="button">📋 Dán</button>
+    </div>
     <label class="check"><input id="remember" type="checkbox" checked> Ghi nhớ đăng nhập (lần sau tự vào thẳng, không cần đăng nhập lại)</label>
     <button id="loginBtn" class="primary big">Đăng nhập</button>
     <div id="loginStatus" class="status"></div>
     <div class="progress" hidden><div class="track"><div class="bar"></div></div><span></span></div>
-    <p class="note">Lấy API key tại <b>platform.claude.com/settings/keys</b> (không nằm trong phần Settings của claude.ai).
-      Gói Ultra có sẵn $200/tháng tiền API: claude.ai → Settings → Billing → API credits → Link organization.
-      Đăng nhập bằng Google/email chỉ có trên bản máy tính.</p>
+    <button id="guideBtn" class="guideBtn" type="button" aria-expanded="false">❓ Hướng dẫn chi tiết</button>
+    <p class="note">Mỗi người đăng nhập bằng tài khoản Claude của chính mình: tiền dùng tính vào tài khoản đó, không ai phải chia sẻ key cho ai.</p>
+  </div>
+
+  <aside id="guide" class="guide" hidden>
+    <div class="guideHead"><b>Hướng dẫn lấy API key</b><button id="guideClose" class="link" type="button">Đóng ✕</button></div>
+    <ol class="steps">
+      <li><b>Bấm nút cam</b> “Đăng nhập Claude…”. Trang <b>platform.claude.com</b> mở ra trong Safari.</li>
+      <li><b>Đăng nhập:</b> chọn <b>Continue with Google</b> để dùng Gmail, hoặc nhập <b>email</b> rồi mở hộp thư bấm vào link / nhập mã Claude gửi.
+        Dùng đúng tài khoản Claude bạn đang có (Pro, Max, Ultra hoặc tài khoản mới đều được).</li>
+      <li><b>Lần đầu</b> Claude có thể hỏi tên tổ chức (organization): đặt tên bất kỳ, ví dụ tên của bạn.</li>
+      <li>Ở trang <b>API keys</b>, bấm <b>Create Key</b> → đặt tên (ví dụ “iPad”) → <b>Create</b>.</li>
+      <li>Bấm <b>Copy</b> để sao chép key (bắt đầu bằng <code>sk-ant-</code>).
+        Key chỉ hiện <b>một lần</b>: nếu lỡ đóng trước khi copy, tạo key mới.</li>
+      <li>Quay lại <b>Live Translator</b> (vuốt từ cạnh dưới để đổi app, hoặc chạm “‹ Live Translator” ở góc trên bên trái),
+        bấm <b>📋 Dán</b>. App tự đăng nhập khi dán đúng key.</li>
+      <li>Để tick <b>Ghi nhớ đăng nhập</b>: lần sau mở app là vào thẳng.</li>
+    </ol>
+    <h3>Tiền dùng</h3>
+    <ul>
+      <li>API tính tiền theo lượng dùng, tách riêng với gói Claude trên claude.ai. Nạp tiền ở platform.claude.com → <b>Settings → Billing</b>.</li>
+      <li>Gói <b>Ultra</b> có sẵn $200/tháng tiền API: claude.ai → Settings → Billing → <b>API credits → Link organization</b>, rồi tạo key trong đúng tổ chức đó.</li>
+      <li>Dịch ở chế độ “Nhanh (Sonnet)” rẻ hơn nhiều so với “Chất lượng cao (Opus)”.</li>
+    </ul>
+    <h3>Gặp lỗi?</h3>
+    <ul>
+      <li><b>“API key không hợp lệ”</b>: key bị copy thiếu hoặc đã bị xoá → tạo key mới và dán lại.</li>
+      <li><b>“Hết credit ($0)”</b>: nạp tiền hoặc liên kết gói Ultra như trên.</li>
+      <li><b>Nút cam không mở trang</b>: mở Safari, gõ <b>platform.claude.com/settings/keys</b>.</li>
+      <li><b>Nút Dán không chạy</b>: chạm giữ vào ô nhập key → chọn <b>Dán</b>.</li>
+    </ul>
+    <h3>An toàn</h3>
+    <ul>
+      <li>Key chỉ lưu trên iPad này. Không gửi key cho người khác.</li>
+      <li>Có thể xoá key bất cứ lúc nào ở trang API keys; app sẽ hỏi đăng nhập lại.</li>
+    </ul>
+  </aside>
   </div>
 </div>
 

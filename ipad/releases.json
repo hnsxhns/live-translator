@@ -37,6 +37,17 @@
         "🎓 Learning: thư viện tài liệu học, Agenda, Documents, Summary, Exercises, Journal (điền PDF), Certificate (chia sẻ qua Mail/WhatsApp).",
         "Backup/Restore dùng chung file với bản máy tính."
       ]
+    },
+    {
+      "version": "1.8.0",
+      "build": 4,
+      "channel": "beta",
+      "date": "2026-11-11",
+      "notes": [
+        "Đăng nhập dễ hơn: nút “Đăng nhập Claude bằng Google / email để lấy API key” mở thẳng trang tạo key, rồi chỉ cần bấm 📋 Dán là vào app.",
+        "Nút “❓ Hướng dẫn chi tiết” mở hướng dẫn từng bước bên cạnh: đăng nhập Gmail/email, tạo key, tiền dùng, cách xử lý lỗi.",
+        "Mỗi người dùng tài khoản Claude của chính mình, không ai phải chia sẻ key."
+      ]
     }
   ]
 }
