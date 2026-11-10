@@ -15,9 +15,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      # Official python.org Python (same 3.12.10 as the Windows build). Its Tk is recent enough
+      # for macOS input methods (Vietnamese Telex/VNI), which older Tk versions handle badly.
+      - name: Install Python 3.12.10 (python.org)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o py.pkg https://www.python.org/ftp/python/3.12.10/python-3.12.10-macos11.pkg
+          sudo installer -pkg py.pkg -target /
+          PY=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3
+          echo "PYTHON=$PY" >> "$GITHUB_ENV"
+          "$PY" -c "import sys, tkinter; print(sys.version); print('Tk', tkinter.Tcl().call('info', 'patchlevel'))"
+
+      # Anthropic's official `ant` CLI for "Sign in with Claude" (same v2.8.0 as vendor/ant.exe on Windows)
+      - name: Download ant CLI (macOS arm64)
+        run: |
+          set -euo pipefail
+          mkdir -p vendor
+          curl -fsSL -o ant.zip https://github.com/anthropics/anthropic-cli/releases/download/v2.8.0/ant_2.8.0_macos_arm64.zip
+          echo "5509dc1b4e03bdc97ee7fa790d617cc9d42cd81a8a25f2c60881fc4c2377569f  ant.zip" | shasum -a 256 -c
+          unzip -q -o ant.zip -d ant_x
+          mv "$(find ant_x -type f -name ant | head -1)" vendor/ant
+          chmod +x vendor/ant && rm -rf ant.zip ant_x
+          vendor/ant --version
 
       # Speech models are not in git (too big); fetch the same files from their official sources
       - name: Cache models
@@ -46,7 +65,7 @@ jobs:
           du -sh models/*
 
       - name: Build
-        run: PYTHON=python bash build_mac.sh
+        run: bash build_mac.sh
 
       - name: Upload .dmg
         uses: actions/upload-artifact@v4

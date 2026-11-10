@@ -22,7 +22,7 @@ import anthropic
 import numpy as np
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.7.0"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.7.1"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # Live words come from Vosk (streaming); Whisper base.en then corrects each finished utterance.
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base.en")
@@ -48,6 +48,58 @@ CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 UI_FONT = "Helvetica Neue" if IS_MAC else "Segoe UI"
 MONO_FONT = "Menlo" if IS_MAC else "Consolas"
 EMOJI_FONT = "Apple Color Emoji" if IS_MAC else "Segoe UI Emoji"
+
+
+class _FlatButton(tk.Label):
+    """Mac only: a Label that behaves like tk.Button. macOS draws tk.Button natively and ignores
+    bg/activebackground, so white-on-orange buttons became unreadable and the ON/OFF colors vanished."""
+    _SKIP = ("command", "overrelief", "default", "repeatdelay", "repeatinterval")
+
+    def __init__(self, master=None, cnf=None, **kw):
+        kw = {**(cnf or {}), **kw}
+        self._command = kw.pop("command", None)
+        for k in self._SKIP:
+            kw.pop(k, None)
+        kw.setdefault("cursor", "hand2")
+        kw.setdefault("padx", 6)
+        kw.setdefault("pady", 2)
+        kw.setdefault("activebackground", kw.get("bg", kw.get("background", "#e6e6e6")))
+        kw.setdefault("activeforeground", kw.get("fg", kw.get("foreground", "black")))
+        super().__init__(master, **kw)
+        self.bind("<Enter>", lambda e: self._on() and tk.Label.configure(self, state="active"))
+        self.bind("<Leave>", lambda e: self._on() and tk.Label.configure(self, state="normal"))
+        self.bind("<ButtonRelease-1>", self._release)
+
+    def _on(self):
+        return str(tk.Label.cget(self, "state")) != "disabled"
+
+    def _release(self, e):
+        if self._on() and 0 <= e.x < self.winfo_width() and 0 <= e.y < self.winfo_height():
+            self.invoke()
+
+    def invoke(self):
+        if self._command:
+            return self._command()
+
+    def configure(self, cnf=None, **kw):
+        if cnf is None and not kw:
+            return super().configure()
+        kw = {**(cnf or {}), **kw}
+        if "command" in kw:
+            self._command = kw.pop("command")
+        for k in self._SKIP:
+            kw.pop(k, None)
+        if kw:
+            return super().configure(**kw)
+
+    config = configure
+
+    def cget(self, key):
+        return self._command if key == "command" else super().cget(key)
+
+
+if IS_MAC:
+    tk.Button = _FlatButton
 
 
 def whisper_model_path():
@@ -1029,6 +1081,8 @@ class MainWindow:
         om.config(font=(UI_FONT, 9), bg="#3a3a3a", fg="#ddd", activebackground="#4a4a4a",
                   activeforeground="white", relief="flat", highlightthickness=0, bd=0)
         om["menu"].config(font=(UI_FONT, 9))
+        if IS_MAC:
+            om.config(fg="black")
         om.pack(side="right", padx=(0, 10), pady=5)
         tk.Label(top, text="Dịch:", bg="#2b2b2b", fg="#aaa", font=(UI_FONT, 9)).pack(side="right")
         bstyle = dict(font=(UI_FONT, 9), relief="flat", bg="#3a3a3a", fg="#ddd", activebackground="#4a4a4a",
@@ -1250,7 +1304,10 @@ class MainWindow:
 
     def _wheel(self, event):                       # mouse wheel over English or Vietnamese
         w = event.widget
-        w.yview_scroll(-3 if event.delta > 0 else 3, "units")
+        if IS_MAC:
+            w.yview_scroll(-event.delta, "units")    # Mac: small deltas, many events (trackpad)
+        else:
+            w.yview_scroll(-3 if event.delta > 0 else 3, "units")
         self._sync_from(w, self.right if w is self.left else self.left)
         self._user_scrolled()
         return "break"

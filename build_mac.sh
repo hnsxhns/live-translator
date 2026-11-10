@@ -66,6 +66,9 @@ rm -f "$SELFTEST"
 "$APP/Contents/MacOS/$NAME" --selftest || true
 echo "--- selftest ---"; cat "$SELFTEST" 2>/dev/null || echo "(no selftest.txt)"; echo
 grep -q '^OK' "$SELFTEST" 2>/dev/null || { echo "Selftest failed"; exit 1; }
+if [ -f vendor/ant ]; then   # the "Sign in with Claude" tool must be inside the app, not just on this Mac
+  grep -q "^ant: .*\.app/.*vendor/ant$" "$SELFTEST" || { echo "Selftest: bundled ant not found"; exit 1; }
+fi
 
 # ONE file to copy to other Macs: a .dmg with the app and an Applications shortcut
 STAGE="build/mac/dmg"
