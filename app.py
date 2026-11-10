@@ -22,7 +22,7 @@ import anthropic
 import numpy as np
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.6.2"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.7.0"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # Live words come from Vosk (streaming); Whisper base.en then corrects each finished utterance.
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base.en")
@@ -35,7 +35,19 @@ TEACHER_MINUTES = 10             # whoever has spoken this long becomes "Teacher
 SUMMARY_EVERY = 25.0             # refresh key takeaways this often (seconds)
 # Folder next to the .exe (portable) or next to app.py.
 APP_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+IS_MAC = sys.platform == "darwin"
+# Where settings are saved. On Mac the .app bundle is read-only (and signed), so use the user's
+# Application Support folder there; on Windows keep config.json next to the .exe (portable).
+if IS_MAC and getattr(sys, "frozen", False):
+    DATA_DIR = os.path.join(os.path.expanduser("~/Library/Application Support"), "LiveTranslator")
+    os.makedirs(DATA_DIR, exist_ok=True)
+else:
+    DATA_DIR = APP_DIR
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+# Fonts: Segoe UI / Consolas only exist on Windows
+UI_FONT = "Helvetica Neue" if IS_MAC else "Segoe UI"
+MONO_FONT = "Menlo" if IS_MAC else "Consolas"
+EMOJI_FONT = "Apple Color Emoji" if IS_MAC else "Segoe UI Emoji"
 
 
 def whisper_model_path():
@@ -74,7 +86,7 @@ def find_ant():
     """Locate Anthropic's official `ant` CLI (bundled in vendor/ or on PATH)."""
     for base in (getattr(sys, "_MEIPASS", None), APP_DIR):
         if base:
-            p = os.path.join(base, "vendor", "ant.exe")
+            p = os.path.join(base, "vendor", "ant.exe" if sys.platform == "win32" else "ant")
             if os.path.exists(p):
                 return p
     return shutil.which("ant")
@@ -101,11 +113,11 @@ class LoginWindow:
         frm.pack(fill="both", expand=True)
         bg = "#faf9f5"
 
-        tk.Label(frm, text="Đăng nhập bằng tài khoản Claude", font=("Segoe UI", 15, "bold"), bg=bg).pack(anchor="w")
+        tk.Label(frm, text="Đăng nhập bằng tài khoản Claude", font=(UI_FONT, 15, "bold"), bg=bg).pack(anchor="w")
         tk.Label(frm, text="Trang đăng nhập chính thức của Claude sẽ mở trong trình duyệt.",
-                 font=("Segoe UI", 9), fg="#555", bg=bg).pack(anchor="w", pady=(4, 14))
+                 font=(UI_FONT, 9), fg="#555", bg=bg).pack(anchor="w", pady=(4, 14))
 
-        style = dict(font=("Segoe UI", 11), relief="solid", bd=1, cursor="hand2", anchor="center")
+        style = dict(font=(UI_FONT, 11), relief="solid", bd=1, cursor="hand2", anchor="center")
         self.btn_google = tk.Button(frm, text="G   Tiếp tục với Google", bg="white", activebackground="#eee",
                                     command=self.login_account, **style)
         self.btn_google.pack(fill="x", ipady=6)
@@ -117,11 +129,11 @@ class LoginWindow:
         self.code_frame = tk.Frame(frm, bg="#fff4e5", padx=10, pady=8, bd=1, relief="solid")
         tk.Label(self.code_frame, text="Sau khi đăng nhập trên web, nếu trang hiển thị một MÃ (code),\n"
                                        "hãy copy và dán mã đó vào đây rồi bấm Xác nhận:",
-                 bg="#fff4e5", font=("Segoe UI", 9), justify="left").pack(anchor="w")
+                 bg="#fff4e5", font=(UI_FONT, 9), justify="left").pack(anchor="w")
         row = tk.Frame(self.code_frame, bg="#fff4e5")
         row.pack(fill="x", pady=(6, 0))
         self.code_var = tk.StringVar()
-        self.code_entry = tk.Entry(row, textvariable=self.code_var, font=("Consolas", 11))
+        self.code_entry = tk.Entry(row, textvariable=self.code_var, font=(MONO_FONT, 11))
         self.code_entry.pack(side="left", fill="x", expand=True, ipady=3)
         self.code_entry.bind("<Return>", lambda e: self.submit_code())
         tk.Button(row, text="Xác nhận", bg="#d97757", fg="white", relief="flat",
@@ -138,11 +150,11 @@ class LoginWindow:
         self.code_try = 0
 
         self.divider = tk.Label(frm, text="──────────  hoặc dùng API key  ──────────", fg="#999", bg=bg,
-                                font=("Segoe UI", 9))
+                                font=(UI_FONT, 9))
         self.divider.pack(pady=(16, 8))
 
         self.key_var = tk.StringVar(value=os.environ.get("ANTHROPIC_API_KEY") or load_config().get("api_key", ""))
-        self.entry = tk.Entry(frm, textvariable=self.key_var, show="•", font=("Segoe UI", 11))
+        self.entry = tk.Entry(frm, textvariable=self.key_var, show="•", font=(UI_FONT, 11))
         self.entry.pack(fill="x", ipady=4)
         self.entry.bind("<Return>", lambda e: self.login_key())
 
@@ -150,11 +162,11 @@ class LoginWindow:
         tk.Checkbutton(frm, text="Ghi nhớ đăng nhập (lần sau tự vào thẳng, không cần đăng nhập lại)",
                        variable=self.remember, bg=bg, wraplength=400, justify="left").pack(anchor="w", pady=(4, 0))
 
-        self.btn = tk.Button(frm, text="Đăng nhập bằng API key", font=("Segoe UI", 11, "bold"), bg="#d97757",
+        self.btn = tk.Button(frm, text="Đăng nhập bằng API key", font=(UI_FONT, 11, "bold"), bg="#d97757",
                              fg="white", activebackground="#c4643f", relief="flat", command=self.login_key)
         self.btn.pack(fill="x", pady=(8, 4), ipady=3)
 
-        self.status = tk.Label(frm, text="", font=("Segoe UI", 9), fg="#c0392b", wraplength=420,
+        self.status = tk.Label(frm, text="", font=(UI_FONT, 9), fg="#c0392b", wraplength=420,
                                justify="left", bg=bg)
         self.status.pack(anchor="w")
 
@@ -235,7 +247,7 @@ class LoginWindow:
             pass
         ant = find_ant()
         if not ant:
-            self.root.after(0, self._fail, "Thiếu công cụ đăng nhập Claude (vendor\\ant.exe). "
+            self.root.after(0, self._fail, "Thiếu công cụ đăng nhập Claude (vendor/ant). "
                                            "Hãy dùng API key bên dưới.")
             return
         try:
@@ -996,30 +1008,30 @@ class MainWindow:
         root.geometry(f"{w}x{h}+{(root.winfo_screenwidth() - w) // 2}+{max(0, (root.winfo_screenheight() - h) // 2 - 30)}")
         root.minsize(700, 450)
 
-        text_font = tkfont.Font(family="Segoe UI", size=13)
-        head_font = ("Segoe UI", 10, "bold")
+        text_font = tkfont.Font(family=UI_FONT, size=13)
+        head_font = (UI_FONT, 10, "bold")
 
         # top bar
         top = tk.Frame(root, bg="#2b2b2b", height=40)
         top.grid(row=0, column=0, columnspan=4, sticky="ew")
-        self.status = tk.Label(top, text="Nhấn ON để bắt đầu.", bg="#2b2b2b", fg="#ddd", font=("Segoe UI", 10))
+        self.status = tk.Label(top, text="Nhấn ON để bắt đầu.", bg="#2b2b2b", fg="#ddd", font=(UI_FONT, 10))
         self.status.pack(side="left", padx=12, pady=6)
-        self.toggle = tk.Button(top, text="OFF", width=7, font=("Segoe UI", 10, "bold"), relief="flat",
+        self.toggle = tk.Button(top, text="OFF", width=7, font=(UI_FONT, 10, "bold"), relief="flat",
                                 bg="#777", fg="white", activebackground="#555", command=self.toggle_onoff)
         self.toggle.pack(side="right", padx=10, pady=5)
-        tk.Button(top, text="Đăng xuất", font=("Segoe UI", 9), relief="flat", bg="#2b2b2b", fg="#bbb",
+        tk.Button(top, text="Đăng xuất", font=(UI_FONT, 9), relief="flat", bg="#2b2b2b", fg="#bbb",
                   activebackground="#444", cursor="hand2", command=self.logout).pack(side="right", pady=5)
         # translation speed / quality choice (remembered)
         self.preset_var = tk.StringVar(value=load_config().get("translate_preset", DEFAULT_PRESET))
         if self.preset_var.get() not in TRANSLATE_PRESETS:
             self.preset_var.set(DEFAULT_PRESET)
         om = tk.OptionMenu(top, self.preset_var, *TRANSLATE_PRESETS, command=self._set_preset)
-        om.config(font=("Segoe UI", 9), bg="#3a3a3a", fg="#ddd", activebackground="#4a4a4a",
+        om.config(font=(UI_FONT, 9), bg="#3a3a3a", fg="#ddd", activebackground="#4a4a4a",
                   activeforeground="white", relief="flat", highlightthickness=0, bd=0)
-        om["menu"].config(font=("Segoe UI", 9))
+        om["menu"].config(font=(UI_FONT, 9))
         om.pack(side="right", padx=(0, 10), pady=5)
-        tk.Label(top, text="Dịch:", bg="#2b2b2b", fg="#aaa", font=("Segoe UI", 9)).pack(side="right")
-        bstyle = dict(font=("Segoe UI", 9), relief="flat", bg="#3a3a3a", fg="#ddd", activebackground="#4a4a4a",
+        tk.Label(top, text="Dịch:", bg="#2b2b2b", fg="#aaa", font=(UI_FONT, 9)).pack(side="right")
+        bstyle = dict(font=(UI_FONT, 9), relief="flat", bg="#3a3a3a", fg="#ddd", activebackground="#4a4a4a",
                       activeforeground="white", cursor="hand2", padx=8)
         tk.Button(top, text="📂 Restore", command=self.restore_session, **bstyle).pack(side="right", padx=(0, 12), pady=5)
         tk.Button(top, text="💾 Backup", command=self.backup_session, **bstyle).pack(side="right", padx=(0, 4), pady=5)
@@ -1102,10 +1114,10 @@ class MainWindow:
         self.attachments = []          # [(display name, content block for Claude)]
         row = self.prompt_row = tk.Frame(pf, bg="white")
         row.pack(fill="both", expand=True)
-        self.send_btn = tk.Button(row, text="Gửi ➤", font=("Segoe UI", 10, "bold"), bg="#d97757", fg="white",
+        self.send_btn = tk.Button(row, text="Gửi ➤", font=(UI_FONT, 10, "bold"), bg="#d97757", fg="white",
                                   activebackground="#c4643f", relief="flat", cursor="hand2", command=self.send_prompt)
         self.send_btn.pack(side="right", fill="y", padx=6, pady=6)
-        self.attach_btn = tk.Button(row, text="📎", font=("Segoe UI Emoji", 13), bg="white", relief="flat",
+        self.attach_btn = tk.Button(row, text="📎", font=(EMOJI_FONT, 13), bg="white", relief="flat",
                                     activebackground="#eee", cursor="hand2", command=self.attach_files)
         self.attach_btn.pack(side="right", fill="y", pady=6)
         # Native Windows text box: works with every Vietnamese input method (Tk's Text does not)
@@ -1116,7 +1128,7 @@ class MainWindow:
             self.prompt = NativeEdit(host, self.send_prompt)
         except Exception:  # noqa: BLE001  (not Windows, or the control could not be created)
             host.destroy()
-            self.prompt = tk.Text(row, wrap="word", font=("Segoe UI", 12), bd=0, padx=10, pady=6, height=3)
+            self.prompt = tk.Text(row, wrap="word", font=(UI_FONT, 12), bd=0, padx=10, pady=6, height=3)
             self.prompt.pack(side="left", fill="both", expand=True)
             self.prompt.bind("<Return>", self._prompt_enter)
         self.claude_panel.add(pf, minsize=70)
@@ -1129,7 +1141,7 @@ class MainWindow:
         self.unread = False
         self.body_ratio = 0.75         # EN/VI share of the height (Key takeaways = the rest)
         self.chat_ratio = 0.80         # answers share of the Claude panel (prompt box = the rest)
-        btn = dict(font=("Segoe UI", 9, "bold"), relief="flat", bd=0, fg="white",
+        btn = dict(font=(UI_FONT, 9, "bold"), relief="flat", bd=0, fg="white",
                    activeforeground="white", cursor="hand2")
         self.panel_btns = {
             "left": tk.Button(strip_l, command=lambda: self.toggle_panel("left"), **btn),
@@ -1138,6 +1150,8 @@ class MainWindow:
         for b in self.panel_btns.values():
             b.place(relx=0.5, rely=0.5, anchor="center", width=26, height=230)
         root.bind_all("<Control-k>", lambda e: self.toggle_panel("right"))
+        if IS_MAC:
+            root.bind_all("<Command-k>", lambda e: self.toggle_panel("right"))
         self._refresh_panel_btn()
         # keep the pane proportions when the window is resized (a dragged divider sets a new ratio)
         self.body.bind("<Configure>", lambda e: self._place_sashes())
@@ -1329,8 +1343,8 @@ class MainWindow:
             chip = tk.Frame(self.attach_bar, bg="#f3e3dc")
             chip.pack(side="left", padx=(6, 0), pady=(4, 0))
             short = name if len(name) <= 28 else name[:25] + "..."
-            tk.Label(chip, text="📎 " + short, bg="#f3e3dc", font=("Segoe UI", 9)).pack(side="left", padx=(6, 2))
-            tk.Button(chip, text="✕", bg="#f3e3dc", relief="flat", bd=0, font=("Segoe UI", 8), cursor="hand2",
+            tk.Label(chip, text="📎 " + short, bg="#f3e3dc", font=(UI_FONT, 9)).pack(side="left", padx=(6, 2))
+            tk.Button(chip, text="✕", bg="#f3e3dc", relief="flat", bd=0, font=(UI_FONT, 8), cursor="hand2",
                       command=lambda i=i: (self.attachments.pop(i), self._refresh_attach_bar())).pack(side="left",
                                                                                                 padx=(0, 4))
         self.attach_bar.pack(fill="x", before=self.prompt_row)
@@ -1896,7 +1910,7 @@ def selftest():
                f"ant: {find_ant()}")
     except Exception as e:  # noqa: BLE001
         msg = f"FAIL {e!r}"
-    with open(os.path.join(APP_DIR, "selftest.txt"), "w", encoding="utf-8") as f:
+    with open(os.path.join(DATA_DIR, "selftest.txt"), "w", encoding="utf-8") as f:
         f.write(msg)
 
 
@@ -1910,6 +1924,8 @@ def main():
         windll.shcore.SetProcessDpiAwareness(1)  # crisp text on high-DPI screens
     except Exception:
         pass
+    if IS_MAC:
+        root.tk.call("tk", "scaling", 1.33)     # Mac Tk draws fonts ~25% smaller; match the Windows look
 
     def start_main(client):
         for w in root.winfo_children():
