@@ -1,0 +1,8 @@
+anthropic
+faster-whisper
+ctranslate2==4.6.0
+setuptools<81
+vosk
+sounddevice
+numpy
+sherpa-onnx

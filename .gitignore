@@ -1,0 +1,15 @@
+# Python
+.venv/
+.venv-mac/
+__pycache__/
+*.pyc
+# Build output (kept on disk, not in git)
+build/
+dist/
+build.log
+# Large model files and bundled binaries (copy these folders by hand)
+models/
+vendor/
+# Local settings / logins
+config.json
+selftest.txt
