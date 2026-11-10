@@ -11,7 +11,7 @@ on:
 jobs:
   build:
     runs-on: macos-15          # Apple Silicon (M1 and newer)
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 

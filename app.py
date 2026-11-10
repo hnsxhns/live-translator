@@ -22,7 +22,7 @@ import anthropic
 import numpy as np
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.7.1"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.7.2"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # Live words come from Vosk (streaming); Whisper base.en then corrects each finished utterance.
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base.en")
@@ -1996,4 +1996,8 @@ def main():
 
 
 if __name__ == "__main__":
+    # Must come first. On Mac, Python's multiprocessing starts helper processes (resource tracker)
+    # by running this same app file; without this each helper opened the whole app again, forever.
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()

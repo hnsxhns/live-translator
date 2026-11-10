@@ -63,7 +63,21 @@ codesign --force --deep --sign - "$APP"
 # Quick check that the bundled speech models load (stop the build if they do not)
 SELFTEST="$HOME/Library/Application Support/LiveTranslator/selftest.txt"
 rm -f "$SELFTEST"
-"$APP/Contents/MacOS/$NAME" --selftest || true
+"$APP/Contents/MacOS/$NAME" --selftest &
+PID=$!
+for _ in $(seq 300); do kill -0 "$PID" 2>/dev/null || break; sleep 1; done   # at most 5 minutes
+if kill -0 "$PID" 2>/dev/null; then
+  echo "Selftest hung (still running after 5 minutes)"
+  pkill -f "$APP/Contents/MacOS/" || true
+  exit 1
+fi
+sleep 3
+# The app must not leave extra copies of itself running (that happened once on Mac)
+if pgrep -f "$APP/Contents/MacOS/" >/dev/null; then
+  echo "Selftest left app processes running:"; pgrep -fl "$APP/Contents/MacOS/" || true
+  pkill -f "$APP/Contents/MacOS/" || true
+  exit 1
+fi
 echo "--- selftest ---"; cat "$SELFTEST" 2>/dev/null || echo "(no selftest.txt)"; echo
 grep -q '^OK' "$SELFTEST" 2>/dev/null || { echo "Selftest failed"; exit 1; }
 if [ -f vendor/ant ]; then   # the "Sign in with Claude" tool must be inside the app, not just on this Mac
