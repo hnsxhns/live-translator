@@ -8,3 +8,4 @@ numpy
 sherpa-onnx
 pymupdf
 pillow
+pyyaml

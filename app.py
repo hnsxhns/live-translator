@@ -24,8 +24,11 @@ import numpy as np
 import learning
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.8.1"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.8.4"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
+# The login client waits at most 20 s for data (right for live translation). Chat and the Learning menu send
+# whole documents, and Claude can read/think longer than that before the first word: give them more time.
+LONG_TIMEOUT = anthropic.Timeout(300.0, connect=15.0)
 # Live words come from Vosk (streaming); Whisper base.en then corrects each finished utterance.
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base.en")
 SAMPLE_RATE = 16000
@@ -61,6 +64,16 @@ def load_config():
             return json.load(f)
     except Exception:
         return {}
+
+
+def output_dir(sub):
+    """<Output Folder>/<sub> ("Backup" or "Outputs"), created if missing; None if no Output Folder is set."""
+    root = load_config().get("output_folder")
+    if not root or not os.path.isdir(root):
+        return None
+    d = os.path.join(root, sub)
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 def save_config(cfg):
@@ -789,6 +802,8 @@ def friendly_error(e):
         return "Tài khoản không có quyền dùng model này."
     if isinstance(e, anthropic.RateLimitError):
         return "Đang gửi quá nhiều yêu cầu (rate limit). Ứng dụng sẽ tự thử lại."
+    if isinstance(e, anthropic.APITimeoutError) or "timed out" in s:
+        return "Claude phản hồi quá lâu nên hết thời gian chờ. Hãy bấm gửi lại."
     if isinstance(e, anthropic.APIConnectionError):
         return "Mất kết nối tới Claude. Kiểm tra mạng."
     return f"Lỗi Claude: {str(e)[:160]}"
@@ -913,7 +928,7 @@ class Chatter(threading.Thread):
 
     def __init__(self, client, ui_q, get_context):
         super().__init__(daemon=True)
-        self.client = client
+        self.client = client.with_options(timeout=LONG_TIMEOUT, max_retries=2)   # questions may carry documents
         self.ui_q = ui_q
         self.get_context = get_context
         self.q = queue.Queue()
@@ -977,8 +992,8 @@ class Summarizer(threading.Thread):
 
     def __init__(self, client, ui_q, get_transcript, get_takeaways):
         super().__init__(daemon=True)
-        # short timeout: a stuck request must not stop the takeaways for long
-        self.client = client.with_options(timeout=120.0, max_retries=1)
+        # a stuck request must not stop the takeaways for long (but Claude may think for a while)
+        self.client = client.with_options(timeout=60.0, max_retries=1)
         self.ui_q = ui_q
         self.get_transcript = get_transcript      # (start, end) -> transcript text of those entries
         self.get_takeaways = get_takeaways
@@ -1112,6 +1127,10 @@ class MainWindow:
         self.left.configure(yscrollcommand=lambda a, b: self._on_text_scroll(self.left, a, b))
         self.right.configure(yscrollcommand=lambda a, b: self._on_text_scroll(self.right, a, b))
         self.bottom = pane(self.body, "Ý chính / Key takeaways")
+        # export the whole takeaways history as a PDF (button on the right of the pane's title bar)
+        tk.Button(self.bottom.master, text="📄 Xuất PDF", font=("Segoe UI", 8), relief="flat", bd=0, padx=6,
+                  bg="#e4e4e4", activebackground="#d0d0d0", cursor="hand2",
+                  command=self.export_takeaways).place(relx=1.0, x=-4, y=2, anchor="ne")
 
         # Claude panel: covers the left or right half when open (everything underneath keeps updating)
         self.claude_panel = tk.PanedWindow(root, orient="vertical", sashwidth=6, sashrelief="flat",
@@ -1434,6 +1453,8 @@ class MainWindow:
         if job:
             w.insert("end", "🎓 " + job["label"] + "\n", "file")
         w.insert("end", "Claude: ", "who")
+        w.mark_set("answer_start", "end-1c")      # file names in this answer become links (Learning)
+        w.mark_gravity("answer_start", "left")
         w.see("end")
         w.configure(state="disabled")
         names = [n for n, _ in files] + (["🎓 " + job["label"]] if job else [])
@@ -1474,7 +1495,8 @@ class MainWindow:
         from tkinter import filedialog, messagebox
         default = f"LiveTranslator_backup_{time.strftime('%Y%m%d_%H%M')}.json"
         path = filedialog.asksaveasfilename(parent=self.root, title="Lưu backup", defaultextension=".json",
-                                            initialfile=default, filetypes=[("Live Translator backup", "*.json")])
+                                            initialfile=default, initialdir=output_dir("Backup"),
+                                            filetypes=[("Live Translator backup", "*.json")])
         if not path:
             return
         try:
@@ -1486,7 +1508,7 @@ class MainWindow:
 
     def restore_session(self):
         from tkinter import filedialog, messagebox
-        path = filedialog.askopenfilename(parent=self.root, title="Mở file backup",
+        path = filedialog.askopenfilename(parent=self.root, title="Mở file backup", initialdir=output_dir("Backup"),
                                           filetypes=[("Live Translator backup", "*.json"), ("Tất cả", "*.*")])
         if not path:
             return
@@ -1575,6 +1597,48 @@ class MainWindow:
         self._schedule_align_all()
         self.root.after(200, lambda: (self.left.see("end"), self._sync_from(self.left, self.right),
                                       self.chat.see("end"), self.bottom.see("end")))
+
+    def choose_output_folder(self):
+        """Output Folder: backups go to its Backup folder, exported files to its Outputs folder."""
+        from tkinter import filedialog, messagebox
+        cfg = load_config()
+        folder = filedialog.askdirectory(parent=self.root, title="Chọn Output Folder (nơi lưu backup và kết quả)",
+                                         initialdir=cfg.get("output_folder") or None)
+        if not folder:
+            return
+        try:
+            for sub in ("Backup", "Outputs"):
+                os.makedirs(os.path.join(folder, sub), exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Output Folder", f"Không tạo được thư mục con: {e}", parent=self.root)
+            return
+        cfg["output_folder"] = folder
+        save_config(cfg)
+        self.status.config(text=f"✓ Output Folder: {folder}  (Backup, Outputs)", fg="#7ee2a8")
+        self.learning.chat_note(f"Output Folder: {folder}\n• Backup/ — nơi mặc định để lưu và mở file backup\n"
+                                "• Outputs/ — Key takeaways, nhật ký, lời giải bài tập được lưu tự động vào đây")
+
+    def export_takeaways(self):
+        from tkinter import filedialog, messagebox
+        if not self.last_summary.strip():
+            messagebox.showinfo("Key takeaways", "Chưa có ý chính nào để xuất.", parent=self.root)
+            return
+        name = f"KeyTakeaways_{time.strftime('%Y%m%d_%H%M')}.pdf"
+        outputs = output_dir("Outputs")
+        if outputs:                                # saved straight into <Output Folder>/Outputs
+            path = os.path.join(outputs, name)
+        else:
+            path = filedialog.asksaveasfilename(parent=self.root, title="Xuất Key takeaways ra PDF",
+                                                defaultextension=".pdf", filetypes=[("PDF", "*.pdf")],
+                                                initialfile=name)
+            if not path:
+                return
+        try:
+            learning.takeaways_pdf(path, self.last_summary)
+            self.status.config(text=f"✓ Đã xuất PDF: {os.path.basename(path)}", fg="#7ee2a8")
+            learning.open_path(path)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("Không xuất được PDF", str(e), parent=self.root)
 
     def _take_scrolled(self):
         self.take_follow = self.bottom.yview()[1] >= 0.999
