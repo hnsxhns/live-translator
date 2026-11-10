@@ -68,6 +68,44 @@ jobs:
       - name: Build
         run: bash build_mac.sh
 
+      # Install the new .dmg like a user and open it, before anyone downloads it
+      - name: Install the new .dmg and open the app for 60 s
+        run: |
+          set -uo pipefail
+          DMG=$(ls dist/*.dmg | head -1)
+          hdiutil attach "$DMG" -nobrowse -mountpoint /Volumes/LT
+          ditto "/Volumes/LT/Live Translator.app" "/Applications/Live Translator.app"
+          hdiutil detach /Volumes/LT
+          A="/Applications/Live Translator.app"
+          ls "$A/Contents/Frameworks/pymupdf" >/dev/null && echo "pymupdf bundled" || { echo "pymupdf missing"; exit 1; }
+          mkdir -p shots
+          open "$A"
+          COUNTS=""
+          for i in 1 2 3 4 5 6; do
+            sleep 10
+            COUNTS="$COUNTS $(pgrep -f "Live Translator.app/Contents/MacOS/" | wc -l | tr -d ' ')"
+            [ "$i" = 3 ] && screencapture -x shots/new_build_login.png || true
+          done
+          echo "process counts every 10 s:$COUNTS"
+          LAST=$(echo $COUNTS | awk '{print $NF}')
+          pkill -f "Live Translator.app/Contents/MacOS/" || true
+          sleep 2
+          # the app must not write inside its own bundle (that breaks the signature on users' Macs)
+          codesign --verify --deep --strict "$A" && echo "signature still valid after running"
+          ls -d "$HOME/Library/Application Support/LiveTranslator" && echo "settings folder OK"
+          {
+            echo "## New build: installed and opened"
+            echo "- Processes every 10 s:$COUNTS"
+            [ "$LAST" -ge 1 ] && [ "$LAST" -le 2 ] && echo "- PASS: running after 60 s, no relaunch loop" || echo "- FAIL"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$LAST" -ge 1 ] && [ "$LAST" -le 2 ] && codesign --verify --deep --strict "$A"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshot-new-build
+          path: shots/
+
       - name: Upload .dmg
         uses: actions/upload-artifact@v4
         with:

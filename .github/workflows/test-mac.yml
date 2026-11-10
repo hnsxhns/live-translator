@@ -10,7 +10,7 @@ name: Test Mac app
 on:
   push:
     branches: [mac-portable]
-    paths: ["tests/**", ".github/workflows/test-mac.yml"]
+    paths: ["tests/**", ".github/workflows/test-mac.yml", "app.py", "learning.py", "requirements.txt"]
   workflow_dispatch:
     inputs:
       release:
@@ -138,19 +138,25 @@ jobs:
           curl -fsSL -o models/spk-onnx/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx \
             https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx
 
-      - name: Make English test speech with macOS voice
+      - name: Make English test speech with two macOS voices (teacher, student, teacher)
         run: |
           set -euo pipefail
-          say -o speech.aiff "Good morning everyone. Today we will talk about machine learning and how computers understand speech. Please open your notebooks and write down the key ideas."
-          afconvert -f WAVE -d LEI16@16000 -c 1 speech.aiff speech.wav
-          ls -l speech.wav
+          say -v '?' | awk '{print $1}' | tr '\n' ' '; echo
+          pick() { for v in "$@"; do say -v '?' | grep -q "^$v " && { echo "$v"; return; }; done; echo ""; }
+          VA=$(pick Daniel Fred Alex Tom); VB=$(pick Samantha Karen Victoria Allison)
+          echo "voice A: ${VA:-default}  voice B: ${VB:-default}"
+          mk() { say ${2:+-v "$2"} -o "$1.aiff" "$3"; afconvert -f WAVE -d LEI16@16000 -c 1 "$1.aiff" "$1.wav"; }
+          mk a1 "$VA" "Good morning everyone. Today we will talk about machine learning and how computers understand speech. Please open your notebooks and write down the key ideas."
+          mk b1 "$VB" "Thank you teacher. I have a question about the homework. Should we finish all the exercises before Friday, or only the first part?"
+          mk a2 "$VA" "Good question. Please finish all of them before Friday. If you have more questions, send me an email and I will answer tonight."
+          ls -l a1.wav b1.wav a2.wav
 
       - name: Run the app window with the fake microphone
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -uo pipefail
-          .venv-mac/bin/python tests/mac_e2e_test.py speech.wav shots | tee e2e.log
+          .venv-mac/bin/python tests/mac_e2e_test.py shots A:a1.wav B:b1.wav A:a2.wav | tee e2e.log
           CODE=${PIPESTATUS[0]}
           .venv-mac/bin/python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
           import json

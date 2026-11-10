@@ -278,6 +278,20 @@ take = mw.bottom.get("1.0", "end")
 stamps = re.findall(r"\[\d\d:\d\d\]", take)
 check("takeaways_timestamped_history", len(stamps) >= 2, f"{len(stamps)} timestamped blocks kept")
 check("takeaways_follow_newest", mw.bottom.yview()[1] >= 0.999, f"view {mw.bottom.yview()}")
+# new in v1.8.3: export the takeaways history as a PDF (Vietnamese text must survive)
+tpdf = os.path.join(OUT, "takeaways_test.pdf")
+filedialog.asksaveasfilename = lambda *a, **k: tpdf
+learning.open_path = lambda p: None                     # don't open a PDF viewer during the test
+mw.export_takeaways()
+pump(0.5)
+try:
+    import pymupdf
+    with pymupdf.open(tpdf) as d:
+        ttext = " ".join(" ".join(p.get_text() for p in d).split())
+    snippet = " ".join(mw.last_summary.splitlines()[1].split())[:40]
+    check("takeaways_export_pdf", snippet in ttext, f"pdf has {len(ttext)} chars; looked for '{snippet}'")
+except Exception as e:  # noqa: BLE001
+    check("takeaways_export_pdf", False, repr(e))
 shot("05_after_speech")
 root.geometry(f"{min(1280, sw - 20)}x{min(800, sh - 110)}+10+30")
 pump(1)

@@ -24,7 +24,7 @@ import numpy as np
 import learning
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.8.1"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.8.3"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # Live words come from Vosk (streaming); Whisper base.en then corrects each finished utterance.
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base.en")
@@ -1179,6 +1179,10 @@ class MainWindow:
         self.left.configure(yscrollcommand=lambda a, b: self._on_text_scroll(self.left, a, b))
         self.right.configure(yscrollcommand=lambda a, b: self._on_text_scroll(self.right, a, b))
         self.bottom = pane(self.body, "Ý chính / Key takeaways")
+        # export the whole takeaways history as a PDF (button on the right of the pane's title bar)
+        tk.Button(self.bottom.master, text="📄 Xuất PDF", font=(UI_FONT, 8), relief="flat", bd=0, padx=6,
+                  bg="#e4e4e4", activebackground="#d0d0d0", cursor="hand2",
+                  command=self.export_takeaways).place(relx=1.0, x=-4, y=2, anchor="ne")
 
         # Claude panel: covers the left or right half when open (everything underneath keeps updating)
         self.claude_panel = tk.PanedWindow(root, orient="vertical", sashwidth=6, sashrelief="flat",
@@ -1197,7 +1201,7 @@ class MainWindow:
         for wdg in self.bottom.master.winfo_children():
             if isinstance(wdg, tk.Scrollbar):
                 wdg.config(command=lambda *a: (self.bottom.yview(*a), self._take_scrolled()))
-        self.bottom.tag_configure("ttime", foreground="#999", font=("Segoe UI", 9))
+        self.bottom.tag_configure("ttime", foreground="#999", font=(UI_FONT, 9))
         for w in (self.left, self.right):
             w.tag_configure("lbl", font=(text_font.actual("family"), 12, "bold"))
             w.tag_bind("lbl", "<Double-Button-1>", self._rename_speaker)
@@ -1507,6 +1511,8 @@ class MainWindow:
         if job:
             w.insert("end", "🎓 " + job["label"] + "\n", "file")
         w.insert("end", "Claude: ", "who")
+        w.mark_set("answer_start", "end-1c")      # file names in this answer become links (Learning)
+        w.mark_gravity("answer_start", "left")
         w.see("end")
         w.configure(state="disabled")
         names = [n for n, _ in files] + (["🎓 " + job["label"]] if job else [])
@@ -1648,6 +1654,23 @@ class MainWindow:
         self._schedule_align_all()
         self.root.after(200, lambda: (self.left.see("end"), self._sync_from(self.left, self.right),
                                       self.chat.see("end"), self.bottom.see("end")))
+
+    def export_takeaways(self):
+        from tkinter import filedialog, messagebox
+        if not self.last_summary.strip():
+            messagebox.showinfo("Key takeaways", "Chưa có ý chính nào để xuất.", parent=self.root)
+            return
+        path = filedialog.asksaveasfilename(parent=self.root, title="Xuất Key takeaways ra PDF",
+                                            defaultextension=".pdf", filetypes=[("PDF", "*.pdf")],
+                                            initialfile=f"KeyTakeaways_{time.strftime('%Y%m%d_%H%M')}.pdf")
+        if not path:
+            return
+        try:
+            learning.takeaways_pdf(path, self.last_summary)
+            self.status.config(text=f"✓ Đã xuất PDF: {os.path.basename(path)}", fg="#7ee2a8")
+            learning.open_path(path)
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("Không xuất được PDF", str(e), parent=self.root)
 
     def _take_scrolled(self):
         self.take_follow = self.bottom.yview()[1] >= 0.999
