@@ -10,7 +10,11 @@ import { ensureFiles, hasWebGPU, modelFiles } from "./models.js";
 import { Translator, Chatter, Summarizer, TRANSLATE_PRESETS, DEFAULT_PRESET } from "./assistants.js";
 import { fileToBlock, ACCEPT } from "./files.js";
 import * as upd from "./updates.js";
-import { LearningUI } from "./learning.js";
+import { LearningUI, shareBlob } from "./learning.js";
+
+// Running inside the TestFlight app (ipad/ios): files ship in the app, updates come from TestFlight.
+const NATIVE = !!(window.LT_NATIVE && window.webkit?.messageHandlers?.lt);
+const LABEL = NATIVE ? `v${window.LT_NATIVE.version} (${window.LT_NATIVE.build})` : upd.BUILD_LABEL;
 
 const TEACHER_MINUTES = 10;   // whoever has spoken this long becomes "Teacher" (several -> Teacher 1, 2...)
 // soft, muted colors: steel blue, terracotta, moss green, dusty purple, ochre, teal, plum
@@ -88,7 +92,7 @@ class App {
     const cfg = loadConfig();
     $("key").value = cfg.api_key || "";
     $("remember").checked = cfg.remember !== false;
-    $("loginVersion").textContent = upd.BUILD_LABEL;
+    $("loginVersion").textContent = LABEL;
     $("loginBtn").onclick = () => this.loginKey();
     $("key").onkeydown = (e) => { if (e.key === "Enter") this.loginKey(); };
     if (cfg.remember && cfg.api_key) {
@@ -152,14 +156,14 @@ class App {
       const cfg = loadConfig();
       const gpu = await hasWebGPU();
       const useWhisper = cfg.whisper !== false;
-      const downloading = await ensureFiles(modelFiles(gpu, useWhisper), (done, total) => {
+      const downloading = !NATIVE && await ensureFiles(modelFiles(gpu, useWhisper), (done, total) => {
         const pct = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
         const msg = `Đang tải mô hình nhận diện giọng nói lần đầu: ${(done / 1e6).toFixed(0)}` +
           (total ? ` / ${(total / 1e6).toFixed(0)} MB (${pct}%)` : " MB");
         this.progress(pct, msg);
       });
       this.progress(100, downloading ? "Đã tải xong mô hình. Đang chuẩn bị..." : "Đang chuẩn bị nhận diện giọng nói (vài giây)...");
-      await this.recognizer.load({ gpu, useWhisper });
+      await this.recognizer.load({ gpu, useWhisper, native: NATIVE });
       this.progress(null);
       this.handle("ready", null);
     } catch (e) {
@@ -197,7 +201,7 @@ class App {
     $("btnBackup").onclick = () => this.backupSession();
     $("btnRestore").onclick = () => $("restorePick").click();
     $("restorePick").onchange = (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) this.restoreSession(f); };
-    $("btnVersion").textContent = upd.BUILD_LABEL;
+    $("btnVersion").textContent = LABEL;
     $("btnVersion").onclick = () => this.showVersions();
     $("edgeL").onclick = () => this.togglePanel("left");
     $("edgeR").onclick = () => this.togglePanel("right");
@@ -668,6 +672,7 @@ class App {
   }
 
   async keepAwake(on) {
+    if (NATIVE) window.webkit.messageHandlers.lt.postMessage({ type: "keepAwake", on });
     try {
       if (on && "wakeLock" in navigator && document.visibilityState === "visible") {
         this.wake = await navigator.wakeLock.request("screen");      // screen stays on while listening
@@ -724,17 +729,10 @@ class App {
   async backupSession() {
     const d = new Date(), pad = (n) => String(n).padStart(2, "0");
     const name = `LiveTranslator_backup_${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}.json`;
-    const file = new File([JSON.stringify(this.sessionData(), null, 1)], name, { type: "application/json" });
+    const file = new Blob([JSON.stringify(this.sessionData(), null, 1)], { type: "application/json" });
     try {
-      if (navigator.canShare?.({ files: [file] })) {
-        await navigator.share({ files: [file], title: name });       // iPad: "Lưu vào Tệp", AirDrop, Mail...
-      } else {
-        const a = el("a");
-        a.href = URL.createObjectURL(file);
-        a.download = name;
-        a.click();
-        setTimeout(() => URL.revokeObjectURL(a.href), 10000);
-      }
+      // iPad share sheet: "Lưu vào Tệp", AirDrop, Mail...
+      if (!(await shareBlob(file, name))) return;
       this.setStatus(`✓ Đã backup: ${name}`, "ok");
     } catch (e) {
       if (e?.name !== "AbortError") alert("Backup lỗi: " + (e.message || e));
@@ -808,6 +806,7 @@ class App {
 
   // ---------------- TestFlight-style updates ----------------
   async checkUpdates() {
+    if (NATIVE) return;                          // the TestFlight app tells testers about new builds itself
     const now = Date.now();
     if (this.lastCheck && now - this.lastCheck < 60_000) return;
     this.lastCheck = now;
@@ -833,6 +832,20 @@ class App {
   }
 
   async showVersions() {
+    if (NATIVE) {
+      const body = el("div", "versions");
+      body.append(el("p", "", `Live Translator ${LABEL} — bản cài qua TestFlight.`),
+                  el("p", "muted", "Khi có bản mới, app TestFlight sẽ báo; mở TestFlight và bấm Cập nhật."));
+      const ul = el("ul");
+      for (const n of NOTES) ul.append(el("li", "", n));
+      const fb = el("button", "", "✉ Gửi phản hồi");
+      fb.onclick = () => this.showFeedback("");
+      const actions = el("div", "actions");
+      actions.append(fb);
+      body.append(ul, actions);
+      this.sheet("Phiên bản", body);
+      return;
+    }
     const data = this.releases || await upd.fetchReleases();
     const prefs = upd.getPrefs();
     const body = el("div", "versions");
@@ -890,7 +903,8 @@ class App {
       const text = `${ta.value.trim()}\n\n---\n${JSON.stringify(info, null, 1)}`;
       const subject = `Phản hồi Live Translator iPad ${upd.BUILD_ID}`;
       try {
-        if (email) location.href = `mailto:${email}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(text)}`;
+        if (NATIVE) await shareBlob(new Blob([text], { type: "text/plain" }), "phan-hoi-live-translator.txt", text);
+        else if (email) location.href = `mailto:${email}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(text)}`;
         else if (navigator.share) await navigator.share({ title: subject, text });
         else { await navigator.clipboard.writeText(text); alert("Đã copy phản hồi, hãy dán gửi cho người phát triển."); }
         $("sheet").close();
@@ -917,7 +931,7 @@ class App {
 
 // ---------------- start ----------------
 function registerSW() {
-  if (!("serviceWorker" in navigator)) return;
+  if (NATIVE || !("serviceWorker" in navigator)) return;   // the app already has every file
   navigator.serviceWorker.register(upd.ROOT + "sw.js", { scope: upd.ROOT }).then(async (reg) => {
     // keep this build's files offline
     const files = await fetch("files.json").then((r) => r.json()).catch(() => []);

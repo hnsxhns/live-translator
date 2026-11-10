@@ -1,0 +1,55 @@
+# XcodeGen project for the native iPad app (TestFlight). Generated in CI: `xcodegen generate`.
+name: LiveTranslator
+options:
+  bundleIdPrefix: com.hnsxhns
+  deploymentTarget:
+    iOS: "17.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.8.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+targets:
+  LiveTranslator:
+    type: application
+    platform: iOS
+    sources:
+      - path: LiveTranslator
+      - path: site              # the web app + speech models, kept as a folder inside the app
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        APP_BUNDLE_ID: com.hnsxhns.livetranslator
+        PRODUCT_BUNDLE_IDENTIFIER: $(APP_BUNDLE_ID)
+        PRODUCT_NAME: LiveTranslator
+        TARGETED_DEVICE_FAMILY: "2"
+        CODE_SIGN_STYLE: Automatic
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        GENERATE_INFOPLIST_FILE: NO
+    info:
+      path: LiveTranslator/Info.plist
+      properties:
+        CFBundleDisplayName: Live Translator
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        ITSAppUsesNonExemptEncryption: false
+        UILaunchScreen: {}
+        UIStatusBarStyle: UIStatusBarStyleLightContent
+        UIViewControllerBasedStatusBarAppearance: false
+        UIRequiresFullScreen: false
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        NSMicrophoneUsageDescription: Live Translator cần micro để nghe tiếng Anh và dịch trực tiếp.
+        NSCameraUsageDescription: Dùng camera khi bạn chụp ảnh để gửi kèm câu hỏi cho Claude.
+        NSPhotoLibraryUsageDescription: Dùng thư viện ảnh khi bạn chọn ảnh để gửi kèm câu hỏi cho Claude.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true

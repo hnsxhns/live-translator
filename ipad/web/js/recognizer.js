@@ -70,14 +70,14 @@ export class Recognizer {
   }
 
   /** Load the speech models (files must already be in the cache). Whisper/voiceprints are optional. */
-  async load({ gpu, useWhisper }) {
+  async load({ gpu, useWhisper, native = false }) {
     const base = new URL("./", import.meta.url);
     const spk = new WorkerClient(new URL("speaker-worker.js", base));
     const spkReady = spk.load().then(() => { this.spk = spk; }).catch((e) => console.warn("voiceprints off:", e));
     let whisperReady = Promise.resolve();
     if (useWhisper) {
       const w = new WorkerClient(new URL("whisper-worker.js", base));
-      whisperReady = w.load({ gpu }).then((m) => { this.whisper = w; this.whisperMode = m.mode; })
+      whisperReady = w.load({ gpu, native }).then((m) => { this.whisper = w; this.whisperMode = m.mode; })
         .catch((e) => {
           console.warn("whisper off:", e);
           this.emit("status", "Whisper không chạy được trên máy này — dùng chữ của Vosk.");

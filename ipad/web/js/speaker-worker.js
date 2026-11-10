@@ -7,7 +7,7 @@ const SR = 16000;
 let session = null;
 
 async function getBytes(url) {
-  const hit = await caches.match(url).catch(() => undefined);
+  const hit = typeof caches !== "undefined" ? await caches.match(url).catch(() => undefined) : undefined;
   const res = hit || await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status} ${url}`);
   return new Uint8Array(await res.arrayBuffer());

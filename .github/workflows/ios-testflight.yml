@@ -1,0 +1,162 @@
+# Native iPad app (ipad/ios) -> TestFlight.
+#
+# Every push to the ipad-pwa branch (or "Run workflow"):
+#   1. bundles the web app + speech models into the app (ipad/build-native.mjs)
+#   2. runs it in an iPad simulator, checks the speech models load, takes screenshots
+#   3. builds an unsigned .ipa (artifact, for Sideloadly)
+#   4. when the App Store Connect secrets are set: signs it and uploads it to TestFlight
+#
+# Secrets (Settings -> Secrets and variables -> Actions): ASC_KEY_P8_BASE64, ASC_KEY_ID, ASC_ISSUER_ID, TEAM_ID
+# Variable (optional): BUNDLE_ID (default com.hnsxhns.livetranslator)
+name: iPad app (TestFlight)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ipad-pwa]
+    paths: ["ipad/**", ".github/workflows/ios-testflight.yml"]
+
+env:
+  BUNDLE_ID: ${{ vars.BUNDLE_ID || 'com.hnsxhns.livetranslator' }}
+  ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+
+jobs:
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: ipad
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Bundle the web app and speech models
+        run: |
+          npm ci --no-audit --no-fund
+          node build-native.mjs
+          echo "MARKETING_VERSION=$(node -e "import('./web/js/version.js').then(m => console.log(m.APP_VERSION))")" >> "$GITHUB_ENV"
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Generate Xcode project
+        working-directory: ipad/ios
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      # ---------- iPad simulator: run the app, check it starts, screenshots ----------
+      - name: Build for iPad simulator
+        working-directory: ipad/ios
+        run: |
+          set -o pipefail
+          mkdir -p build
+          xcodebuild build -project LiveTranslator.xcodeproj -scheme LiveTranslator -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath build/sim \
+            CODE_SIGNING_ALLOWED=NO APP_BUNDLE_ID="$BUNDLE_ID" MARKETING_VERSION="$MARKETING_VERSION" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+            | tee build/sim.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
+          test -d build/sim/Build/Products/Debug-iphonesimulator/LiveTranslator.app
+
+      - name: Run in iPad simulator
+        working-directory: ipad/ios
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c "
+          import json, sys
+          devs = json.load(sys.stdin)['devices']
+          ipads = [d for k, v in devs.items() if 'iOS' in k for d in v if d['name'].startswith('iPad')]
+          pro = [d for d in ipads if 'Pro' in d['name']]
+          print((pro or ipads)[0]['udid'])")
+          echo "Simulator: $UDID"
+          xcrun simctl boot "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+          xcrun simctl install "$UDID" build/sim/Build/Products/Debug-iphonesimulator/LiveTranslator.app
+          mkdir -p screenshots
+          xcrun simctl launch "$UDID" "$BUNDLE_ID" -selftest
+          sleep 15
+          xcrun simctl io "$UDID" screenshot screenshots/1-start.png
+          for i in $(seq 1 30); do
+            sleep 5
+            xcrun simctl spawn "$UDID" log show --last 2m --style compact --predicate 'eventMessage CONTAINS "LT: selftest"' > screenshots/selftest.log 2>/dev/null || true
+            if grep -q '"ready":true' screenshots/selftest.log; then break; fi
+          done
+          xcrun simctl io "$UDID" screenshot screenshots/2-ready.png
+          tail -3 screenshots/selftest.log || true
+          xcrun simctl spawn "$UDID" log show --last 5m --predicate 'process == "LiveTranslator"' > screenshots/app.log 2>&1 || true
+          grep -q '"ready":true' screenshots/selftest.log && echo "Speech models loaded in the app." \
+            || echo "::warning::The app did not report ready in the simulator (see screenshots/selftest.log)"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ipad-simulator-screenshots
+          path: ipad/ios/screenshots/
+
+      # ---------- unsigned .ipa (Sideloadly) ----------
+      - name: Build unsigned .ipa
+        working-directory: ipad/ios
+        run: |
+          set -o pipefail
+          xcodebuild build -project LiveTranslator.xcodeproj -scheme LiveTranslator -configuration Release \
+            -destination 'generic/platform=iOS' -derivedDataPath build/device \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            APP_BUNDLE_ID="$BUNDLE_ID" MARKETING_VERSION="$MARKETING_VERSION" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+            | tee build/device.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
+          mkdir -p ipa/Payload
+          cp -R build/device/Build/Products/Release-iphoneos/LiveTranslator.app ipa/Payload/
+          (cd ipa && zip -qry ../LiveTranslator.ipa Payload)
+          ls -lh LiveTranslator.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LiveTranslator-unsigned-ipa
+          path: ipad/ios/LiveTranslator.ipa
+          retention-days: 30
+
+      # ---------- TestFlight (only when the Apple secrets are set) ----------
+      - name: Archive (signed)
+        if: env.ASC_KEY_ID != ''
+        working-directory: ipad/ios
+        run: |
+          echo "${{ secrets.ASC_KEY_P8_BASE64 }}" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          xcodebuild archive -project LiveTranslator.xcodeproj -scheme LiveTranslator -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/LiveTranslator.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/AuthKey.p8" \
+            -authenticationKeyID "${{ secrets.ASC_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_ISSUER_ID }}" \
+            DEVELOPMENT_TEAM="${{ secrets.TEAM_ID }}" APP_BUNDLE_ID="$BUNDLE_ID" \
+            MARKETING_VERSION="$MARKETING_VERSION" CURRENT_PROJECT_VERSION="${{ github.run_number }}"
+
+      - name: Upload to TestFlight
+        if: env.ASC_KEY_ID != ''
+        working-directory: ipad/ios
+        run: |
+          cat > ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>teamID</key><string>${{ secrets.TEAM_ID }}</string>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict></plist>
+          EOF
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/LiveTranslator.xcarchive" \
+            -exportOptionsPlist ExportOptions.plist -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$RUNNER_TEMP/AuthKey.p8" \
+            -authenticationKeyID "${{ secrets.ASC_KEY_ID }}" \
+            -authenticationKeyIssuerID "${{ secrets.ASC_ISSUER_ID }}"
+          echo "Uploaded build ${{ github.run_number }} (v$MARKETING_VERSION) to App Store Connect -> TestFlight."
+
+      - name: No Apple secrets yet
+        if: env.ASC_KEY_ID == ''
+        run: echo "::notice::TestFlight upload skipped - add the App Store Connect secrets (see ipad/ios/README.md)."

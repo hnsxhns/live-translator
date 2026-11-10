@@ -16,3 +16,9 @@ selftest.txt
 # iPad web app: libraries and built site (big; re-created by ipad/build.mjs)
 ipad/node_modules/
 ipad/site/
+# native iPad app: generated in CI by ipad/build-native.mjs and xcodegen
+ipad/ios/site/
+ipad/ios/build/
+ipad/ios/LiveTranslator.xcodeproj/
+ipad/ios/LiveTranslator/Info.plist
+ipad/ios/LiveTranslator/Assets.xcassets/AppIcon.appiconset/icon-1024.png

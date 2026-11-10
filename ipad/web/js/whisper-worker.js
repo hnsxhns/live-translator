@@ -6,13 +6,14 @@ const ROOT = new URL("../../../", import.meta.url).href;
 const MODEL = "whisper-base.en";
 let asr = null;
 
-async function load(gpu) {
+async function load(gpu, native) {
   env.allowRemoteModels = false;
   env.allowLocalModels = true;
   env.localModelPath = ROOT + "models/";
   env.useBrowserCache = false;
-  env.useCustomCache = true;
-  env.customCache = await caches.open("lt-models");     // files were downloaded there by the app
+  // web: files were downloaded into the "lt-models" cache by the app; TestFlight app: they ship inside it
+  env.useCustomCache = !native;
+  if (!native) env.customCache = await caches.open("lt-models");
   env.backends.onnx.wasm.wasmPaths = ROOT + "lib/transformers-3.7.5/";
   env.backends.onnx.wasm.numThreads = 1;
   const tries = gpu
@@ -48,7 +49,7 @@ self.onmessage = async (ev) => {
   const msg = ev.data;
   try {
     if (msg.type === "load") {
-      loading = loading || load(msg.gpu);
+      loading = loading || load(msg.gpu, msg.native);
       const mode = await loading;
       self.postMessage({ type: "ready", mode });
     } else if (msg.type === "run") {
