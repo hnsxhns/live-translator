@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="Live Translator">
+<meta name="theme-color" content="#2b2b2b">
+<title>Live Translator</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" href="icons/icon-192.png">
+<style>
+  html, body { margin: 0; height: 100%; background: #2b2b2b; color: #ddd;
+    font-family: -apple-system, "Segoe UI", system-ui, sans-serif; }
+  body { display: grid; place-items: center; text-align: center; padding: 16px; box-sizing: border-box; }
+  a { color: #f0b49c; }
+</style>
+</head>
+<body>
+<div id="msg">Đang mở Live Translator…</div>
+<script>
+// Launcher: opens the build for this tester's channel (Beta = newest build, Stable = newest stable build),
+// or the build they pinned in "Phiên bản". Every build stays at v/<version>-<build>/.
+(async () => {
+  let prefs = { channel: "beta", pinned: null };
+  try { Object.assign(prefs, JSON.parse(localStorage.getItem("lt_update") || "{}")); } catch (e) { /* private mode */ }
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+  let data = null;
+  try {
+    const r = await fetch("releases.json", { cache: "no-store" });
+    if (r.ok) data = await r.json();
+  } catch (e) { /* offline */ }
+  if (!data && "caches" in self) {
+    const hit = await caches.match(new URL("releases.json", location.href).href).catch(() => null);
+    if (hit) data = await hit.json();
+  }
+  const all = (data && data.releases) || [];
+  const num = (v) => v.split(".").map((x) => parseInt(x, 10) || 0);
+  const cmp = (a, b) => {
+    const x = num(a.version), y = num(b.version);
+    for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0);
+    return a.build - b.build;
+  };
+  const id = (r) => r.version + "-" + r.build;
+  let list = all.filter((r) => prefs.channel === "beta" || r.channel === "stable");
+  if (!list.length) list = all;                        // no stable build yet: newest beta
+  list.sort((a, b) => cmp(b, a));
+  let pick = prefs.pinned && all.some((r) => id(r) === prefs.pinned) ? prefs.pinned : null;
+  if (!pick && list[0]) pick = id(list[0]);
+  if (!pick && prefs.last) pick = prefs.last;           // offline and nothing cached: last build opened
+  if (!pick) {
+    document.getElementById("msg").innerHTML = "Không mở được app: cần kết nối mạng ở lần mở đầu tiên.<br><br>" +
+      "<a href=\"\">Thử lại</a>";
+    return;
+  }
+  location.replace("v/" + pick + "/");
+})();
+</script>
+</body>
+</html>

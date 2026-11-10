@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="Live Translator">
+<meta name="theme-color" content="#2b2b2b">
+<title>Live Translator</title>
+<link rel="manifest" href="../../manifest.webmanifest">
+<link rel="apple-touch-icon" href="../../icons/icon-180.png">
+<link rel="icon" href="../../icons/icon-192.png">
+<link rel="stylesheet" href="app.css">
+<script src="../../lib/vosk-0.0.8/vosk.js"></script>
+<script type="module" src="js/main.js"></script>
+</head>
+<body>
+
+<!-- ============ Login ============ -->
+<div id="login" class="login" hidden>
+  <div class="card">
+    <h1>Đăng nhập bằng API key</h1>
+    <p class="sub">Live Translator cho iPad · <span id="loginVersion"></span></p>
+    <input id="key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="sk-ant-...">
+    <label class="check"><input id="remember" type="checkbox" checked> Ghi nhớ đăng nhập (lần sau tự vào thẳng, không cần đăng nhập lại)</label>
+    <button id="loginBtn" class="primary big">Đăng nhập</button>
+    <div id="loginStatus" class="status"></div>
+    <div class="progress" hidden><div class="track"><div class="bar"></div></div><span></span></div>
+    <p class="note">Lấy API key tại <b>platform.claude.com/settings/keys</b> (không nằm trong phần Settings của claude.ai).
+      Gói Ultra có sẵn $200/tháng tiền API: claude.ai → Settings → Billing → API credits → Link organization.
+      Đăng nhập bằng Google/email chỉ có trên bản máy tính.</p>
+  </div>
+</div>
+
+<!-- ============ Main ============ -->
+<div id="main" class="main" hidden>
+  <header class="top">
+    <span id="status" class="status">Nhấn ON để bắt đầu.</span>
+    <span class="spacer"></span>
+    <button id="btnVersion" class="tool ver"></button>
+    <button id="btnBackup" class="tool">💾 Backup</button>
+    <button id="btnRestore" class="tool">📂 Restore</button>
+    <label class="presetLbl">Dịch: <select id="preset"></select></label>
+    <button id="btnLogout" class="link">Đăng xuất</button>
+    <button id="toggle" class="onoff off">OFF</button>
+  </header>
+  <div class="progress top-progress" hidden><div class="track"><div class="bar"></div></div><span></span></div>
+  <div id="updateBanner" class="banner" hidden>
+    <span id="updateText"></span>
+    <button id="updateNotes" class="link">Ghi chú</button>
+    <button id="updateGo" class="primary small">Cập nhật</button>
+  </div>
+
+  <div class="body">
+    <button id="edgeL" class="edge left"></button>
+    <div id="center" class="center">
+      <div id="panes" class="panes">
+        <div id="rows" class="rows">
+          <div class="head">English (nhận diện giọng nói)</div>
+          <div class="head">Tiếng Việt (bản dịch)</div>
+          <div class="cell en partial" id="partialEn"></div>
+          <div class="cell vi" id="partialVi"></div>
+        </div>
+      </div>
+      <div id="divider" class="divider"></div>
+      <section class="pane takeaways">
+        <div class="ptitle">Ý chính / Key takeaways</div>
+        <div id="summary" class="ptext"></div>
+      </section>
+
+      <aside id="claude" class="claude" hidden>
+        <section class="pane answers">
+          <div class="ptitle">Claude trả lời</div>
+          <div id="chat" class="ptext"></div>
+        </section>
+        <div id="divider2" class="divider"></div>
+        <section class="pane ask">
+          <div class="ptitle">Hỏi Claude (Enter: gửi · Shift+Enter: xuống dòng)</div>
+          <div id="attachBar" class="attachBar" hidden></div>
+          <div class="promptRow">
+            <textarea id="prompt" placeholder="Hỏi về nội dung đang nghe, hoặc bất cứ điều gì..."></textarea>
+            <button id="learn" class="learnBtn" title="Học tập (Ctrl+L)">🎓 Learning</button>
+            <button id="attach" class="attach" title="Đính kèm ảnh, PDF, Word, file chữ">📎</button>
+            <button id="send" class="primary send">Gửi ➤</button>
+          </div>
+        </section>
+      </aside>
+    </div>
+    <div class="strip">
+      <button id="edgeR" class="edge right"></button>
+      <button id="edgeLearn" class="edgeLearn" title="Learning">🎓
+L
+e
+a
+r
+n</button>
+    </div>
+  </div>
+</div>
+
+<dialog id="sheet" class="sheet">
+  <div class="sheetHead"><b id="sheetTitle"></b><button id="sheetClose" class="link">Đóng</button></div>
+  <div id="sheetBody"></div>
+</dialog>
+
+<input id="filePick" type="file" multiple hidden>
+<input id="restorePick" type="file" accept=".json,application/json" hidden>
+</body>
+</html>

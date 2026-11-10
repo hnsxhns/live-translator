@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#2b2b2b">
+<title>Cài Live Translator</title>
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" href="icons/icon-192.png">
+<style>
+  :root { --accent: #d97757; --muted: #6b6b6b; }
+  body { margin: 0; background: #faf9f5; color: #1f1f1f; font-family: -apple-system, "Segoe UI", system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 28px 16px 40px; }
+  header { display: flex; gap: 16px; align-items: center; }
+  header img { width: 72px; height: 72px; border-radius: 16px; }
+  h1 { font-size: 26px; margin: 0; }
+  .sub { color: var(--muted); margin: 4px 0 0; }
+  .grid { display: grid; grid-template-columns: minmax(0, 1fr) 220px; gap: 24px; margin-top: 24px; align-items: start; }
+  .box { background: #fff; border: 1px solid #e4e2dc; border-radius: 14px; padding: 16px 18px; }
+  ol { padding-left: 22px; line-height: 1.6; margin: 8px 0 0; }
+  .qr { text-align: center; }
+  .qr svg { width: 180px; height: 180px; }
+  .qr p { font-size: 13px; color: var(--muted); word-break: break-all; }
+  .btn { display: inline-block; background: var(--accent); color: #fff; text-decoration: none; font-weight: 600;
+    padding: 12px 18px; border-radius: 10px; margin-top: 14px; }
+  .badge { font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px; background: #fde2d6; color: #9a3d16; }
+  .badge.stable { background: #dcf1e3; color: #1e6b3a; }
+  .warn { background: #fff4e5; border: 1px solid #f0d9bb; border-radius: 10px; padding: 10px 12px; margin-top: 16px; }
+  ul { padding-left: 20px; line-height: 1.5; }
+  @media (max-width: 640px) { .grid { grid-template-columns: minmax(0, 1fr); } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <img src="icons/icon-180.png" alt="">
+    <div>
+      <h1>Live Translator cho iPad</h1>
+      <p class="sub">Bản thử nghiệm — cài thẳng từ Safari, không qua App Store</p>
+    </div>
+  </header>
+
+  <div id="notSafari" class="warn" hidden>Hãy mở trang này bằng <b>Safari</b> trên iPad (Chrome/ứng dụng khác không thêm được vào Màn hình chính).</div>
+  <div id="installed" class="warn" hidden>App đã được cài trên máy này. Mở từ biểu tượng <b>Live Translator</b> trên Màn hình chính.</div>
+
+  <div class="grid">
+    <div>
+      <div class="box">
+        <b>Cài đặt (1 phút)</b>
+        <ol>
+          <li>Mở trang này bằng <b>Safari</b> trên iPad (quét mã QR bên cạnh bằng Camera).</li>
+          <li>Bấm nút <b>Chia sẻ</b> (ô vuông có mũi tên lên) ở thanh trên.</li>
+          <li>Chọn <b>Thêm vào MH chính</b> → bật <b>Mở dưới dạng ứng dụng web</b> (nếu có) → <b>Thêm</b>.</li>
+          <li>Mở <b>Live Translator</b> từ Màn hình chính, nhập API key, rồi cho phép dùng <b>Micro</b>.</li>
+        </ol>
+        <p class="sub">Lần mở đầu tiên app tải mô hình nhận diện giọng nói (khoảng 150–230 MB, nên dùng Wi-Fi). Sau đó chạy được cả khi mạng yếu; chỉ phần dịch cần Internet.</p>
+        <a class="btn" href="./">Mở app</a>
+      </div>
+      <div class="box" style="margin-top:16px">
+        <b>Bản mới nhất</b> <span id="relBadge" class="badge"></span>
+        <div id="rel" class="sub">Đang tải…</div>
+        <ul id="notes"></ul>
+        <p class="sub">Có bản mới, app tự hiện thông báo “Cập nhật”. Trong app bấm vào số phiên bản ở thanh trên để xem các bản trước, chọn kênh Beta/Ổn định, hoặc gửi phản hồi.</p>
+      </div>
+    </div>
+    <div class="box qr">
+      <div id="qr"></div>
+      <p id="url"></p>
+    </div>
+  </div>
+</main>
+<script src="lib/qrcode-1.4.4/qrcode.js"></script>
+<script>
+  const home = new URL("./", location.href).href;
+  document.getElementById("url").textContent = home;
+  try {
+    const q = qrcode(0, "M");
+    q.addData(new URL("install.html", home).href);
+    q.make();
+    document.getElementById("qr").innerHTML = q.createSvgTag({ cellSize: 4, margin: 2, scalable: true });
+  } catch (e) { document.getElementById("qr").textContent = "(không tạo được mã QR)"; }
+  const ua = navigator.userAgent;
+  const iOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  if (iOS && /CriOS|FxiOS|EdgiOS|GSA\//.test(ua)) document.getElementById("notSafari").hidden = false;
+  if (matchMedia("(display-mode: standalone)").matches || navigator.standalone) document.getElementById("installed").hidden = false;
+  fetch("releases.json", { cache: "no-store" }).then((r) => r.json()).then((d) => {
+    const r = (d.releases || []).slice().sort((a, b) => (a.version === b.version ? b.build - a.build : b.version.localeCompare(a.version, undefined, { numeric: true })))[0];
+    if (!r) return;
+    document.getElementById("rel").textContent = `Phiên bản ${r.version} (${r.build}) · ${r.date || ""}`;
+    const b = document.getElementById("relBadge");
+    b.textContent = r.channel === "beta" ? "BETA" : "Ổn định";
+    if (r.channel !== "beta") b.className = "badge stable";
+    for (const n of r.notes || []) { const li = document.createElement("li"); li.textContent = n; document.getElementById("notes").append(li); }
+  }).catch(() => { document.getElementById("rel").textContent = ""; });
+</script>
+</body>
+</html>

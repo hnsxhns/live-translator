@@ -1,0 +1,29 @@
+{
+  "app": "Live Translator iPad",
+  "feedback_email": "",
+  "releases": [
+    {
+      "version": "1.7.0",
+      "build": 1,
+      "channel": "beta",
+      "date": "2026-11-10",
+      "notes": [
+        "Bản thử đầu tiên cho iPad: tính năng như bản Windows 1.6.2 (chưa có Learning)."
+      ]
+    },
+    {
+      "version": "1.8.0",
+      "build": 2,
+      "channel": "beta",
+      "date": "2026-11-11",
+      "notes": [
+        "Đủ tính năng như bản máy tính 1.8.0, chạy trên iPad (cài từ Safari, không cần App Store).",
+        "Nghe tiếng Anh trực tiếp (Vosk + Whisper, chạy ngay trên iPad), dịch tiếng Việt từng dòng thẳng hàng, nhận diện người nói / Teacher.",
+        "Ý chính cộng dồn theo mốc giờ, không ghi đè và không kéo màn hình khi bạn đang đọc phía trên.",
+        "🎓 Learning: thư viện tài liệu học, Agenda, Documents, Summary, Exercises, Journal (điền PDF), Certificate (chia sẻ qua Mail/WhatsApp).",
+        "Backup/Restore dùng chung file với bản máy tính.",
+        "Đăng nhập bằng API key (đăng nhập Google/email chỉ có trên bản máy tính)."
+      ]
+    }
+  ]
+}

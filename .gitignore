@@ -13,3 +13,6 @@ vendor/
 # Local settings / logins
 config.json
 selftest.txt
+# iPad web app: libraries and built site (big; re-created by ipad/build.mjs)
+ipad/node_modules/
+ipad/site/
