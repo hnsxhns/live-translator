@@ -52,7 +52,8 @@ const libs = {
     ["pdfjs-dist/legacy/build/pdf.worker.min.mjs", "pdf.worker.min.mjs"]],
   "pdf-lib-1.17.1": [["pdf-lib/dist/pdf-lib.min.js", "pdf-lib.min.js"],
     ["@pdf-lib/fontkit/dist/fontkit.umd.min.js", "fontkit.umd.min.js"],
-    ["dejavu-fonts-ttf/ttf/DejaVuSans.ttf", "DejaVuSans.ttf"]],
+    ["dejavu-fonts-ttf/ttf/DejaVuSans.ttf", "DejaVuSans.ttf"],
+    ["dejavu-fonts-ttf/ttf/DejaVuSans-Bold.ttf", "DejaVuSans-Bold.ttf"]],
 };
 for (const [dir, files] of Object.entries(libs)) {
   fs.mkdirSync(path.join(OUT, "lib", dir), { recursive: true });

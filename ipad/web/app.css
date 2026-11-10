@@ -218,3 +218,27 @@ button { cursor: pointer; touch-action: manipulation; }
   .rows, .ptext { font-size: 16px; }
   .presetLbl { font-size: 13px; }
 }
+
+/* ---------- Learning 1.8.1+: Summary file list, Exercises list, guided steps ---------- */
+.lmItem.sub { margin-left: 24px; background: #fde2d6; font-size: 15px; }
+.actions .spacer { flex: 1; }
+.checklist { max-height: 40dvh; overflow: auto; border: 1px solid #e4e2dc; border-radius: 8px; }
+.checkrow { display: grid; grid-template-columns: 28px 70px minmax(0, 1fr) minmax(0, 1fr); gap: 6px; align-items: center;
+  padding: 8px; border-top: 1px solid #f0ece8; font-size: 14px; }
+.checkrow:first-child { border-top: 0; }
+.checkrow input { width: 20px; height: 20px; }
+.checkrow .cfile { color: var(--muted); overflow-wrap: anywhere; }
+.exlist { max-height: 38dvh; overflow: auto; border: 1px solid #e4e2dc; border-radius: 8px; font-size: 14px; }
+.exrow { display: grid; grid-template-columns: 60px minmax(0, 1.4fr) 70px minmax(0, 1fr); gap: 6px; padding: 8px;
+  border-top: 1px solid #f0ece8; cursor: pointer; overflow-wrap: anywhere; }
+.exrow.head { position: sticky; top: 0; background: #f0f0f0; font-weight: 700; cursor: default; border-top: 0; }
+.exrow.file { font-weight: 700; }
+.exrow.child { padding-left: 28px; }
+.exrow.sel { background: #fde2d6; }
+.exchildren { display: none; }
+.exchildren.open { display: block; }
+.exdetail { white-space: pre-wrap; background: #fbf8f6; border: 1px solid #e4e2dc; border-radius: 8px; padding: 8px;
+  font-size: 13px; max-height: 22dvh; overflow: auto; min-height: 3em; }
+
+.ptitle { position: relative; }
+.ptbtn { position: absolute; right: 4px; top: 3px; border: 0; border-radius: 4px; background: #e4e4e4; font-size: 12px; padding: 3px 8px; }

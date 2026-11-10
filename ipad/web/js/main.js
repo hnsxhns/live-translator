@@ -10,7 +10,7 @@ import { ensureFiles, hasWebGPU, modelFiles } from "./models.js";
 import { Translator, Chatter, Summarizer, TRANSLATE_PRESETS, DEFAULT_PRESET } from "./assistants.js";
 import { fileToBlock, ACCEPT } from "./files.js";
 import * as upd from "./updates.js";
-import { LearningUI, shareBlob } from "./learning.js";
+import { LearningUI, shareBlob, takeawaysPdf } from "./learning.js";
 
 // Running inside the TestFlight app (ipad/ios): files ship in the app, updates come from TestFlight.
 const NATIVE = !!(window.LT_NATIVE && window.webkit?.messageHandlers?.lt);
@@ -242,6 +242,7 @@ class App {
     $("edgeR").onclick = () => this.togglePanel("right");
     $("send").onclick = () => this.sendPrompt();
     $("learn").onclick = () => this.learning.showMenu();
+    $("takePdf").onclick = () => this.exportTakeaways();
     $("edgeLearn").onclick = () => this.learning.showMenu();
     $("summary").addEventListener("scroll", () => {
       const w = $("summary");
@@ -384,6 +385,7 @@ class App {
     this.attachments = [];
     this.refreshAttachBar();
     this.chatBusy = true;
+    this.chatFailed = false;
     $("send").disabled = true;
     $("send").textContent = "...";
     const names = files.map(([n]) => n).concat(job ? ["🎓 " + job.label] : []);
@@ -411,7 +413,7 @@ class App {
     const plain = names.filter((n) => !n.startsWith("🎓 ")), learn = names.filter((n) => n.startsWith("🎓 "));
     if (plain.length) w.append(el("span", "file", "📎 " + plain.join(", ") + "\n"));
     for (const n of learn) w.append(el("span", "file", n + "\n"));
-    w.append(el("span", "who", "Claude: "));
+    w.append(el("span", "who", "Claude: "), el("span", "ansStart"));   // file names after this become links
     if (answer !== null) w.append(answer);
     this.scrollEnd(w);
   }
@@ -622,12 +624,14 @@ class App {
         $("chat").append(val);
         this.scrollEnd($("chat"));
         break;
-      case "chat_error": $("chat").append(el("span", "err", val)); break;
+      case "chat_error": this.chatFailed = true; $("chat").append(el("span", "err", val)); break;
       case "chat_end":
         this.chatBusy = false;
         $("send").disabled = false;
         $("send").textContent = "Gửi ➤";
         if (!this.panelSide) { this.unread = true; this.refreshPanelBtn(); }
+        // guided exercise: put the next step's prompt in the box (or finish the solution); links in the answer
+        this.learning.onChatEnd(this.chatLog[this.chatLog.length - 1] || null, !this.chatFailed);
         break;
       case "summary": this.addTakeaways(val); break;
       case "ready":
@@ -652,6 +656,17 @@ class App {
     if (w.childNodes.length) w.append("\n\n");
     w.append(el("span", "ttime", `[${stamp}]\n`), bullets.trim());
     if (this.takeFollow) this.scrollEnd(w);
+  }
+
+  /** The whole takeaways history as a PDF (button on the pane's title bar). */
+  async exportTakeaways() {
+    if (!this.lastSummary.trim()) { alert("Chưa có ý chính nào để xuất."); return; }
+    try {
+      const { name, blob } = await takeawaysPdf(this.lastSummary);
+      if (await shareBlob(blob, name)) this.setStatus(`✓ Đã xuất PDF: ${name}`, "ok");
+    } catch (e) {
+      alert("Không xuất được PDF: " + (e.message || e));
+    }
   }
 
   renderTakeaways(text) {

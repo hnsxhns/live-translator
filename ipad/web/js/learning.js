@@ -30,7 +30,11 @@ const MB = 2 ** 20;
 const extOf = (name) => { const i = name.lastIndexOf("."); return i >= 0 ? name.slice(i).toLowerCase() : ""; };
 const stem = (name) => { const i = name.lastIndexOf("."); return i > 0 ? name.slice(0, i) : name; };
 const copyMarked = (name) => COPY_MARK.test(stem(name));
-const safeName = (name) => name.replace(/[\\/:*?"<>|]+/g, "_").trim() || "file";
+// a string that is safe as a file name: no reserved or control characters, no line breaks
+const safeName = (name) => String(name).replace(/[\\/:*?"<>|\x00-\x1f]+/g, "_").replace(/\s+/g, " ")
+  .replace(/^[ .]+|[ .]+$/g, "") || "file";
+// titles shown in prompts and labels: one line, no repeated spaces
+const clean = (t) => String(t || "").replace(/\s+/g, " ").trim();
 const pad = (n) => String(n).padStart(2, "0");
 const isoDate = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const stamp = (d = new Date()) => `${isoDate(d)} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
@@ -51,7 +55,11 @@ function db() {
   dbp = dbp || new Promise((resolve, reject) => {
     const r = indexedDB.open("lt-learning", 1);
     r.onupgradeneeded = () => { for (const s of ["meta", "files", "text"]) r.result.createObjectStore(s); };
-    r.onsuccess = () => resolve(r.result);
+    r.onsuccess = () => {
+      // another copy of the app (newer build, second tab) needs the database: let it go instead of blocking it
+      r.result.onversionchange = () => { r.result.close(); dbp = null; };
+      resolve(r.result);
+    };
     r.onerror = () => reject(r.error);
   });
   return dbp;
@@ -372,7 +380,7 @@ class Syncer {
       const info = `Đường dẫn: ${doc.rel}\nNgày sửa file: ${doc.mtime}\n\n<file name="${doc.name}">\n${text}\n</file>`;
       res = await askJson(this.key, CATALOG_SYSTEM, info, CATALOG_SCHEMA);
     }
-    Object.assign(doc, { title: res.title || doc.title, description: res.description || "",
+    Object.assign(doc, { title: clean(res.title) || doc.title, description: res.description || "",
       kind: KINDS.includes(res.kind) ? res.kind : "other", day: Math.max(0, parseInt(res.day, 10) || 0),
       date: res.date || "", exercises: res.exercises || [], catalogued: true });
   }
@@ -632,6 +640,257 @@ async function makeJournal(apiKey, lib, template, dayDocs, sessionText, instruct
   return { name, blob, preview: res.preview || "" };
 }
 
+// =====================================================================
+// Exercises: big exercises with steps (read from all files), step plans, solution PDF (v1.8.1+)
+// =====================================================================
+const STR = { type: "string" };
+const STEPS_SCHEMA = { type: "array", items: {
+  type: "object", additionalProperties: false, required: ["title", "instruction"],
+  properties: { title: STR, instruction: STR } } };
+const BIGEX_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["exercises"],
+  properties: { exercises: { type: "array", items: {
+    type: "object", additionalProperties: false, required: ["title", "goal", "location", "steps"],
+    properties: { title: STR, goal: STR, location: STR, steps: STEPS_SCHEMA } } } } };
+const MERGE_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["exercises"],
+  properties: { exercises: { type: "array", items: {
+    type: "object", additionalProperties: false, required: ["title", "goal", "day", "doc_ids", "steps"],
+    properties: { title: STR, goal: STR, day: { type: "integer" }, doc_ids: { type: "array", items: STR }, steps: STEPS_SCHEMA } } } } };
+const PLAN_SCHEMA = { type: "object", additionalProperties: false, required: ["steps"], properties: { steps: STEPS_SCHEMA } };
+const WHOLE_SCHEMA = {
+  type: "object", additionalProperties: false, required: ["goal", "exercises"],
+  properties: { goal: STR, exercises: { type: "array", items: {
+    type: "object", additionalProperties: false, required: ["title", "goal", "steps"],
+    properties: { title: STR, goal: STR, steps: STEPS_SCHEMA } } } } };
+const BIGEX_SYSTEM = (
+  "You read a course document and list its substantial exercises, assignments, labs or projects " +
+  "(bài tập lớn) — tasks the learner has to carry out, especially ones whose instructions go through " +
+  "concrete steps. Return JSON only. For each exercise: title (as written in the document), goal (one " +
+  "Vietnamese sentence), location (pages/sections), and steps in order: follow the document's own steps " +
+  "exactly when it gives them (title + instruction in Vietnamese, keeping technical terms, commands, " +
+  "numbers and names from the document); if it only states the task, derive 3-8 clear steps from it. " +
+  "Skip trivial one-line questions and reading-only items. Empty list if there are none.");
+const MERGE_SYSTEM = (
+  "You get exercises found file by file in a course folder. Return JSON with the list of distinct big " +
+  "exercises: merge entries that are the same exercise, or parts of one exercise spread over several files " +
+  "(keep every doc id, combine the steps in the right order without duplicates). Keep titles, goals and " +
+  "step texts as given (Vietnamese). day = the course day (0 if unknown). Order by day, then by course order.");
+const PLAN_SYSTEM = (
+  "Break the given exercise from the attached course document into concrete steps the learner can work " +
+  "through one at a time, following the document's own instructions and order (3-8 steps for one exercise; " +
+  "when asked to follow the whole file, one step per exercise or instruction block, in the file's order, up " +
+  "to 15 steps). Return JSON only: steps with " +
+  "a short title and a Vietnamese instruction (keep technical terms, commands and values from the document).");
+const WHOLE_SYSTEM = (
+  "The attached course file may be one big problem made of many sub-exercises that build on each other. " +
+  "Return JSON only: goal = the overall goal of the whole file (one Vietnamese sentence); exercises = every " +
+  "sub-exercise in the file's own order (title as written, goal in one Vietnamese sentence, and its concrete " +
+  "steps: follow the file's own steps exactly when it gives them, otherwise 2-6 clear steps; Vietnamese, " +
+  "keeping technical terms, commands, numbers and names from the file). Note in a step's instruction when it " +
+  "uses the result of an earlier sub-exercise. Skip reading-only parts.");
+
+/** askJson with one library document attached (falls back to its text if the file is refused). */
+async function askDoc(lib, key, system, doc, info, schema, effort = "medium") {
+  try {
+    return await askJson(key, system, [await lib.block(doc), { type: "text", text: info }], schema, { effort });
+  } catch (e) {
+    if (!(e instanceof ClaudeError && e.status === 400)) throw e;
+    const text = (await lib.text(doc)).slice(0, 300_000);
+    return askJson(key, system, `${info}\n\n<file name="${doc.name}">\n${text}\n</file>`, schema, { effort });
+  }
+}
+
+/** Plan a whole file: [overall goal, steps] where each step knows its sub-exercise (part). */
+export async function planFile(lib, key, doc, known) {
+  const info = `File: ${doc.rel}\nSub-exercises already noticed in it: ` + (known.join("; ") || "(none)");
+  const res = await askDoc(lib, key, WHOLE_SYSTEM, doc, info, WHOLE_SCHEMA);
+  const parts = (res.exercises || []).filter((p) => p.steps?.length);
+  const steps = [];
+  parts.forEach((p, k) => p.steps.forEach((st, j) => steps.push({ ...st, part: k + 1, parts: parts.length,
+    part_title: p.title, part_goal: p.goal || "", pstep: j + 1, psteps: p.steps.length })));
+  return [res.goal || "", steps];
+}
+
+/** Read the files, find the big exercises with their steps and save the list in the library.
+ *  Only files not read before are read again, unless `full`. Returns [number of exercises, problems]. */
+export async function scanExercises(lib, key, progress, full = false) {
+  const docs = lib.docs().filter((d) => !["journal_template", "certificate"].includes(d.kind));
+  const todo = full ? docs : docs.filter((d) => !("bigex" in d));
+  const problems = [];
+  if (todo.length) {
+    let done = 0;
+    progress(`Claude đang đọc bài tập trong tài liệu 0/${todo.length}...`);
+    const queue = [...todo];
+    const worker = async () => {
+      for (let d = queue.shift(); d; d = queue.shift()) {
+        try {
+          const res = await askDoc(lib, key, BIGEX_SYSTEM, d, `File: ${d.rel} (buổi ${d.day || "?"})`, BIGEX_SCHEMA);
+          d.bigex = res.exercises || [];
+        } catch (e) {
+          problems.push(`${d.name}: ${friendlyError(e)}`);
+        }
+        done++;
+        progress(`Claude đang đọc bài tập trong tài liệu ${done}/${todo.length}...`);
+      }
+    };
+    await Promise.all([worker(), worker(), worker()]);
+    await lib.save();
+  }
+  const entries = docs.flatMap((d) => (d.bigex || []).map((ex) =>
+    ({ doc_id: d.id, doc_title: d.title || d.name, day: d.day || 0, ...ex })));
+  let merged;
+  if (entries.length > 1) {
+    progress("Đang gộp và sắp xếp danh sách bài tập lớn...");
+    merged = (await askJson(key, MERGE_SYSTEM, JSON.stringify(entries), MERGE_SCHEMA, { effort: "medium" })).exercises || [];
+  } else {
+    merged = entries.map((e) => ({ title: e.title, goal: e.goal, day: e.day, doc_ids: [e.doc_id], steps: e.steps }));
+  }
+  const out = [];
+  merged.forEach((ex, i) => {
+    const ids = (ex.doc_ids || []).filter((x) => lib.get(x));
+    if (ex.steps?.length) out.push({ ...ex, doc_ids: ids, id: `bx${i + 1}` });
+  });
+  lib.data.big_exercises = out;
+  lib.data.big_exercises_updated = stamp();
+  await lib.save();
+  return [out.length, problems];
+}
+
+/** Steps for an exercise from the per-document list (it has none yet). */
+export async function planSteps(lib, key, ex) {
+  const doc = ex.doc;
+  const info = `Exercise: ${ex.title}\nSummary: ${ex.summary || ""}\nLocation: ${ex.location || ""}\nFile: ${doc.rel}`;
+  return (await askDoc(lib, key, PLAN_SYSTEM, doc, info, PLAN_SCHEMA)).steps || [];
+}
+
+/** Claude's plain text (light Markdown) -> paragraphs of [text, bold] runs. */
+export function textBlocks(text) {
+  return (text || "").trim().split(/\n\s*\n/).filter((p) => p.trim()).map((para) => {
+    const runs = [];
+    para.split("\n").forEach((line, k) => {
+      if (k) runs.push(["\n", false]);
+      let ln = line.replace(/\s+$/, "");
+      const h = /^#{1,6}\s+(.*)/.exec(ln);
+      if (h) { runs.push([h[1].replace(/\*\*/g, ""), true]); return; }
+      ln = ln.replace(/^(\s*)[-*]\s+/, "$1• ");
+      ln.split(/(\*\*.+?\*\*)/).forEach((part) => {
+        if (!part) return;
+        const b = /^\*\*(.+)\*\*$/.exec(part);
+        runs.push(b ? [b[1], true] : [part, false]);
+      });
+    });
+    return { type: "p", runs };
+  });
+}
+
+/** A4 PDF from simple blocks ({type: h1|h2|h3|meta|instr|p, runs: [[text, bold]]}) with a Vietnamese font. */
+export async function writePdf(blocks) {
+  const L = await pdfLib();
+  const doc = await L.PDFDocument.create();
+  doc.registerFontkit(window.fontkit);
+  const get = async (f) => (await fetch(ROOT + "lib/pdf-lib-1.17.1/" + f)).arrayBuffer();
+  const regular = await doc.embedFont(await get("DejaVuSans.ttf"), { subset: true });
+  const bold = await doc.embedFont(await get("DejaVuSans-Bold.ttf"), { subset: true });
+  const rgb = (h) => L.rgb(((h >> 16) & 255) / 255, ((h >> 8) & 255) / 255, (h & 255) / 255);
+  const ST = { h1: { size: 17, color: 0x8a3f22, bold: true, before: 0, after: 6 },
+               h2: { size: 13.5, color: 0x8a3f22, bold: true, before: 14, after: 4 },
+               h3: { size: 12, color: 0x1f1f1f, bold: true, before: 10, after: 3 },
+               meta: { size: 9.5, color: 0x666666, before: 2, after: 4 },
+               instr: { size: 10.5, color: 0x444444, before: 2, after: 4 },
+               p: { size: 11, color: 0x1f1f1f, before: 4, after: 4 } };
+  const W = 595.28, H = 841.89, M = 50, maxW = W - 2 * M;
+  let page = doc.addPage([W, H]);
+  let y = H - M;
+  for (const b of blocks) {
+    const st = ST[b.type] || ST.p;
+    const size = st.size, lh = size * 1.35;
+    y -= st.before;
+    // words with their font; "\n" forces a new line
+    const words = [];
+    for (const [text, isBold] of b.runs) {
+      const font = isBold || st.bold ? bold : regular;
+      if (text === "\n") { words.push({ br: true }); continue; }
+      for (const w of text.split(/(\s+)/)) if (w) words.push({ text: w, font, space: /^\s+$/.test(w) });
+    }
+    const lines = [[]];
+    let x = 0;
+    for (const w of words) {
+      if (w.br) { lines.push([]); x = 0; continue; }
+      let width = w.font.widthOfTextAtSize(w.text, size);
+      if (w.space) { if (x > 0) { lines[lines.length - 1].push({ ...w, text: " ", x }); x += w.font.widthOfTextAtSize(" ", size); } continue; }
+      if (x + width > maxW && x > 0) { lines.push([]); x = 0; }
+      let t = w.text;
+      while (width > maxW) {                                  // a very long word (URL, path)
+        let k = t.length - 1;
+        while (k > 1 && w.font.widthOfTextAtSize(t.slice(0, k), size) > maxW) k--;
+        lines[lines.length - 1].push({ ...w, text: t.slice(0, k), x: 0 });
+        lines.push([]);
+        t = t.slice(k);
+        width = w.font.widthOfTextAtSize(t, size);
+      }
+      lines[lines.length - 1].push({ ...w, text: t, x });
+      x += width;
+    }
+    for (const line of lines) {
+      if (y - lh < M) { page = doc.addPage([W, H]); y = H - M; }
+      y -= lh;
+      for (const w of line) page.drawText(w.text, { x: M + w.x, y: y + (lh - size) / 2, size, font: w.font, color: rgb(st.color) });
+    }
+    y -= st.after;
+  }
+  return doc.save();
+}
+
+/** The whole key-takeaways history (blocks headed "[HH:MM]") as a PDF. Returns {name, blob}. */
+export async function takeawaysPdf(history, title = "Ý chính / Key takeaways") {
+  const d = new Date();
+  const when = `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const blocks = [{ type: "h1", runs: [[title, false]] }, { type: "meta", runs: [[`Xuất ngày ${when}`, false]] }];
+  for (let block of history.trim().split(/\n\s*\n(?=\[\d\d:\d\d\]\n)/)) {
+    const t = /^\[(\d\d:\d\d)\]\n/.exec(block);
+    if (t) {
+      blocks.push({ type: "h3", runs: [[t[1], false]] });
+      block = block.slice(t[0].length);
+    }
+    blocks.push(...textBlocks(block));
+  }
+  const name = `KeyTakeaways_${isoDate(d).replaceAll("-", "")}_${pad(d.getHours())}${pad(d.getMinutes())}.pdf`;
+  return { name, blob: new Blob([await writePdf(blocks)], { type: "application/pdf" }) };
+}
+
+/** The exercise solution (summary + every step) as a PDF. Returns {name, blob}. */
+export async function solutionPdf(lib, session, summary) {
+  const ex = session.ex;
+  const docs = (ex.doc_ids || []).map((i) => lib.get(i)).filter(Boolean);
+  const d = new Date();
+  const meta = [`Ngày ${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}`];
+  if (ex.day) meta.push(`Buổi ${ex.day}`);
+  if (docs.length) meta.push("Tài liệu: " + docs.map((x) => x.title || x.name).join(", "));
+  const one = (type, text, isBold = false) => ({ type, runs: [[text, isBold]] });
+  const blocks = [one("h1", `Lời giải bài tập: ${ex.title}`), one("meta", meta.join(" · "))];
+  if (ex.goal) blocks.push({ type: "p", runs: [["Mục tiêu: ", true], [ex.goal, false]] });
+  blocks.push(one("h2", "Tổng kết lời giải"), ...textBlocks(summary), one("h2", "Chi tiết từng bước"));
+  let part = null;
+  session.log.forEach((item, k) => {
+    const st = item.step;
+    if (st.part && st.part !== part) {
+      part = st.part;
+      blocks.push(one("h2", `Bài ${part}/${st.parts}: ${st.part_title}`));
+      if (st.part_goal) blocks.push(one("instr", st.part_goal));
+    }
+    const label = st.part ? `Bước ${st.pstep}/${st.psteps}` : `Bước ${k + 1}`;
+    blocks.push(one("h3", `${label}: ${st.title || ""}`));
+    if (st.instruction) blocks.push(one("instr", st.instruction));
+    blocks.push(...textBlocks(item.a));
+  });
+  const bytes = await writePdf(blocks);
+  const name = `LoiGiai_${safeName(ex.title).slice(0, 50)}_${isoDate(d).replaceAll("-", "")}_${pad(d.getHours())}${pad(d.getMinutes())}.pdf`;
+  const blob = new Blob([bytes], { type: "application/pdf" });
+  await idbPut("files", "solution/" + name, blob);
+  return { name, blob };
+}
+
 // ---------------- open / save / share a file on the iPad ----------------
 // Inside the TestFlight app: files go to the iOS share sheet (Save to Files, Mail, WhatsApp, AirDrop...)
 const NATIVE = typeof window !== "undefined" && window.LT_NATIVE && window.webkit?.messageHandlers?.lt;
@@ -681,6 +940,9 @@ export class LearningUI {
     this.ready = this.lib.load();
     this.job = null;                 // documents/instructions that go with the next prompt
     this.syncing = false;
+    this.session = null;             // the exercise being solved step by step
+    this.sentJob = null;             // the job that went with the last sent prompt
+    this.scanning = false;           // reading the folder for big exercises
   }
 
   // ---- menu ----
@@ -691,18 +953,23 @@ export class LearningUI {
     const body = el("div", "lmenu");
     body.append(el("p", "muted", n ? `Thư viện: ${n} tài liệu · đồng bộ ${this.lib.data.synced || "-"}`
                                    : "Chưa có tài liệu — chọn Folder để bắt đầu"));
-    const item = (label, fn, enabled = true) => {
-      const b = el("button", "lmItem", label);
+    const item = (label, fn, enabled = true, cls = "lmItem") => {
+      const b = el("button", cls, label);
       b.disabled = !enabled;
       b.onclick = () => { this.app.closeSheet(); fn(); };
       body.append(b);
     };
-    item("📁  Folder — " + (this.syncing ? "đang đồng bộ..." : n ? "đồng bộ thư mục học" : "chọn thư mục học"),
-         () => this.folder(), !this.syncing);
+    item("📁  Folder — " + (this.syncing ? "đang đồng bộ..." : "chọn thư mục học"), () => this.folder(), !this.syncing);
+    if (this.lib.data.folder) item("🔄  Refresh — tìm file mới, cập nhật dữ liệu", () => this.refresh(), !this.syncing);
     item("🗓  Agenda — chương trình học", () => this.agenda(), n > 0);
     item("📚  Documents — danh sách tài liệu", () => this.documents(), n > 0);
     item("📝  Summary — tổng kết buổi học", () => this.summary(), n > 0);
-    item("✏️  Exercises — bài tập, hướng dẫn từng bước", () => this.exercises(), n > 0);
+    item("✏️  Exercises — bài tập, giải theo từng bước", () => this.exercises(), n > 0);
+    if (this.session) {
+      const ex = this.session.ex;
+      item(`⏹  Dừng bài "${ex.title.slice(0, 30)}" (bước ${this.session.i + 1}/${ex.steps.length})`,
+           () => this.stopSession(), true, "lmItem sub");
+    }
     item("📓  Journal — điền nhật ký buổi học (PDF)", () => this.journal(), n > 0);
     item("🏆  Certificate — chứng chỉ & chia sẻ", () => this.certificate());
     this.app.sheet("🎓 Learning", body);
@@ -721,6 +988,7 @@ export class LearningUI {
   takeJob() {
     const job = this.job;
     this.job = null;
+    this.sentJob = job;                // remembered until Claude finishes answering (guided exercises)
     return job;
   }
 
@@ -745,35 +1013,47 @@ export class LearningUI {
     this.app.scrollEnd(w);
   }
 
-  // ---- Folder ----
-  async folder() {
+  // ---- Folder / Refresh ----
+  // The desktop app reads the study folder itself; on the iPad the user picks the folder's files (Files app).
+  // Picking them again finds the new ones: files already in the library are skipped (same content = same file).
+  async folder(refresh = false, onDone = null) {
     await this.ready;
     const body = el("div", "lform");
     const last = this.lib.data.folder;
-    body.append(el("p", "", last
-      ? `Lần trước: ${last} (đồng bộ ${this.lib.data.synced || "-"}). Chọn lại thư mục hoặc các file học — file đã có sẽ tự bỏ qua, chỉ tài liệu mới được upload.`
+    body.append(el("p", "", refresh
+      ? `Thư mục học: ${last} (đồng bộ ${this.lib.data.synced || "-"}). Chọn lại các file trong thư mục (app Tệp → Chọn → ` +
+        "chọn tất cả): file đã có sẽ tự bỏ qua, chỉ tài liệu mới được upload và dữ liệu được làm mới."
       : "Chọn thư mục học (hoặc chọn nhiều file trong app Tệp) để Claude đọc, phân loại theo buổi và tìm bài tập."));
     const row = el("div", "actions");
     const pickFiles = el("button", "primary", "📄 Chọn file");
     const pickDir = el("button", "", "📁 Chọn cả thư mục");
-    const refresh = el("button", "", "🔄 Chỉ làm mới (upload/phân loại phần còn thiếu)");
+    const update = el("button", "", "🔄 Chỉ cập nhật dữ liệu (không thêm file)");
     const input = el("input");
     input.type = "file";
     input.multiple = true;
     input.hidden = true;
-    input.onchange = () => { const fs = [...input.files]; input.remove(); if (fs.length) this.sync(fs); };
+    input.onchange = () => { const fs = [...input.files]; input.remove(); if (fs.length) this.sync(fs, onDone); };
     pickFiles.onclick = () => { this.app.closeSheet(); input.removeAttribute("webkitdirectory"); input.click(); };
     pickDir.onclick = () => { this.app.closeSheet(); input.setAttribute("webkitdirectory", ""); input.click(); };
-    refresh.onclick = () => { this.app.closeSheet(); this.sync(null); };
+    update.onclick = () => { this.app.closeSheet(); this.sync(null, onDone); };
     document.body.append(input);
     row.append(pickFiles);
     if ("webkitdirectory" in input) row.append(pickDir);
-    if (last) row.append(refresh);
+    if (last) row.append(update);
     body.append(row);
-    this.app.sheet("Learning — Folder", body);
+    this.app.sheet(refresh ? "Learning — Refresh" : "Learning — Folder", body);
   }
 
-  async sync(files) {
+  refresh(onDone = null) {
+    if (!this.lib.data.folder) {
+      alert("Chưa chọn thư mục học. Hãy chọn Folder.");
+      return;
+    }
+    this.folder(true, onDone);
+  }
+
+  async sync(files, onDone = null) {
+    if (this.syncing) return;
     this.syncing = true;
     this.chatNote(files ? `Bắt đầu đồng bộ ${files.length} file` : "Bắt đầu làm mới thư viện");
     const progress = (msg) => this.app.setStatus("🎓 " + msg);
@@ -789,119 +1069,387 @@ export class LearningUI {
       this.app.setStatus(`🎓 Đồng bộ lỗi: ${friendlyError(e)}`, "err");
     } finally {
       this.syncing = false;
+      onDone?.();
     }
   }
 
   // ---- Agenda ----
-  agenda() {
-    const ids = this.lib.docs().filter((d) => d.kind === "agenda").map((d) => d.id);
-    const src = ids.length ? "tài liệu Agenda đính kèm và danh mục tài liệu" : "danh mục tài liệu đã upload";
+  async agenda() {
+    const docs = this.lib.docs();
+    const ids = docs.filter((d) => d.kind === "agenda").map((d) => d.id);
+    // the first part of every document (cover page: title, teacher, date, session) helps place it in the agenda
+    const heads = [];
+    for (const d of docs) {
+      if (["journal_template", "certificate"].includes(d.kind)) continue;
+      heads.push(`[${d.name}] buổi ${d.day || "?"} · ${clean(d.title)}\n${(await this.lib.text(d)).slice(0, 1200).trim()}`);
+    }
+    const src = ids.length ? "tài liệu Agenda đính kèm, phần đầu của từng tài liệu" : "phần đầu của từng tài liệu";
     this.setPrompt(
-      `Hãy in ra Agenda (chương trình học) của khóa học dựa trên ${src}: liệt kê theo từng buổi/ngày ` +
-      "gồm ngày học, chủ đề chính, nội dung từng phần, bài tập và tài liệu liên quan. Trình bày gọn, dễ đọc.",
-      { kind: "agenda", label: ids.length ? `Agenda · ${ids.length} tài liệu` : "Agenda · danh mục", doc_ids: ids });
+      `Hãy lập Agenda chi tiết của khóa học dựa trên ${src} và nội dung thầy giảng (nếu có), phân cấp ` +
+      "Ngày → Buổi (sáng/chiều/tối) → Phiên. Mỗi phiên ghi: giờ (nếu có), chủ đề, tên giảng viên, và các tài " +
+      "liệu dùng trong phiên đó — ghi đúng tên file trong thư viện (kể cả đuôi .pdf/.docx) để bấm mở được. " +
+      "Trình bày đúng mẫu sau, không thêm giải thích; thông tin nào không có thì ghi \"—\":\n" +
+      "📅 Ngày 1 · Thứ Hai 10/11/2026\n" +
+      "  ▸ Buổi sáng\n" +
+      "    • Phiên 1 · 08:30–10:00 · Chủ đề — GV: Tên giảng viên\n" +
+      "        📄 Ten_file.pdf",
+      { kind: "agenda", doc_ids: ids, label: `Agenda chi tiết · ${docs.length} tài liệu`,
+        blocks: heads.length ? [{ type: "text", text: `<document_heads>\n${heads.join("\n\n")}\n</document_heads>` }] : [] });
   }
 
-  // ---- Summary ----
-  summary() {
-    this.pickDay("Summary — tổng kết buổi học", true, ([day, date, docs, mode]) => {
-      const books = docs.filter((d) => !["journal_template", "certificate"].includes(d.kind));
-      const when = day ? `Buổi ${day}` + (date ? ` (ngày ${fmtDate(date)})` : "") : "toàn khóa học";
-      const how = mode === "book" ? "chỉ dựa trên tài liệu sách/bài học đã upload của buổi này"
-        : "kết hợp tài liệu sách đã upload của buổi này với nội dung thầy giảng (bản ghi lời giảng và " +
-          "bản dịch đang có trên màn hình); ghi rõ ý nào từ sách, ý nào thầy nhấn mạnh hoặc bổ sung";
-      this.setPrompt(
-        `Hãy tổng kết tất cả thông tin của ${when}, ${how}. Gồm: các ý chính, khái niệm quan trọng, ví dụ, ` +
-        "bài tập đã giao và những điểm cần ghi nhớ.",
-        { kind: "summary", label: `Summary · ${when} · ${mode === "book" ? "Sách" : "Sách + thầy giảng"} · ${books.length} tài liệu`,
-          doc_ids: books.map((d) => d.id) });
-    });
-  }
-
-  /** Choose the course day (and summary mode); calls done([day, date, docs, mode]). */
-  pickDay(title, withMode, done) {
-    const choices = this.lib.days().map(([day, date, ds]) => [day, date, ds,
-      `Buổi ${day}` + (date ? ` · ${fmtDate(date)}` : "") + " · " +
-      ds.slice(0, 3).map((d) => (d.title || d.name).slice(0, 40)).join(", ") + (ds.length > 3 ? " ..." : "")]);
-    choices.push([0, "", this.lib.docs(), "Toàn khóa (tất cả tài liệu)"]);
-    const body = el("div", "lform");
-    body.append(el("b", "", "Chọn buổi học:"));
-    const sel = el("select", "wide");
-    choices.forEach((c, i) => sel.append(new Option(c[3], String(i))));
-    sel.value = String(choices.length > 1 ? choices.length - 2 : 0);
-    body.append(sel);
-    let mode = "mix";
-    if (withMode) {
-      body.append(el("b", "", "Cách tổng kết:"));
-      for (const [val, txt] of [["book", "Theo file sách đã upload"], ["mix", "Kết hợp sách + nội dung thầy giảng trên màn hình"]]) {
-        const lab = el("label", "radio");
-        const r = el("input");
-        r.type = "radio";
-        r.name = "lmode";
-        r.checked = val === mode;
-        r.onchange = () => { mode = val; };
-        lab.append(r, " " + txt);
-        body.append(lab);
+  /** Library file names in Claude's latest answer become links that open the file. */
+  linkify() {
+    document.getElementById("chat").normalize();          // streamed pieces -> whole text, so names are not split
+    const marker = [...document.querySelectorAll("#chat .ansStart")].pop();
+    if (!marker) return;
+    const names = this.lib.docs().map((d) => [d.name.toLowerCase(), d]).sort((a, b) => b[0].length - a[0].length);
+    if (!names.length) return;
+    const nodes = [];
+    for (let n = marker.nextSibling; n; n = n.nextSibling) if (n.nodeType === Node.TEXT_NODE) nodes.push(n);
+    for (let node of nodes) {
+      for (;;) {
+        const low = node.data.toLowerCase();
+        let best = null;
+        for (const [name, d] of names) {
+          const i = low.indexOf(name);
+          if (i >= 0 && (!best || i < best[0])) best = [i, name.length, d];
+        }
+        if (!best) break;
+        const [i, len, d] = best;
+        const hit = node.splitText(i);
+        const rest = hit.splitText(len);
+        const a = el("span", "flink", hit.data);
+        a.onclick = async () => { try { openBlob(await this.lib.file(d), d.name); } catch (e) { alert(e.message); } };
+        hit.replaceWith(a);
+        node = rest;
       }
     }
-    this.buttons(body, "Tạo prompt", () => {
-      const c = choices[+sel.value];
-      done([c[0], c[1], c[2], mode]);
-    });
-    this.app.sheet(title, body);
   }
 
-  buttons(body, ok, onOk) {
+  // ---- Summary: mode, course day, and the exact book files ----
+  summary() {
+    const books = this.lib.docs().filter((d) => !["journal_template", "certificate"].includes(d.kind));
+    const days = this.lib.days();
+    const body = el("div", "lform");
+    body.append(el("b", "", "Cách tổng kết:"));
+    let mode = "book";
+    for (const [val, txt] of [["book", "Theo file sách đã upload (chọn file bên dưới)"],
+                              ["mix", "Kết hợp sách + nội dung thầy giảng trên màn hình"]]) {
+      const lab = el("label", "radio");
+      const r = el("input");
+      r.type = "radio";
+      r.name = "smode";
+      r.checked = val === mode;
+      r.onchange = () => { mode = val; };
+      lab.append(r, " " + txt);
+      body.append(lab);
+    }
+    body.append(el("b", "", "Buổi học:"));
+    const sel = el("select", "wide");
+    sel.append(new Option("Tự chọn tài liệu (không theo buổi)", "0"));
+    days.forEach(([day, date], i) => sel.append(new Option(`Buổi ${day}` + (date ? ` · ${fmtDate(date)}` : ""), String(i + 1))));
+    sel.value = String(days.length);
+    body.append(sel, el("b", "", "File sách dùng để tổng kết (chạm để chọn nhiều file):"));
+    const list = el("div", "checklist");
+    const count = el("p", "muted", "");
+    const boxes = new Map();
+    for (const d of books) {
+      const lab = el("label", "checkrow");
+      const cb = el("input");
+      cb.type = "checkbox";
+      cb.onchange = () => { count.textContent = `Đã chọn ${[...boxes.values()].filter((b) => b.checked).length} file`; };
+      lab.append(cb, el("span", "cday", d.day ? `Buổi ${d.day}` : "-"), el("span", "ctitle", d.title || d.name),
+                 el("span", "cfile", d.name));
+      boxes.set(d.id, cb);
+      list.append(lab);
+    }
+    const dayChanged = () => {
+      const i = +sel.value;
+      const ids = new Set(i ? days[i - 1][2].map((d) => d.id) : []);
+      for (const [id, cb] of boxes) cb.checked = ids.has(id);
+      count.textContent = `Đã chọn ${ids.size} file`;
+      list.querySelector("input:checked")?.scrollIntoView({ block: "nearest" });
+    };
+    sel.onchange = dayChanged;
+    body.append(list, count);
     const row = el("div", "actions end");
     const cancel = el("button", "", "Hủy");
     cancel.onclick = () => this.app.closeSheet();
-    const go = el("button", "primary", ok);
-    go.onclick = () => { this.app.closeSheet(); onOk(); };
+    const go = el("button", "primary", "Tạo prompt");
+    go.onclick = () => {
+      const ids = [...boxes].filter(([, cb]) => cb.checked).map(([id]) => id);
+      if (!ids.length) { alert("Hãy chọn ít nhất 1 file sách."); return; }
+      this.app.closeSheet();
+      const chosen = ids.map((i) => this.lib.get(i));
+      const names = chosen.map((d) => `"${clean(d.title || d.name)}" (${d.name})`).join("; ");
+      const di = +sel.value;
+      const when = di ? `Buổi ${days[di - 1][0]}` + (days[di - 1][1] ? ` (ngày ${fmtDate(days[di - 1][1])})` : "") : "";
+      const text = mode === "book"
+        ? `Hãy tổng kết ${when ? "nội dung " + when : "nội dung"} chỉ dựa trên các file sách sau: ${names}. ` +
+          "Gồm: các ý chính, khái niệm quan trọng, ví dụ, bài tập và những điểm cần ghi nhớ."
+        : `Hãy tổng kết ${when || "buổi học"} kết hợp các file sách (${names}) với nội dung thầy giảng ` +
+          "(bản ghi lời giảng và bản dịch đang có trên màn hình); ghi rõ ý nào từ sách, ý nào thầy nhấn " +
+          "mạnh hoặc bổ sung. Gồm: các ý chính, khái niệm quan trọng, ví dụ, bài tập đã giao và những " +
+          "điểm cần ghi nhớ.";
+      this.setPrompt(text, { kind: "summary", doc_ids: ids,
+        label: `Summary · ${when ? when + " · " : ""}${mode === "book" ? "Sách" : "Sách + thầy giảng"} · ${ids.length} file` });
+    };
     row.append(cancel, go);
     body.append(row);
-    return go;
+    this.app.sheet("Summary — tổng kết", body, true);
+    dayChanged();
   }
 
-  // ---- Exercises ----
+  // ---- Exercises: big exercises (whole folder, with steps) or per file ----
   exercises() {
-    const exs = this.lib.exercises();
-    if (!exs.length) {
-      alert("Chưa tìm thấy bài tập nào trong các tài liệu đã upload.\nHãy thêm tài liệu bài tập vào thư mục học rồi chọn Folder để đồng bộ lại.");
-      return;
-    }
+    if (this.session && !confirm(`Đang làm bài "${this.session.ex.title}" (bước ${this.session.i + 1}/` +
+        `${this.session.ex.steps.length}).\nDừng bài này để chọn bài khác?`)) return;
+    this.session = null;
     const body = el("div", "lform");
-    const table = el("div", "ltable");
-    const desc = el("p", "muted", "Chạm để chọn một bài tập.");
-    let chosen = null;
-    const choose = () => {
-      if (!chosen) return;
-      const ex = chosen, doc = ex.doc;
-      const where = ex.location ? `, ${ex.location}` : "";
-      const day = ex.day ? `Buổi ${ex.day}, ` : "";
-      this.setPrompt(
-        `Hướng dẫn tôi làm bài tập "${ex.title}" (${day}trong tài liệu "${doc.title || doc.name}"` +
-        `${where}) từng bước một. Bắt đầu bằng việc nêu lại đề bài và mục tiêu, sau đó chỉ hướng dẫn bước 1 ` +
-        "và chờ tôi trả lời hoặc làm xong rồi mới sang bước tiếp theo. Không đưa ngay toàn bộ lời giải; " +
-        "nếu tôi làm sai, hãy gợi ý để tôi tự sửa.",
-        { kind: "exercise", label: `Exercise · ${ex.title.slice(0, 40)}`, doc_ids: [doc.id] });
-    };
-    table.append(el("div", "lth", "Buổi"), el("div", "lth", "Bài tập"), el("div", "lth", "Tài liệu"));
-    for (const ex of exs) {
-      const cells = [el("div", "ltd", String(ex.day || "-")), el("div", "ltd", ex.title), el("div", "ltd", ex.doc.title || ex.doc.name)];
-      for (const c of cells) {
-        c.onclick = () => {
-          table.querySelectorAll(".sel").forEach((x) => x.classList.remove("sel"));
-          cells.forEach((x) => x.classList.add("sel"));
-          chosen = ex;
-          desc.textContent = `${ex.summary}  (${ex.location})`;
-        };
-        c.ondblclick = () => { this.app.closeSheet(); choose(); };
-      }
-      table.append(...cells);
+    let mode = "big";
+    const modes = el("div", "actions");
+    for (const [val, txt] of [["big", "Bài tập lớn (đọc toàn bộ thư mục, theo các bước)"],
+                              ["doc", "Theo file bài tập (chọn file cụ thể)"]]) {
+      const lab = el("label", "radio");
+      const r = el("input");
+      r.type = "radio";
+      r.name = "xmode";
+      r.checked = val === mode;
+      r.onchange = () => { mode = val; fill(); };
+      lab.append(r, " " + txt);
+      modes.append(lab);
     }
-    body.append(table, desc);
-    this.buttons(body, "Chọn bài", choose);
-    this.app.sheet("Exercises — chọn bài tập", body, true);
+    const status = el("p", "muted", "");
+    const list = el("div", "exlist");
+    const detail = el("div", "exdetail", "");
+    const fullLab = el("label", "radio");
+    const full = el("input");
+    full.type = "checkbox";
+    fullLab.append(full, " Đọc lại toàn bộ file");
+    const refreshBtn = el("button", "", "🔄 Refresh danh sách");
+    const startBtn = el("button", "primary", "▶ Bắt đầu bài tập");
+    const close = el("button", "", "Đóng");
+    close.onclick = () => this.app.closeSheet();
+    const row = el("div", "actions");
+    const right = el("span", "spacer");
+    row.append(refreshBtn, fullLab, right, close, startBtn);
+    body.append(modes, status, list, detail, row);
+    const alive = () => body.isConnected;
+    let chosen = null;
+
+    const fileExercises = (d) => {           // exercises found in one file: with steps (folder scan) first
+      const out = (d.bigex || []).map((e) => ({ ...e }));
+      const seen = new Set(out.map((e) => e.title.trim().toLowerCase()));
+      for (const e of d.exercises || []) {
+        if (!seen.has(e.title.trim().toLowerCase())) out.push({ title: e.title, goal: e.summary || "", location: e.location || "", steps: [] });
+      }
+      return out;
+    };
+    const showStatus = () => {
+      if (mode === "big") {
+        const upd = this.lib.data.big_exercises_updated;
+        const n = (this.lib.data.big_exercises || []).length;
+        status.textContent = upd ? `${n} bài tập lớn · cập nhật ${upd}` : "Chưa có danh sách — nhấn 🔄 Refresh để Claude đọc toàn bộ thư mục.";
+      } else {
+        status.textContent = "Chọn một file bài tập: bấm ▶ để làm lần lượt toàn bộ bài trong file, hoặc mở file và chọn một bài cụ thể.";
+      }
+    };
+    const select = (rowEl, it) => {
+      list.querySelectorAll(".sel").forEach((x) => x.classList.remove("sel"));
+      rowEl.classList.add("sel");
+      chosen = it;
+      detail.textContent = "";
+      if (it.kind === "file") {
+        rowEl.nextSibling?.classList?.contains("exchildren") && rowEl.nextSibling.classList.add("open");
+        detail.textContent = `${it.doc.description || ""}\n\n` + (it.exs.length
+          ? "Bài tập trong file:\n" + it.exs.map((e) => `  • ${e.title}`).join("\n")
+          : "Chưa thấy bài tập riêng trong file (nhấn 🔄 Refresh để Claude đọc kỹ file).") +
+          "\n\n▶ Bắt đầu = làm lần lượt toàn bộ bài tập/hướng dẫn trong file này.";
+      } else {
+        const ex = it.ex;
+        detail.textContent = (ex.goal || "") + (ex.location ? `  (${ex.location})` : "") + "\n\n" + (ex.steps?.length
+          ? ex.steps.map((s, k) => `${k + 1}. ${s.title} — ${s.instruction}`).join("\n")
+          : "(Claude sẽ chia bài thành các bước khi bắt đầu.)");
+      }
+    };
+    const rowOf = (cells, it, cls = "exrow") => {
+      const r = el("div", cls);
+      cells.forEach((c, i) => r.append(el("span", ["xday", "xtitle", "xsteps", "xdocs"][i], c)));
+      r.onclick = () => select(r, it);
+      r.ondblclick = () => { select(r, it); start(); };
+      return r;
+    };
+    const fill = () => {
+      list.replaceChildren();
+      chosen = null;
+      detail.textContent = "";
+      list.append(rowOf(["Buổi", "Bài tập", "Số bước", "Tài liệu / file"], null, "exrow head"));
+      list.lastChild.onclick = null;
+      if (mode === "big") {
+        for (const ex of this.lib.data.big_exercises || []) {
+          const docs = (ex.doc_ids || []).map((i) => this.lib.get(i)).filter(Boolean);
+          list.append(rowOf([String(ex.day || "-"), ex.title, String(ex.steps.length),
+                             docs.map((d) => d.title || d.name).join(", ")], { kind: "big", ex }));
+        }
+      } else {
+        for (const d of this.lib.docs()) {
+          if (["journal_template", "certificate", "agenda"].includes(d.kind)) continue;
+          const exs = fileExercises(d);
+          list.append(rowOf([String(d.day || "-"), "📄 " + (d.title || d.name), exs.length ? `${exs.length} bài` : "-", d.name],
+                            { kind: "file", doc: d, exs }, "exrow file"));
+          const kids = el("div", "exchildren");
+          for (const ex of exs) {
+            kids.append(rowOf([String(d.day || "-"), "✏ " + ex.title, String(ex.steps.length || "-"), d.name],
+                              { kind: "ex", doc: d, ex }, "exrow child"));
+          }
+          list.append(kids);
+        }
+      }
+      showStatus();
+      refreshBtn.disabled = this.scanning;
+    };
+    const refresh = async () => {
+      this.scanning = true;
+      refreshBtn.disabled = true;
+      try {
+        const [n, problems] = await scanExercises(this.lib, this.app.apiKey,
+          (msg) => { if (alive()) status.textContent = "⏳ " + msg; }, full.checked);
+        this.chatNote(`Đã cập nhật danh sách: ${n} bài tập lớn.` +
+          (problems.length ? "\nLưu ý:\n" + problems.slice(0, 8).map((p) => "• " + p).join("\n") : ""));
+      } catch (e) {
+        this.chatNote(`Chưa cập nhật được danh sách bài tập: ${friendlyError(e)}`, true);
+      } finally {
+        this.scanning = false;
+        if (alive()) fill();
+      }
+    };
+    const start = async () => {
+      const it = chosen;
+      if (!it) return;
+      if (it.kind === "big") { this.app.closeSheet(); this.startSession(it.ex); return; }
+      const d = it.doc;
+      if (it.kind === "ex" && it.ex.steps?.length) {
+        this.app.closeSheet();
+        this.startSession({ title: it.ex.title, goal: it.ex.goal || "", day: d.day || 0, doc_ids: [d.id], steps: it.ex.steps });
+        return;
+      }
+      startBtn.disabled = true;
+      try {
+        let sess;
+        if (it.kind === "file") {            // the whole file: one big problem, sub-exercise by sub-exercise
+          status.textContent = "⏳ Claude đang đọc cả file, lập các bài tập con và các bước...";
+          const [goal, steps] = await planFile(this.lib, this.app.apiKey, d, it.exs.map((e) => e.title));
+          if (!steps.length) throw new Error("Claude không tìm thấy bài tập trong file");
+          sess = { title: clean(d.title || d.name), goal, day: d.day || 0, doc_ids: [d.id], steps, whole_file: true };
+        } else {
+          status.textContent = "⏳ Claude đang đọc file và chia bài tập thành các bước...";
+          const steps = await planSteps(this.lib, this.app.apiKey, { title: it.ex.title, summary: it.ex.goal || "",
+                                                                     location: it.ex.location || "", doc: d });
+          if (!steps.length) throw new Error("Claude không trả về các bước");
+          sess = { title: it.ex.title, goal: it.ex.goal || "", day: d.day || 0, doc_ids: [d.id], steps };
+        }
+        if (alive()) this.app.closeSheet();
+        this.startSession(sess);
+      } catch (e) {
+        const why = e instanceof ClaudeError ? friendlyError(e) : String(e?.message || e);
+        if (alive()) { status.textContent = "Lỗi: " + why; startBtn.disabled = false; }
+      }
+    };
+    refreshBtn.onclick = refresh;
+    startBtn.onclick = start;
+    this.app.sheet("Exercises — bài tập", body, true);
+    fill();
+    if (!this.lib.data.big_exercises_updated && !this.scanning) refresh();    // first time: read the folder right away
+  }
+
+  // ---- guided exercise: one prompt per step, then the solution summary + PDF ----
+  startSession(ex) {
+    ex = { ...ex, title: clean(ex.title), goal: clean(ex.goal),
+           steps: ex.steps.map((x) => ({ ...x, title: clean(x.title), ...(x.part_title ? { part_title: clean(x.part_title) } : {}) })) };
+    this.session = { ex, i: 0, log: [] };
+    const steps = ex.steps;
+    if (steps.length && steps[0].part) {
+      const lines = steps.filter((st) => st.pstep === 1).map((st) => `  Bài ${st.part}/${st.parts}: ${st.part_title} (${st.psteps} bước)`);
+      this.chatNote(`Bắt đầu bài toán "${ex.title}" — ${steps[0].parts} bài tập con, ${steps.length} bước:\n` + lines.join("\n"));
+    } else {
+      this.chatNote(`Bắt đầu bài tập "${ex.title}" — ${steps.length} bước:\n` + steps.map((s, k) => `  ${k + 1}. ${s.title}`).join("\n"));
+    }
+    this.promptStep();
+  }
+
+  stopSession() {
+    if (this.session) this.chatNote(`Đã dừng bài tập "${this.session.ex.title}".`);
+    this.session = null;
+    if (this.job && ["exstep", "exsummary"].includes(this.job.kind)) {
+      this.job = null;
+      document.getElementById("prompt").value = "";
+      this.app.refreshAttachBar();
+    }
+  }
+
+  promptStep() {
+    const s = this.session, ex = s.ex, i = s.i;
+    const n = ex.steps.length, step = ex.steps[i];
+    const doIt = "Hãy thực hiện bước này: giải thích ngắn gọn cần làm gì và vì sao, làm/giải chi tiết bước này " +
+      "dựa trên tài liệu, rồi tóm tắt kết quả của bước. Chỉ làm bước này, chưa sang bước sau.";
+    let text, label, newPart = false;
+    if (step.part) {
+      newPart = step.pstep === 1;
+      text = `Bài toán "${ex.title}" — Bài ${step.part}/${step.parts}: ${step.part_title} — ` +
+        `Bước ${step.pstep}/${step.psteps}: ${step.title}.\n` +
+        (newPart && step.part_goal ? `Mục tiêu bài này: ${step.part_goal}\n` : "") +
+        `${step.instruction}\n${doIt} Dùng kết quả của các bài/bước trước nếu cần.`;
+      label = `Bài ${step.part}/${step.parts} · Bước ${step.pstep}/${step.psteps} · ${step.part_title.slice(0, 25)}`;
+    } else {
+      text = `Bài tập "${ex.title}" — Bước ${i + 1}/${n}: ${step.title}.\n${step.instruction}\n${doIt}`;
+      label = `Bài tập · Bước ${i + 1}/${n} · ${ex.title.slice(0, 30)}`;
+    }
+    // the documents go with the first step (and each new sub-exercise, and now and then) so they stay in
+    // Claude's recent history
+    const ids = i % 6 === 0 || newPart ? ex.doc_ids || [] : [];
+    this.setPrompt(text, { kind: "exstep", step: i, doc_ids: ids, label });
+  }
+
+  summaryPrompt(send = true) {
+    const ex = this.session.ex;
+    this.setPrompt(
+      `Đã xong tất cả ${ex.steps.length} bước của bài tập "${ex.title}". Hãy viết phần tổng kết lời giải: ` +
+      "đề bài và mục tiêu, kết quả cuối cùng, tóm tắt lời giải theo từng " +
+      (ex.whole_file ? "bài tập con (mỗi bài vài dòng, nêu kết quả và cách các bài nối với nhau)" : "bước (mỗi bước 1-3 dòng)") +
+      ", các kiến thức quan trọng cần nhớ và lỗi thường gặp.",
+      { kind: "exsummary", label: `Tổng kết lời giải · ${ex.title.slice(0, 30)}` });
+    if (send) setTimeout(() => this.app.sendPrompt(), 300);      // sent right away
+  }
+
+  /** Called by the app when Claude finished answering (ok = no error). */
+  async onChatEnd(turn, ok) {
+    const job = this.sentJob;
+    this.sentJob = null;
+    try { this.linkify(); } catch { /* answer pane changed */ }
+    const s = this.session;
+    if (!s) return;
+    const steps = s.ex.steps;
+    const answer = (turn?.a || "").trim();
+    const kind = job?.kind;
+    if (kind === "exstep" && job.step === s.i && ok && answer) {
+      s.log.push({ step: steps[s.i], q: turn.q || "", a: answer });
+      s.i += 1;
+      if (s.i < steps.length) this.promptStep();               // next step's prompt, ready to send
+      else this.summaryPrompt();
+    } else if (kind === "exsummary" && ok && answer) {
+      try {
+        const out = await solutionPdf(this.lib, s, answer);
+        this.chatNote(`Hoàn thành bài tập "${s.ex.title}". File PDF lời giải:\n`);
+        this.fileLinks(out.name, out.blob);
+      } catch (e) {
+        this.chatNote(`Chưa tạo được file PDF lời giải: ${e.message || e}`, true);
+      }
+      this.session = null;
+    } else if (s.i < steps.length) {
+      this.promptStep();                                       // a side question or an error: same step again
+    } else {
+      this.summaryPrompt(false);
+    }
   }
 
   // ---- Documents ----
@@ -913,7 +1461,12 @@ export class LearningUI {
     const desc = el("p", "muted", "Chạm vào tên file để mở file gốc.");
     let chosen = null;
     const open = async (d) => {
-      try { openBlob(await this.lib.file(d), d.name); } catch (e) { alert("Không mở được file: " + e.message); }
+      try {
+        openBlob(await this.lib.file(d), d.name);
+        this.app.closeSheet();                                 // file is open: close the list
+      } catch (e) {
+        alert("Không mở được file: " + e.message);
+      }
     };
     const fill = () => {
       table.replaceChildren(el("div", "lth", "Ngày"), el("div", "lth", "Buổi"), el("div", "lth", "Tên tài liệu"), el("div", "lth", "Tên file"));
@@ -939,7 +1492,10 @@ export class LearningUI {
     };
     q.oninput = fill;
     fill();
-    const row = el("div", "actions end");
+    const row = el("div", "actions");
+    const sync = el("button", "", "🔄 Refresh");
+    sync.onclick = () => { this.app.closeSheet(); this.refresh(() => this.documents()); };
+    const spacer = el("span", "spacer");
     const openBtn = el("button", "", "📄 Mở file");
     openBtn.onclick = () => chosen && open(chosen);
     const ask = el("button", "primary", "💬 Hỏi Claude về tài liệu này");
@@ -947,10 +1503,10 @@ export class LearningUI {
       if (!chosen) return;
       const d = chosen;
       this.app.closeSheet();
-      this.setPrompt(`Hãy giới thiệu tài liệu "${d.title || d.name}": nội dung chính, các ý quan trọng và nó liên quan thế nào đến khóa học.`,
+      this.setPrompt(`Hãy giới thiệu tài liệu "${clean(d.title || d.name)}": nội dung chính, các ý quan trọng và nó liên quan thế nào đến khóa học.`,
         { kind: "doc", label: `Tài liệu · ${(d.title || d.name).slice(0, 40)}`, doc_ids: [d.id] });
     };
-    row.append(openBtn, ask);
+    row.append(sync, spacer, openBtn, ask);
     body.append(q, table, desc, row);
     this.app.sheet("Documents — tài liệu đã upload", body, true);
   }
@@ -959,21 +1515,23 @@ export class LearningUI {
   journal() {
     const temps = this.lib.templates();
     if (!temps.length) {
-      alert('Chưa tìm thấy file PDF mẫu nhật ký trong các tài liệu đã upload.\nHãy đặt file mẫu (ví dụ "Journal.pdf" / "Nhat ky.pdf") vào thư mục học rồi chọn Folder để đồng bộ lại.');
+      alert('Chưa tìm thấy file PDF mẫu nhật ký trong các tài liệu đã upload.\nHãy đặt file mẫu (ví dụ "Journal.pdf" / "Nhat ky.pdf") vào thư mục học rồi chọn Refresh để đồng bộ lại.');
       return;
     }
-    this.pickDay("Journal — chọn buổi học", false, ([day, date, docs]) => {
-      const template = temps[0];
-      const d = new Date();
-      const when = day ? `Buổi ${day}` + (date ? ` (ngày ${fmtDate(date)})` : "")
-        : `buổi học hôm nay (${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()})`;
-      this.setPrompt(
-        `Hãy điền nhật ký buổi học cho ${when} theo đúng mẫu "${template.name}", dựa trên tài liệu của ` +
-        "buổi này và nội dung thầy giảng trên màn hình. Viết ngắn gọn, cụ thể, đúng từng mục trong mẫu, " +
-        "rồi trả lại file PDF đã điền để tải về.",
-        { kind: "journal", label: `Journal · ${when} · mẫu ${template.name.slice(0, 30)}`,
-          doc_ids: docs.filter((x) => x.id !== template.id).map((x) => x.id), template: template.id });
-    });
+    // today's course day if the library knows it, else the latest day (the user can edit the prompt)
+    const days = this.lib.days();
+    const today = isoDate();
+    const [day, date, docs] = days.find((x) => x[1] === today) || days[days.length - 1] || [0, "", []];
+    const template = temps[0];
+    const d = new Date();
+    const when = day ? `Buổi ${day}` + (date ? ` (ngày ${fmtDate(date)})` : "")
+      : `buổi học hôm nay (${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()})`;
+    this.setPrompt(
+      `Hãy điền nhật ký buổi học cho ${when} theo đúng mẫu "${template.name}", dựa trên tài liệu của ` +
+      "buổi này và nội dung thầy giảng trên màn hình. Viết ngắn gọn, cụ thể, đúng từng mục trong mẫu, " +
+      "rồi trả lại file PDF đã điền để tải về.",
+      { kind: "journal", label: `Journal · ${when} · mẫu ${template.name.slice(0, 30)}`,
+        doc_ids: docs.filter((x) => x.id !== template.id).map((x) => x.id), template: template.id });
   }
 
   /** Called when the Journal prompt is sent: fill the PDF in the background. */
