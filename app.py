@@ -1934,6 +1934,9 @@ class MainWindow:
                 # cover the row's whole last line (not just its line break)
                 rng = w.tag_ranges(f"b{uid}")
                 if rng:
+                    # only the CURRENT last line: when a row grew, its old last line (or the speaker
+                    # label left at its start) kept the tag and the padding was added twice
+                    w.tag_remove(pad, rng[0], rng[1])
                     w.tag_add(pad, w.index(f"{rng[1]} -1c linestart"), rng[1])
                 w.tag_configure(pad, spacing3=0)
             hl, hr = self._row_height(self.left, uid), self._row_height(self.right, uid)
