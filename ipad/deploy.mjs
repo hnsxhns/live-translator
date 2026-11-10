@@ -30,15 +30,29 @@ if (!exists) {
   sh("gh", ["repo", "create", repo, "--public", "--description", "Live Translator for iPad (web app)"]);
 }
 
-// a throw-away git repo inside site/ holding exactly the site, pushed to the gh-pages branch
+// a throw-away git repo inside site/ holding exactly the site, pushed to the gh-pages branch.
+// It is put on top of what is already published (fetched without file contents), so only new or
+// changed files are uploaded — re-sending the ~250 MB of models ran the machine out of memory.
 const git = (...a) => sh("git", ["-C", SITE, ...a]);
+const remote = `https://github.com/${repo}.git`;
 fs.rmSync(path.join(SITE, ".git"), { recursive: true, force: true });
 git("init", "-q", "-b", "gh-pages");
+let published = true;
+try { git("fetch", "-q", "--filter=blob:none", "--depth=1", remote, "gh-pages"); } catch { published = false; }
+if (published) git("reset", "-q", "--soft", "FETCH_HEAD");
 git("add", "-A");
-git("-c", "user.name=Live Translator", "-c", `user.email=${user}@users.noreply.github.com`,
-    "commit", "-q", "-m", `Publish ${JSON.parse(fs.readFileSync(path.join(SITE, "releases.json"), "utf8")).releases.map((r) => `${r.version}-${r.build}`).join(", ")}`);
-console.log("Uploading (the first time takes a few minutes: ~250 MB of models) ...");
-execFileSync("git", ["-C", SITE, "-c", "http.postBuffer=524288000", "push", "-q", "--force", `https://github.com/${repo}.git`, "gh-pages"], { stdio: "inherit" });
+const builds = JSON.parse(fs.readFileSync(path.join(SITE, "releases.json"), "utf8")).releases.map((r) => `${r.version}-${r.build}`);
+let changed = true;
+try {
+  git("-c", "user.name=Live Translator", "-c", `user.email=${user}@users.noreply.github.com`,
+      "commit", "-q", "-m", `Publish ${builds[builds.length - 1]}`);
+} catch { changed = false; }                               // nothing new to publish
+if (changed) {
+  console.log(published ? "Uploading the new files ..." : "Uploading (first time: ~250 MB of models, a few minutes) ...");
+  execFileSync("git", ["-C", SITE, "-c", "http.postBuffer=157286400", "push", "-q", remote, "HEAD:gh-pages"], { stdio: "inherit" });
+} else {
+  console.log("Nothing new to publish.");
+}
 fs.rmSync(path.join(SITE, ".git"), { recursive: true, force: true });
 
 try {
