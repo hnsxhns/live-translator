@@ -276,6 +276,32 @@ for tag in sorted((t for t in mw.left.tag_names() if t.startswith("b") and t[1:]
                      "pad_en": mw.left.tag_cget(f"pad{uid}", "spacing3"), "pad_vi": mw.right.tag_cget(f"pad{uid}", "spacing3"),
                      "en": mw.left.get(*mw.left.tag_ranges(tag))[:50], "vi": mw.right.get(*mw.right.tag_ranges(tag))[:30]})
 results["rows"] = rows
+# diagnosis for the worst row: when does Tk report its real height after the padding is cleared?
+if diffs and max(diffs) > 3:
+    bad = rows[diffs.index(max(diffs)) - 1] if diffs.index(max(diffs)) > 0 else rows[0]
+    u = int(bad["uid"])
+    diag = {"uid": u}
+    for side, w in (("en", mw.left), ("vi", mw.right)):
+        pad = f"pad{u}"
+        d = {"b_range": [str(i) for i in w.tag_ranges(f"b{u}")], "pad_ranges": [str(i) for i in w.tag_ranges(pad)],
+             "pad_before": w.tag_cget(pad, "spacing3")}
+        w.tag_configure(pad, spacing3=0)
+        d["h_now"] = mw._row_height(w, u)
+        w.tk.call(w._w, "sync")
+        d["h_after_sync"] = mw._row_height(w, u)
+        w.update_idletasks()
+        d["h_after_idle"] = mw._row_height(w, u)
+        pump(0.3)
+        d["h_after_300ms"] = mw._row_height(w, u)
+        r0, r1 = w.tag_ranges(f"b{u}")
+        dl = w.count(r0, r1, "displaylines")
+        d["displaylines"] = dl[0] if isinstance(dl, tuple) else dl
+        d["dlineinfo_first"] = w.dlineinfo(r0)
+        d["text"] = w.get(r0, r1)
+        diag[side] = d
+    results["row_diag"] = diag
+    mw._align_all()
+    pump(1)
 results["totals"] = {"en": ypix(mw.left, "1.0", "end"), "vi": ypix(mw.right, "1.0", "end"),
                      "tk": root.tk.call("info", "patchlevel")}
 check("en_vi_rows_level", diffs and max(diffs) <= 3, f"{len(diffs)} rows, offsets {diffs} px")
