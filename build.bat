@@ -12,7 +12,7 @@ set ADD=--add-data "models\base.en;models\base.en" --add-data "models\vosk-en-sm
 if exist vendor\ant.exe set ADD=%ADD% --add-binary "vendor\ant.exe;vendor"
 .venv\Scripts\python -m PyInstaller --noconfirm --clean --onedir --windowed --name %NAME% ^
   --contents-directory app_files ^
-  %ADD% --collect-all ctranslate2 --collect-all vosk --collect-all sherpa_onnx --hidden-import native_edit ^
+  %ADD% --collect-all ctranslate2 --collect-all vosk --collect-all sherpa_onnx --hidden-import native_edit --hidden-import learning --collect-all pymupdf ^
   --collect-data faster_whisper ^
   --exclude-module onnxruntime --exclude-module torch app.py || exit /b 1
 rem Single-file exe (launcher + app zip) and a plain zip of the same app
