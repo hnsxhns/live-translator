@@ -24,7 +24,7 @@ import numpy as np
 import learning
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.8.0"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.8.1"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # Live words come from Vosk (streaming); Whisper base.en then corrects each finished utterance.
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base.en")
@@ -1411,6 +1411,7 @@ class MainWindow:
         if not q:
             q = "Hãy xem (các) file đính kèm và tóm tắt nội dung chính."
         job = self.learning.take_job()            # documents from the Learning menu, if any
+        self._chat_failed = False
         self.prompt.delete("1.0", "end")
         self.attachments = []
         self._refresh_attach_bar()
@@ -1965,6 +1966,7 @@ class MainWindow:
                         self.chat_log[-1]["a"] += val
                     self._append(self.chat, val)
                 elif kind == "chat_error":
+                    self._chat_failed = True
                     self.chat.configure(state="normal")
                     self.chat.insert("end", val, "err")
                     self.chat.configure(state="disabled")
@@ -1976,6 +1978,9 @@ class MainWindow:
                     else:                       # answered while the panel was closed -> show a hint
                         self.unread = True
                         self._refresh_panel_btn()
+                    # guided exercise: put the next step's prompt in the box (or finish the solution)
+                    self.learning.on_chat_end(self.chat_log[-1] if self.chat_log else None,
+                                              not getattr(self, "_chat_failed", False))
                 elif kind == "summary":
                     self._add_takeaways(val)
                 elif kind == "ready":
