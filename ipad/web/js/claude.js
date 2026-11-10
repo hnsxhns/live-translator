@@ -4,6 +4,8 @@ export const MODEL = "claude-opus-5-5";
 const API = "https://api.anthropic.com/v1";
 const FALLBACK_BETA = "server-side-fallback-2026-07-01";   // refusal fallback: route to another model
 export const FILES_BETA = "files-api-2025-04-14";            // documents uploaded to Claude (Learning library)
+// chat and the Learning menu send whole documents, and Claude can read/think a while before the first word
+export const LONG_TIMEOUT = 300_000;
 
 export class ClaudeError extends Error {
   constructor(status, type, message) {
@@ -63,9 +65,15 @@ export async function claudeStream(apiKey, { system, prompt, effort, onPiece, mo
         betas.push(FALLBACK_BETA);
       }
       const extra = betas.length ? { "anthropic-beta": betas.join(",") } : {};
-      // a stuck request must not block its caller for long (takeaways: 120 s)
+      // like the desktop app's read timeout: give up when Claude sends nothing for timeoutMs
+      // (takeaways 60 s; chat and Learning 300 s because they carry whole documents)
       const ctrl = timeoutMs ? new AbortController() : null;
-      const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+      let timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+      const alive = () => { if (ctrl) { clearTimeout(timer); timer = setTimeout(() => ctrl.abort(), timeoutMs); } };
+      // also stop waiting on our side, in case the browser does not cancel a body that is being read
+      const aborted = ctrl ? new Promise((_, reject) => ctrl.signal.addEventListener("abort",
+        () => reject(new DOMException("timed out", "AbortError")))) : null;
+      aborted?.catch(() => {});
       let out = "";
       try {
         const res = await fetch(`${API}/messages`, { method: "POST", headers: headers(apiKey, extra),
@@ -75,8 +83,16 @@ export async function claudeStream(apiKey, { system, prompt, effort, onPiece, mo
         const dec = new TextDecoder();
         let buf = "";
         for (;;) {
-          const { value, done } = await reader.read();
+          let chunk;
+          try {
+            chunk = await (aborted ? Promise.race([reader.read(), aborted]) : reader.read());
+          } catch (e) {
+            reader.cancel().catch(() => {});
+            throw e;
+          }
+          const { value, done } = chunk;
           if (done) break;
+          alive();
           buf += dec.decode(value, { stream: true });
           let i;
           while ((i = buf.indexOf("\n\n")) >= 0) {
@@ -97,7 +113,7 @@ export async function claudeStream(apiKey, { system, prompt, effort, onPiece, mo
         }
         return out;
       } catch (err) {
-        const e = err?.name === "AbortError" ? new ClaudeError(0, "timeout", "Claude trả lời quá lâu (hết thời gian chờ)") : err;
+        const e = err?.name === "AbortError" ? new ClaudeError(0, "timeout", "request timed out") : err;
         const msg = String(e?.message || e).toLowerCase();
         // only the optional fallback setting is worth retrying without
         if (useFallback && !out && e instanceof ClaudeError && e.status === 400 && msg.includes("fallback")) break;
@@ -131,7 +147,7 @@ export async function askJson(apiKey, system, content, schema, { effort = "low",
   let last;
   for (const useFormat of [true, false]) {
     try {
-      const text = await claudeStream(apiKey, { system, prompt, effort, maxTokens,
+      const text = await claudeStream(apiKey, { system, prompt, effort, maxTokens, timeoutMs: LONG_TIMEOUT,
                                                 format: useFormat ? { type: "json_schema", schema } : undefined });
       return parseJson(text);
     } catch (e) {
@@ -156,6 +172,7 @@ export function friendlyError(e) {
     return ("Tài khoản API hết credit ($0). Gói Ultra có $200/tháng: vào claude.ai → Settings → Billing → " +
             "API credits → Link organization, rồi dùng API key của đúng tổ chức đó.");
   }
+  if (e?.type === "timeout" || s.includes("timed out")) return "Claude phản hồi quá lâu nên hết thời gian chờ. Hãy bấm gửi lại.";
   if (e instanceof ClaudeError) {
     if (e.status === 401) return "API key không còn hợp lệ. Hãy đăng nhập lại.";
     if (e.status === 403) return "Tài khoản không có quyền dùng model này.";

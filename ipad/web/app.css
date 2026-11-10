@@ -242,3 +242,5 @@ button { cursor: pointer; touch-action: manipulation; }
 
 .ptitle { position: relative; }
 .ptbtn { position: absolute; right: 4px; top: 3px; border: 0; border-radius: 4px; background: #e4e4e4; font-size: 12px; padding: 3px 8px; }
+
+.top .status.warn { color: #ffd479; }

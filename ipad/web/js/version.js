@@ -1,15 +1,13 @@
 // Version of this iPad build. Every build needs a new BUILD number (old builds stay online, like TestFlight).
 // APP_VERSION follows the desktop app whose features this build matches.
-export const APP_VERSION = "1.8.3";
-export const BUILD = 5;
+export const APP_VERSION = "1.8.4";
+export const BUILD = 6;
 export const CHANNEL = "beta";            // "beta" (testers only) or "stable"
 export const NOTES = [
-  "Đủ tính năng như bản Windows 1.8.3.",
-  "Exercises: 'Bài tập lớn' đọc toàn bộ thư mục và liệt kê bài tập kèm các bước; hoặc chọn theo từng file (cả file = một bài toán lớn gồm nhiều bài con).",
-  "Giải từng bước: mỗi bước một câu hỏi, câu hỏi bước sau tự điền sẵn; xong bài thì tự tổng kết và tạo file PDF lời giải để tải về.",
-  "Summary: chọn đúng các file sách cần tổng kết. Agenda chi tiết theo Ngày → Buổi → Phiên, có tên giảng viên và tài liệu.",
-  "Tên file tài liệu trong câu trả lời của Claude thành link, chạm để mở.",
-  "Learning có nút Refresh (tìm file mới); Documents tự đóng khi mở file; Journal đưa thẳng vào ô hỏi.",
-  "Nút 📄 Xuất PDF ở khung Ý chính: xuất toàn bộ ý chính theo mốc giờ.",
-  "Đăng nhập: nút mở trang lấy API key, nút Dán, hướng dẫn chi tiết.",
+  "Đủ tính năng như bản Windows 1.8.4.",
+  "Giải bài tập: Claude tóm tắt đề ngắn gọn trước, rồi làm từng bước; khi cần thông tin của bạn thì hỏi và điền sẵn mẫu vào ô nhập; khi cần prompt cho công cụ AI thì đưa prompt hoàn chỉnh kèm nút 📋 Copy prompt.",
+  "Bắt đầu bài tập: hộp chọn đóng ngay, tiến độ hiện trong khung Claude; các bước đã lập được lưu lại nên lần sau mở ngay.",
+  "PDF lời giải có phần tóm tắt, thông tin bạn đã nhập và khung prompt.",
+  "Chờ Claude lâu hơn khi gửi kèm tài liệu (hết lỗi 'hết thời gian chờ' khi tạo Agenda).",
+  "Bài tập lớn, Summary chọn file, Agenda chi tiết, link tên file, Xuất PDF ý chính (từ 1.8.3).",
 ];

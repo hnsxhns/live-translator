@@ -1,5 +1,5 @@
 // Claude workers: live translation, chat answers and key takeaways (same prompts as the desktop app).
-import { claudeStream, friendlyError } from "./claude.js";
+import { claudeStream, friendlyError, LONG_TIMEOUT } from "./claude.js";
 
 export const SUMMARY_EVERY = 25_000;      // refresh key takeaways this often (ms)
 
@@ -134,6 +134,7 @@ export class Translator {
     try {
       out = await claudeStream(this.getKey(), {
         system: Translator.SYSTEM, prompt, effort: "low", model: this.model, thinking: this.thinking, maxTokens: 1500,
+        timeoutMs: 30_000,
         onPiece: (p) => this.emit("vi_piece", [uid, g, p]),
       });
     } catch (e) {
@@ -209,7 +210,7 @@ export class Chatter {
       let answer = "";
       try {
         answer = await claudeStream(this.getKey(), { system: Chatter.SYSTEM, prompt: Chatter.withCache(messages),
-                                                     effort: "medium", maxTokens: 16000,
+                                                     effort: "medium", maxTokens: 16000, timeoutMs: LONG_TIMEOUT,
                                                      onPiece: (p) => this.emit("chat_piece", p) });
       } catch (e) {
         this.emit("chat_error", `[${friendlyError(e)}]`);
@@ -259,7 +260,7 @@ export class Summarizer {
         `<new_transcript>\n${fresh}\n</new_transcript>`;
       // short timeout: a stuck request must not stop the takeaways for long
       const out = (await claudeStream(this.getKey(), { system: Summarizer.SYSTEM, prompt, effort: "medium",
-                                                      timeoutMs: 120_000 })).trim();
+                                                      timeoutMs: 60_000 })).trim();
       this.doneN = n;
       if (out && out.toUpperCase().replace(/^[ .]+|[ .]+$/g, "") !== "NONE") this.emit("summary", out);
     } catch (e) {
