@@ -14,11 +14,11 @@ on:
   workflow_dispatch:
     inputs:
       release:
-        description: "Release tag to test"
-        default: "v1.7.2-mac"
+        description: "Release tag to test (empty = latest release)"
+        default: ""
 
 env:
-  RELEASE: ${{ github.event.inputs.release || 'v1.7.2-mac' }}
+  RELEASE: ${{ github.event.inputs.release }}
 
 jobs:
   installed-app:
@@ -29,6 +29,11 @@ jobs:
       - name: Download the public release zip (no login)
         run: |
           set -euo pipefail
+          if [ -z "${RELEASE:-}" ]; then      # latest public release, found the way a visitor would
+            RELEASE=$(curl -fsSI "https://github.com/${{ github.repository }}/releases/latest" | tr -d '\r' | sed -n 's#^[Ll]ocation: .*/tag/##p')
+          fi
+          echo "Testing release $RELEASE"
+          echo "RELEASE=$RELEASE" >> "$GITHUB_ENV"
           VER="${RELEASE%-mac}"; VER="${VER#v}"
           echo "VER=$VER" >> "$GITHUB_ENV"
           curl -fL -o app.zip "https://github.com/${{ github.repository }}/releases/download/$RELEASE/LiveTranslator_v${VER}_mac.zip"
