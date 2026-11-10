@@ -24,7 +24,7 @@ import numpy as np
 import learning
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.8.3.1"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.8.3.2"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # Live words come from Vosk (streaming); Whisper base.en then corrects each finished utterance.
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base.en")
@@ -1966,14 +1966,11 @@ class MainWindow:
                 # cover the row's whole last line (not just its line break)
                 rng = w.tag_ranges(f"b{uid}")
                 if rng:
+                    # only the CURRENT last line: when a row grew, its old last line (or the speaker
+                    # label left at its start) kept the tag and the padding was added twice
+                    w.tag_remove(pad, rng[0], rng[1])
                     w.tag_add(pad, w.index(f"{rng[1]} -1c linestart"), rng[1])
                 w.tag_configure(pad, spacing3=0)
-                # Tk 8.6.16 (Mac build) keeps the old line heights until its idle update, so the row
-                # was measured with the old padding and got it again; recompute the heights now
-                try:
-                    w.tk.call(w._w, "sync")
-                except tk.TclError:
-                    pass
             hl, hr = self._row_height(self.left, uid), self._row_height(self.right, uid)
             if hl is None or hr is None:
                 continue
