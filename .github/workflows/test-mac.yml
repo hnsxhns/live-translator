@@ -1,0 +1,171 @@
+# Tests the Mac app on GitHub's Mac machines (no Mac needed). Results + screenshots are on the run page.
+#   Job 1 "Installed app": downloads the PUBLIC release zip exactly like a user, installs it, opens it,
+#          takes a screenshot and checks it does not crash or start extra copies of itself.
+#   Job 2 "UI + speech":   runs the app's real window from source with a fake microphone that plays
+#          English speech made by macOS `say`; checks the English text appears; screenshots each step.
+#          Uses real Claude translation only if the repo has an ANTHROPIC_API_KEY secret.
+# Re-run any time: open a run of this workflow on GitHub > "Re-run all jobs".
+name: Test Mac app
+
+on:
+  push:
+    branches: [mac-portable]
+    paths: ["tests/**", ".github/workflows/test-mac.yml"]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Release tag to test"
+        default: "v1.7.2-mac"
+
+env:
+  RELEASE: ${{ github.event.inputs.release || 'v1.7.2-mac' }}
+
+jobs:
+  installed-app:
+    name: Installed app (public release)
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Download the public release zip (no login)
+        run: |
+          set -euo pipefail
+          VER="${RELEASE%-mac}"; VER="${VER#v}"
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          curl -fL -o app.zip "https://github.com/${{ github.repository }}/releases/download/$RELEASE/LiveTranslator_v${VER}_mac.zip"
+          ls -lh app.zip && shasum -a 256 app.zip
+
+      - name: Install like a user (unzip, open .dmg, copy to Applications)
+        run: |
+          set -euo pipefail
+          unzip -q app.zip
+          hdiutil attach "LiveTranslator_v${VER}_mac.dmg" -nobrowse -mountpoint /Volumes/LT
+          ls -la /Volumes/LT
+          ditto "/Volumes/LT/Live Translator.app" "/Applications/Live Translator.app"
+          hdiutil detach /Volumes/LT
+
+      - name: Check the app package
+        run: |
+          set -uo pipefail
+          A="/Applications/Live Translator.app"
+          {
+            echo "## Installed app checks ($RELEASE)"
+            echo '```'
+            echo "Size: $(du -sh "$A" | cut -f1)"
+            echo "Architecture: $(lipo -archs "$A/Contents/MacOS/"* 2>&1)"
+            echo "Microphone message: $(/usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$A/Contents/Info.plist" 2>&1)"
+            echo "Bundled ant: $(ls "$A"/Contents/Frameworks/vendor/ant 2>&1) -> $("$A"/Contents/Frameworks/vendor/ant --version 2>&1)"
+            echo "Signature: $(codesign --verify --deep --strict "$A" 2>&1 && echo "valid, ad-hoc")"
+            echo "Gatekeeper (expected 'rejected' = unsigned, user must click Open Anyway once): $(spctl --assess --type execute "$A" 2>&1)"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          codesign --verify --deep --strict "$A"
+
+      - name: Open the app and watch it for 60 s
+        run: |
+          set -uo pipefail
+          mkdir -p shots
+          open "/Applications/Live Translator.app"
+          COUNTS=""
+          for i in 1 2 3 4 5 6; do
+            sleep 10
+            N=$(pgrep -f "Live Translator.app/Contents/MacOS/" | wc -l | tr -d ' ')
+            COUNTS="$COUNTS $N"
+            [ "$i" = 3 ] && screencapture -x shots/installed_app_login.png || true
+          done
+          screencapture -x shots/installed_app_60s.png || true
+          echo "process counts every 10 s:$COUNTS"
+          pgrep -fl "Live Translator.app/Contents/MacOS/" || true
+          LAST=$(echo $COUNTS | awk '{print $NF}')
+          {
+            echo "## Running the installed app"
+            echo "- Processes every 10 s:$COUNTS (1-2 is normal; growing = relaunch loop)"
+            [ "$LAST" -ge 1 ] && echo "- PASS: app is still running after 60 s" || echo "- FAIL: app is not running (crashed?)"
+            [ "$LAST" -le 2 ] && echo "- PASS: no relaunch loop" || echo "- FAIL: too many app processes"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          pkill -f "Live Translator.app/Contents/MacOS/" || true
+          [ "$LAST" -ge 1 ] && [ "$LAST" -le 2 ]
+
+      - name: Crash reports (if any)
+        if: always()
+        run: ls ~/Library/Logs/DiagnosticReports/ 2>/dev/null | grep -i live && cat ~/Library/Logs/DiagnosticReports/*Live* | head -80 || echo "no crash reports"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots-installed-app
+          path: shots/
+
+  ui-and-speech:
+    name: UI + speech (fake microphone)
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python 3.12.10 (python.org, same as the build)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o py.pkg https://www.python.org/ftp/python/3.12.10/python-3.12.10-macos11.pkg
+          sudo installer -pkg py.pkg -target /
+          PY=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3
+          "$PY" -m venv .venv-mac
+          .venv-mac/bin/python -m pip install -q --upgrade pip
+          .venv-mac/bin/python -m pip install -q -r requirements.txt
+
+      - name: Cache models
+        id: models
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: models-base.en-vosk-small-0.15-campplus-v1
+
+      - name: Download models
+        if: steps.models.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p models/base.en models/spk-onnx
+          HF=https://huggingface.co/Systran/faster-whisper-base.en/resolve/main
+          for f in config.json model.bin tokenizer.json vocabulary.txt README.md; do
+            curl -fsSL -o "models/base.en/$f" "$HF/$f"
+          done
+          curl -fsSL -o vosk.zip https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+          unzip -q vosk.zip && mv vosk-model-small-en-us-0.15 models/vosk-en-small && rm vosk.zip
+          curl -fsSL -o models/spk-onnx/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx
+
+      - name: Make English test speech with macOS voice
+        run: |
+          set -euo pipefail
+          say -o speech.aiff "Good morning everyone. Today we will talk about machine learning and how computers understand speech. Please open your notebooks and write down the key ideas."
+          afconvert -f WAVE -d LEI16@16000 -c 1 speech.aiff speech.wav
+          ls -l speech.wav
+
+      - name: Run the app window with the fake microphone
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -uo pipefail
+          .venv-mac/bin/python tests/mac_e2e_test.py speech.wav shots | tee e2e.log
+          CODE=${PIPESTATUS[0]}
+          .venv-mac/bin/python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r = json.load(open("shots/result.json", encoding="utf-8"))
+          print("## UI + speech test (fake microphone)")
+          print("| Check | Result | Detail |\n|---|---|---|")
+          for k, v in r["checks"].items():
+              print(f"| {k} | {'✅ PASS' if v['ok'] else '❌ FAIL'} | {v['detail'].replace('|', '/')[:150]} |")
+          for n in r["notes"]:
+              print(f"- {n}")
+          print("\n**English recognized:**\n```\n" + r.get("english_text", "") + "\n```")
+          print("**Vietnamese column:**\n```\n" + r.get("vietnamese_text", "") + "\n```")
+          print("Screenshots: see the artifacts below (screenshots-ui).")
+          EOF
+          exit $CODE
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots-ui
+          path: |
+            shots/
+            e2e.log

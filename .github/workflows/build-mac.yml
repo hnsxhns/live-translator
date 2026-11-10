@@ -6,6 +6,7 @@ name: Build Mac app
 on:
   push:
     branches: [mac-portable]
+    paths-ignore: ["tests/**", ".github/workflows/test-mac.yml"]
   workflow_dispatch:
 
 jobs:
