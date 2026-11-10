@@ -219,6 +219,7 @@ mw.summarizer.kick.set()                                # takeaways for the firs
 
 # --- after segment 2: follow newest text, then user scrolls up ---
 at(seg_times[1][2] + 5)
+mw.summarizer.kick.set()                                # takeaways for the second speaker's part
 yl, yr, yt = mw.left.yview(), mw.right.yview(), mw.bottom.yview()
 overflow = yl[0] > 0
 check("auto_scroll_follows_new_text", yl[1] >= 0.999 and yr[1] >= 0.999,
@@ -397,6 +398,32 @@ check("backup_restore_roundtrip", os.path.exists(bk) and mw.left.get("1.0", "end
 # --- friendly credit-balance error ---
 msg = app.friendly_error(Exception("Error code: 400 - Your credit balance is too low to access the Anthropic API."))
 check("friendly_credit_balance_error", "credit" in msg and "Billing" in msg, msg[:120])
+
+# --- v1.8.4: long Claude replies get a friendly timeout message ---
+if hasattr(app, "LONG_TIMEOUT"):
+    msg = app.friendly_error(Exception("Request timed out."))
+    check("friendly_timeout_error", "hết thời gian" in msg, msg[:120])
+
+# --- v1.8.4: Output Folder (Backup/ and Outputs/), takeaways saved straight into Outputs/ ---
+if hasattr(mw, "choose_output_folder"):
+    outf = os.path.join(OUT, "OutputFolder")
+    os.makedirs(outf, exist_ok=True)
+    filedialog.askdirectory = lambda *a, **k: outf
+    mw.choose_output_folder()
+    pump(0.5)
+    saved = app.load_config().get("output_folder")
+    check("output_folder_created_and_remembered",
+          os.path.isdir(os.path.join(outf, "Backup")) and os.path.isdir(os.path.join(outf, "Outputs")) and saved == outf,
+          f"config output_folder={saved}")
+    filedialog.asksaveasfilename = lambda *a, **k: ""           # a dialog must not be needed now
+    mw.export_takeaways()
+    pump(0.5)
+    outs = os.listdir(os.path.join(outf, "Outputs"))
+    check("takeaways_saved_into_outputs", any(n.startswith("KeyTakeaways_") and n.endswith(".pdf") for n in outs),
+          f"Outputs/: {outs}")
+    cfg = app.load_config()                                      # leave no setting behind
+    cfg.pop("output_folder", None)
+    app.save_config(cfg)
 
 # --- Learning ---
 def toplevels():
