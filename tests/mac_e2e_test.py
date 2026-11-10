@@ -117,7 +117,7 @@ for w in root.winfo_children():
     w.destroy()
 
 # 2) main window
-root.geometry("1280x800+0+0")
+# keep the app's own window size and position (it centers itself on the screen)
 mw = app.MainWindow(root, client)
 t0 = time.time()
 while not mw.ready and time.time() - t0 < 120:          # models loaded?
