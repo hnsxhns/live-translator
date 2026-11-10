@@ -21,8 +21,10 @@ from tkinter import font as tkfont
 import anthropic
 import numpy as np
 
+import learning
+
 # ---------------- Settings ----------------
-APP_VERSION = "1.7.3"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.8.1"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # Live words come from Vosk (streaming); Whisper base.en then corrects each finished utterance.
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base.en")
@@ -966,7 +968,10 @@ class Chatter(threading.Thread):
               "user's questions about it, or any other question they ask. Reply in Vietnamese unless the user "
               "writes in another language or asks otherwise. Be clear and concise; plain text, short bullet "
               "points when helpful (no Markdown headings or tables). If the transcript doesn't contain the "
-              "answer, say so and answer from general knowledge if appropriate.")
+              "answer, say so and answer from general knowledge if appropriate. The user may also have a "
+              "study library (course documents uploaded from the Learning menu): its catalogue is given in "
+              "<learning_library>, and documents from it may be attached to a question. Use them when relevant; "
+              "when tutoring an exercise, guide one step at a time and wait for the user.")
 
     def __init__(self, client, ui_q, get_context):
         super().__init__(daemon=True)
@@ -975,6 +980,25 @@ class Chatter(threading.Thread):
         self.get_context = get_context
         self.q = queue.Queue()
         self.history = []          # past turns: [{"role": ..., "content": ...}, ...]
+        self.get_library = None    # -> catalogue text of the Learning library ("" if empty)
+
+    @staticmethod
+    def _with_cache(messages):
+        """Mark the newest attached file as a cache point, so follow-up questions about the same
+        documents (e.g. step-by-step exercise help) don't pay for them again."""
+        out = list(messages)
+        for i in range(len(out) - 1, -1, -1):
+            m = out[i]
+            if m["role"] != "user" or not isinstance(m["content"], list):
+                continue
+            idx = [j for j, b in enumerate(m["content"])
+                   if b.get("type") != "text" or b.get("text", "").startswith("<file ")]
+            if idx:
+                content = list(m["content"])
+                content[idx[-1]] = {**content[idx[-1]], "cache_control": {"type": "ephemeral"}}
+                out[i] = {**m, "content": content}
+                break
+        return out
 
     def run(self):
         while True:
@@ -983,6 +1007,9 @@ class Chatter(threading.Thread):
             context = (f"<transcript_english>\n{en or '(chưa có)'}\n</transcript_english>\n"
                        f"<translation_vietnamese>\n{vi or '(chưa có)'}\n</translation_vietnamese>\n"
                        f"<key_takeaways>\n{summary or '(chưa có)'}\n</key_takeaways>")
+            library = self.get_library() if self.get_library else ""
+            if library:
+                context += f"\n<learning_library>\n{library}\n</learning_library>"
             # The latest session context rides on the newest question, so earlier turns stay unchanged.
             # Files go before the text, and stay in the history so follow-up questions can refer to them.
             messages = self.history[-20:] + [
@@ -990,8 +1017,8 @@ class Chatter(threading.Thread):
                     {"type": "text", "text": f"{context}\n\nCâu hỏi của tôi: {question}"}]}]
             answer = ""
             try:
-                answer = claude_stream(self.client, self.SYSTEM, messages, "medium",
-                                       lambda p: self.ui_q.put(("chat_piece", p)))
+                answer = claude_stream(self.client, self.SYSTEM, self._with_cache(messages), "medium",
+                                       lambda p: self.ui_q.put(("chat_piece", p)), max_tokens=16000)
             except Exception as e:  # noqa: BLE001
                 self.ui_q.put(("chat_error", f"[{friendly_error(e)}]"))
             if answer.strip():
@@ -1001,32 +1028,44 @@ class Chatter(threading.Thread):
 
 
 class Summarizer(threading.Thread):
-    SYSTEM = ("You summarize a live talk/conversation for a Vietnamese listener. Given the English transcript "
-              "so far, write the KEY TAKEAWAYS in Vietnamese: 3-7 short bullet points starting with '• ', most "
-              "important first, covering the whole transcript so far. Output only the bullets.")
+    """Running key takeaways. Every round only the speech that is new since the last round is turned into
+    new bullet points, which are ADDED to the pane (earlier takeaways are never removed)."""
+    SYSTEM = ("You keep running KEY TAKEAWAYS in Vietnamese for a live talk/conversation. You get the takeaways "
+              "already written, the end of the earlier transcript for context, and the NEW part of the English "
+              "transcript (from speech recognition; it may contain errors). Write only takeaways that the NEW "
+              "part adds and that are not already in the existing takeaways: 1-5 short bullet points starting "
+              "with '• ', most important first. If the new part adds nothing worth noting, output exactly NONE. "
+              "Output only the bullets (or NONE).")
 
-    def __init__(self, client, ui_q, get_transcript):
+    def __init__(self, client, ui_q, get_transcript, get_takeaways):
         super().__init__(daemon=True)
-        self.client = client
+        # short timeout: a stuck request must not stop the takeaways for long
+        self.client = client.with_options(timeout=120.0, max_retries=1)
         self.ui_q = ui_q
-        self.get_transcript = get_transcript
+        self.get_transcript = get_transcript      # (start, end) -> transcript text of those entries
+        self.get_takeaways = get_takeaways
         self.kick = threading.Event()
-        self.last_len = 0
+        self.done_n = 0                           # transcript entries already covered
+        self.final = False                        # set when listening stops: cover even a short remainder
 
     def run(self):
         while True:
             self.kick.wait(timeout=SUMMARY_EVERY)
             self.kick.clear()
-            text = self.get_transcript()
-            if len(text.split()) < 15 or len(text) == self.last_len:
-                continue
-            self.last_len = len(text)
+            final, self.final = self.final, False
             try:
-                out = claude_stream(self.client, self.SYSTEM, f"Transcript:\n{text}", "medium").strip()
-                if out:
+                n, new = self.get_transcript(self.done_n, None)
+                if len(new.split()) < (4 if final else 15):
+                    continue
+                _, before = self.get_transcript(0, self.done_n)
+                prompt = (f"<existing_takeaways>\n{self.get_takeaways() or '(none yet)'}\n</existing_takeaways>\n"
+                          f"<earlier_transcript_end>\n{before[-3000:] or '(none)'}\n</earlier_transcript_end>\n"
+                          f"<new_transcript>\n{new}\n</new_transcript>")
+                out = claude_stream(self.client, self.SYSTEM, prompt, "medium").strip()
+                self.done_n = n
+                if out and out.upper().strip(" .") != "NONE":
                     self.ui_q.put(("summary", out))
-            except Exception as e:  # noqa: BLE001
-                self.last_len = 0          # try again next round
+            except Exception as e:  # noqa: BLE001  (done_n unchanged -> try again next round)
                 self.ui_q.put(("error", friendly_error(e)))
 
 
@@ -1152,7 +1191,13 @@ class MainWindow:
         self.chat.tag_configure("err", foreground="#c0392b")
         self.right.tag_configure("vipend", foreground="#b0b0b0")          # "…" while translating
         # keep the takeaways scrolled to the newest lines when the pane changes size
-        self.bottom.bind("<Configure>", lambda e: self.bottom.see("end"))
+        self.take_follow = True        # takeaways pane shows the newest points unless the user scrolls up
+        self.bottom.bind("<Configure>", lambda e: self.take_follow and self.bottom.see("end"))
+        self.bottom.bind("<MouseWheel>", lambda e: self.root.after_idle(self._take_scrolled))
+        for wdg in self.bottom.master.winfo_children():
+            if isinstance(wdg, tk.Scrollbar):
+                wdg.config(command=lambda *a: (self.bottom.yview(*a), self._take_scrolled()))
+        self.bottom.tag_configure("ttime", foreground="#999", font=("Segoe UI", 9))
         for w in (self.left, self.right):
             w.tag_configure("lbl", font=(text_font.actual("family"), 12, "bold"))
             w.tag_bind("lbl", "<Double-Button-1>", self._rename_speaker)
@@ -1177,6 +1222,10 @@ class MainWindow:
         self.attach_btn = tk.Button(row, text="📎", font=(EMOJI_FONT, 13), bg="white", relief="flat",
                                     activebackground="#eee", cursor="hand2", command=self.attach_files)
         self.attach_btn.pack(side="right", fill="y", pady=6)
+        # 🎓 Learning menu (study library), just left of the 📎 button
+        self.learn_btn = tk.Button(row, text="🎓 Learning", font=(UI_FONT, 9, "bold"), bg="#f3e3dc", fg="#8a3f22",
+                                   activebackground="#ecd2c6", relief="flat", cursor="hand2", padx=6)
+        self.learn_btn.pack(side="right", fill="y", pady=10, padx=(4, 2))
         # Native Windows text box: works with every Vietnamese input method (Tk's Text does not)
         host = tk.Frame(row, bg="white", height=60)
         host.pack(side="left", fill="both", expand=True)
@@ -1206,9 +1255,18 @@ class MainWindow:
         }
         for b in self.panel_btns.values():
             b.place(relx=0.5, rely=0.5, anchor="center", width=26, height=230)
+        # Learning: quick button at the bottom of the right edge (opens the panel + the menu); Ctrl+L too
+        learning.setup(sys.modules[__name__])
+        self.learning = learning.LearningUI(self, self.learn_btn)
+        self.edge_learn = tk.Button(strip, text="🎓" + chr(10) + chr(10).join("Learning"),
+                                    command=self.learning.show_menu, bg="#8a3f22", activebackground="#6e321b",
+                                    **btn)
+        self.edge_learn.place(relx=0.5, rely=1.0, y=-8, anchor="s", width=26, height=150)
         root.bind_all("<Control-k>", lambda e: self.toggle_panel("right"))
+        root.bind_all("<Control-l>", lambda e: self.learning.show_menu())
         if IS_MAC:
             root.bind_all("<Command-k>", lambda e: self.toggle_panel("right"))
+            root.bind_all("<Command-l>", lambda e: self.learning.show_menu())
         self._refresh_panel_btn()
         # keep the pane proportions when the window is resized (a dragged divider sets a new ratio)
         self.body.bind("<Configure>", lambda e: self._place_sashes())
@@ -1232,10 +1290,11 @@ class MainWindow:
 
         self.recognizer = Recognizer(self.ui_q, self._on_english)
         self.translator = Translator(client, self.ui_q, self.preset_var.get())
-        self.summarizer = Summarizer(client, self.ui_q, self.transcript_text)
+        self.summarizer = Summarizer(client, self.ui_q, self.transcript_range, lambda: self.last_summary)
         self.chatter = Chatter(client, self.ui_q, self._chat_context)
         self.recognizer.start()
         self.summarizer.start()
+        self.chatter.get_library = self.learning.lib.catalog_text
         self.chatter.start()
         self.root.after(50, self._poll)
 
@@ -1254,7 +1313,7 @@ class MainWindow:
         if hc > 100 and self.panel_side:
             # the prompt box is exactly as tall as Key takeaways (same divider height), on both sides
             self.claude_panel.sash_place(0, 0, self.body.sash_coord(0)[1])
-        self.root.after_idle(lambda: self.bottom.see("end"))
+        self.root.after_idle(lambda: self.take_follow and self.bottom.see("end"))
 
     def _remember_ratio(self, pw, attr):
         h = pw.winfo_height()
@@ -1396,9 +1455,17 @@ class MainWindow:
     def _refresh_attach_bar(self):
         for w in self.attach_bar.winfo_children():
             w.destroy()
-        if not self.attachments:
+        job = self.learning.job if getattr(self, "learning", None) else None
+        if not self.attachments and not job:
             self.attach_bar.pack_forget()
             return
+        if job:                                   # documents the Learning menu adds to the next prompt
+            chip = tk.Frame(self.attach_bar, bg="#e6d3f5")
+            chip.pack(side="left", padx=(6, 0), pady=(4, 0))
+            tk.Label(chip, text="🎓 " + job["label"], bg="#e6d3f5", font=(UI_FONT, 9)).pack(side="left", padx=(6, 2))
+            tk.Button(chip, text="✕", bg="#e6d3f5", relief="flat", bd=0, font=(UI_FONT, 8), cursor="hand2",
+                      command=lambda: (self.learning.take_job(), self._refresh_attach_bar())).pack(side="left",
+                                                                                                  padx=(0, 4))
         for i, (name, _) in enumerate(self.attachments):
             chip = tk.Frame(self.attach_bar, bg="#f3e3dc")
             chip.pack(side="left", padx=(6, 0), pady=(4, 0))
@@ -1416,9 +1483,17 @@ class MainWindow:
             return
         if not q:
             q = "Hãy xem (các) file đính kèm và tóm tắt nội dung chính."
+        job = self.learning.take_job()            # documents from the Learning menu, if any
+        self._chat_failed = False
         self.prompt.delete("1.0", "end")
         self.attachments = []
         self._refresh_attach_bar()
+        learn_blocks = []
+        if job:
+            try:
+                learn_blocks = self.learning.blocks(job) if job["kind"] != "journal" else []
+            except Exception as e:  # noqa: BLE001
+                self.status.config(text=f"🎓 Không đọc được tài liệu: {e}", fg="#ff7b7b")
         self.chat_busy = True
         self.send_btn.config(state="disabled", text="...")
         w = self.chat
@@ -1429,11 +1504,17 @@ class MainWindow:
         w.insert("end", q + "\n")
         if files:
             w.insert("end", "📎 " + ", ".join(n for n, _ in files) + "\n", "file")
+        if job:
+            w.insert("end", "🎓 " + job["label"] + "\n", "file")
         w.insert("end", "Claude: ", "who")
         w.see("end")
         w.configure(state="disabled")
-        self.chat_log.append({"q": q, "files": [n for n, _ in files], "a": ""})
-        self.chatter.q.put((q, [b for _, b in files]))
+        names = [n for n, _ in files] + (["🎓 " + job["label"]] if job else [])
+        self.chat_log.append({"q": q, "files": names, "a": ""})
+        if job and job["kind"] == "journal":
+            self.learning.run_journal(q, job)     # fills the PDF template instead of a normal answer
+            return
+        self.chatter.q.put((q, learn_blocks + [b for _, b in files]))
 
     # ---- Backup / Restore of the whole session ----
     def _session_data(self):
@@ -1539,8 +1620,17 @@ class MainWindow:
         self.transcript = [tuple(t) for t in data.get("transcript", [])]
         self.last_summary = data.get("takeaways", "")
         self.bottom.configure(state="normal")
-        self.bottom.insert("end", self.last_summary)
+        for i, part in enumerate(re.split(r"\n\n(?=\[\d\d:\d\d\]\n)", self.last_summary) if self.last_summary else []):
+            if i:
+                self.bottom.insert("end", "\n\n")
+            m = re.match(r"(\[\d\d:\d\d\]\n)", part)
+            if m:
+                self.bottom.insert("end", m.group(1), "ttime")
+                part = part[m.end():]
+            self.bottom.insert("end", part)
         self.bottom.configure(state="disabled")
+        self.take_follow = True
+        self.summarizer.done_n = len(self.transcript)
         self.chat_log = list(data.get("chat", []))
         w = self.chat
         w.configure(state="normal")
@@ -1559,6 +1649,24 @@ class MainWindow:
         self.root.after(200, lambda: (self.left.see("end"), self._sync_from(self.left, self.right),
                                       self.chat.see("end"), self.bottom.see("end")))
 
+    def _take_scrolled(self):
+        self.take_follow = self.bottom.yview()[1] >= 0.999
+
+    def _add_takeaways(self, bullets):
+        """Add new takeaways under a time stamp; the whole history stays (also in last_summary/backup)."""
+        stamp = time.strftime("%H:%M")
+        block = f"[{stamp}]\n{bullets.strip()}"
+        self.last_summary = (self.last_summary + "\n\n" + block) if self.last_summary else block
+        w = self.bottom
+        w.configure(state="normal")
+        if w.index("end-1c") != "1.0":
+            w.insert("end", "\n\n")
+        w.insert("end", f"[{stamp}]\n", "ttime")
+        w.insert("end", bullets.strip())
+        w.configure(state="disabled")
+        if self.take_follow:
+            self.root.after_idle(lambda: w.see("end"))
+
     def _chat_context(self):
         """What Claude knows about the session when answering (read from the UI thread's data)."""
         en = self.transcript_text()[-40000:]
@@ -1571,10 +1679,19 @@ class MainWindow:
         self.transcript.append((self.recognizer.utt_spk.get(ids[0], 1), text))
         self.ui_q.put(("final", (ids, text)))
 
+    def transcript_range(self, start=0, end=None):
+        """(end index, text) of transcript entries start..end (used by the running takeaways)."""
+        items = list(self.transcript)
+        end = len(items) if end is None else end
+        return end, self._transcript_lines(items[start:end])
+
     def transcript_text(self):
-        """English transcript with speaker names, e.g. 'Teacher: ...' (used by summary and chat)."""
+        """English transcript with speaker names, e.g. 'Teacher: ...' (used by chat)."""
+        return self._transcript_lines(list(self.transcript))
+
+    def _transcript_lines(self, items):
         lines, last = [], None
-        for sid, text in list(self.transcript):
+        for sid, text in items:
             if sid != last:
                 lines.append(f"{self.speaker_name(sid)}: {text}")
                 last = sid
@@ -1873,7 +1990,8 @@ class MainWindow:
         else:
             self.toggle.config(text="OFF", bg="#777", activebackground="#555")
             self.recognizer.running.clear()
-            self.root.after(1500, self.summarizer.kick.set)  # final summary
+            self.summarizer.final = True
+            self.root.after(1500, self.summarizer.kick.set)  # final takeaways for the last words
 
     # ---- UI updates (main thread only) ----
     def _append(self, widget, text):
@@ -1921,6 +2039,7 @@ class MainWindow:
                         self.chat_log[-1]["a"] += val
                     self._append(self.chat, val)
                 elif kind == "chat_error":
+                    self._chat_failed = True
                     self.chat.configure(state="normal")
                     self.chat.insert("end", val, "err")
                     self.chat.configure(state="disabled")
@@ -1932,13 +2051,11 @@ class MainWindow:
                     else:                       # answered while the panel was closed -> show a hint
                         self.unread = True
                         self._refresh_panel_btn()
+                    # guided exercise: put the next step's prompt in the box (or finish the solution)
+                    self.learning.on_chat_end(self.chat_log[-1] if self.chat_log else None,
+                                              not getattr(self, "_chat_failed", False))
                 elif kind == "summary":
-                    self.last_summary = val
-                    self.bottom.configure(state="normal")
-                    self.bottom.delete("1.0", "end")
-                    self.bottom.insert("end", val)
-                    self.root.after_idle(lambda: self.bottom.see("end"))   # show the newest takeaways
-                    self.bottom.configure(state="disabled")
+                    self._add_takeaways(val)
                 elif kind == "ready":
                     self.ready = True
                     if not self.on:
@@ -1947,6 +2064,8 @@ class MainWindow:
                     self.status.config(text=val, fg="#ddd")
                 elif kind == "error":
                     self.status.config(text=val, fg="#ff7b7b")
+                elif kind == "call":                # run a function on the UI thread (Learning menu)
+                    val()
                 elif kind == "force_off":
                     if self.on:
                         self.toggle_onoff()

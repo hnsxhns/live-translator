@@ -45,6 +45,7 @@ fi
   --osx-bundle-identifier com.livetranslator.app \
   --distpath dist --workpath build/mac --specpath build/mac \
   "${ADD[@]}" --collect-all ctranslate2 --collect-all vosk --collect-all sherpa_onnx \
+  --collect-all pymupdf --hidden-import learning \
   --collect-data faster_whisper --exclude-module onnxruntime --exclude-module torch \
   "$PWD/app.py"
 

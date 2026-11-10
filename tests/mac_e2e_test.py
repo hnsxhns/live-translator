@@ -1,15 +1,22 @@
-"""End-to-end UI test of the app on a Mac (GitHub Actions), run from source.
+"""Full end-to-end test of the app on a Mac (GitHub Actions), run from source.
 
-The real app window is built, a fake microphone plays a WAV file (made with macOS `say`)
-in real time, and the test checks that the English text appears in the window.
-Translation: uses Claude if ANTHROPIC_API_KEY is set, otherwise a fake translator
-(so the Vietnamese column and the layout can still be checked).
+The real app window is built and a fake microphone plays English speech (made with macOS `say`,
+two different voices) in real time. Each check matches a problem the user once hit on Windows:
+live-word latency, EN/VI rows level, auto-scroll that follows new text but never fights a user who
+scrolled up, speaker labels (a returning speaker keeps the same label), takeaways kept as timestamped
+history, prompt box as tall as Key takeaways on both sides, Enter sends the prompt (Vietnamese text
+kept intact), backup/restore, friendly "credit balance" error, window fits the screen. Plus the
+Learning features (Documents/Certificate windows, certificate copy to the Mac clipboard,
+Vietnamese PDF).
 
-usage: python tests/mac_e2e_test.py <speech.wav> <out_dir>
+Translation uses Claude if ANTHROPIC_API_KEY is set, otherwise a fake translator.
+
+usage: python tests/mac_e2e_test.py <out_dir> <A:a1.wav> <B:b1.wav> <A:a2.wav> ...
 Writes screenshots (*.png) and result.json to out_dir. Exit code 1 if a check fails.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -19,23 +26,41 @@ import wave
 import numpy as np
 
 sys.stdout.reconfigure(encoding="utf-8")
-
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-WAV, OUT = sys.argv[1], sys.argv[2]
+OUT = sys.argv[1]
+SEGMENTS = [a.split(":", 1) for a in sys.argv[2:]]          # [(speaker letter, wav path)]
 os.makedirs(OUT, exist_ok=True)
 
 import sounddevice                                   # noqa: E402
 import tkinter as tk                                  # noqa: E402
+from tkinter import filedialog, messagebox            # noqa: E402
 
 import app                                            # noqa: E402
+import learning                                       # noqa: E402
 
-results = {"checks": {}, "notes": []}
+results = {"checks": {}, "notes": [], "timings": {}}
 
 
 def check(name, ok, detail=""):
-    results["checks"][name] = {"ok": bool(ok), "detail": str(detail)[:500]}
+    results["checks"][name] = {"ok": bool(ok), "detail": str(detail)[:600]}
     print(("PASS " if ok else "FAIL ") + name + (f" - {detail}" if detail else ""), flush=True)
+
+
+def save_results():
+    results["passed"] = all(c["ok"] for c in results["checks"].values())
+    with open(os.path.join(OUT, "result.json"), "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+
+def watchdog():                                       # never hang the CI job
+    time.sleep(900)
+    check("finished_in_time", False, "test still running after 15 min")
+    save_results()
+    os._exit(3)
+
+
+threading.Thread(target=watchdog, daemon=True).start()
 
 
 def shot(name):
@@ -43,18 +68,34 @@ def shot(name):
     try:
         r = subprocess.run(["screencapture", "-x", path], capture_output=True, text=True, timeout=30)
         err = r.stderr.strip()
-    except (OSError, subprocess.TimeoutExpired) as e:          # not a Mac / no screen access
+    except (OSError, subprocess.TimeoutExpired) as e:
         err = repr(e)
     if not os.path.exists(path):
         results["notes"].append(f"screenshot {name} failed: {err}")
 
 
-# ---- fake microphone: plays the WAV in real time through the app's own callback ----
-with wave.open(WAV) as w:
-    assert w.getframerate() == app.SAMPLE_RATE and w.getnchannels() == 1 and w.getsampwidth() == 2
-    AUDIO = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768
-AUDIO = np.concatenate([np.zeros(app.SAMPLE_RATE, np.float32), AUDIO, np.zeros(app.SAMPLE_RATE * 3, np.float32)])
-results["audio_seconds"] = round(len(AUDIO) / app.SAMPLE_RATE, 1)
+# ---- dialogs never block the test ----
+for fn in ("showinfo", "showwarning", "showerror"):
+    setattr(messagebox, fn, lambda *a, **k: "ok")
+messagebox.askyesno = lambda *a, **k: True
+messagebox.askyesnocancel = lambda *a, **k: None
+messagebox.askokcancel = lambda *a, **k: True
+
+# ---- fake microphone: plays the segments in real time through the app's own callback ----
+SR = app.SAMPLE_RATE
+parts, seg_times, t = [np.zeros(SR, np.float32)], [], 1.0
+for spk, path in SEGMENTS:
+    with wave.open(path) as w:
+        assert w.getframerate() == SR and w.getnchannels() == 1 and w.getsampwidth() == 2, path
+        a = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768
+    seg_times.append((spk, t, t + len(a) / SR))
+    parts += [a, np.zeros(int(SR * 1.5), np.float32)]
+    t += len(a) / SR + 1.5
+parts.append(np.zeros(SR * 3, np.float32))
+AUDIO = np.concatenate(parts)
+results["audio_seconds"] = round(len(AUDIO) / SR, 1)
+results["segments"] = [(s, round(a, 1), round(b, 1)) for s, a, b in seg_times]
+PLAY = {"start": None}
 
 
 class FakeInputStream:
@@ -64,13 +105,14 @@ class FakeInputStream:
     def __enter__(self):
         def play():
             pos = 0
+            PLAY["start"] = time.time()
             while not self.stop.is_set():
                 block = AUDIO[pos:pos + self.bs] if pos < len(AUDIO) else np.zeros(self.bs, np.float32)
                 if len(block) < self.bs:
                     block = np.pad(block, (0, self.bs - len(block)))
                 self.cb(block.reshape(-1, 1), self.bs, None, None)
                 pos += self.bs
-                time.sleep(self.bs / app.SAMPLE_RATE)
+                time.sleep(self.bs / SR)
         threading.Thread(target=play, daemon=True).start()
         return self
 
@@ -80,98 +122,272 @@ class FakeInputStream:
 
 sounddevice.InputStream = FakeInputStream
 
-# ---- Claude: real if a key is given, otherwise a fake translator ----
+# ---- Claude: real if a key is given, otherwise fake ----
 if os.environ.get("ANTHROPIC_API_KEY"):
     import anthropic
     client = anthropic.Anthropic(max_retries=1, timeout=30.0)
-    results["notes"].append("translation: real Claude API")
+    results["notes"].append("Claude: real API (translation, summary, chat)")
 else:
-    client = object()
-    results["notes"].append("translation: FAKE (no ANTHROPIC_API_KEY secret) - Vietnamese text is placeholder")
+    class FakeClient:                                    # the app only needs with_options(); text goes through claude_stream
+        def with_options(self, **kw):
+            return self
+    client = FakeClient()
+    results["notes"].append("Claude: FAKE (no ANTHROPIC_API_KEY secret) - Vietnamese text is placeholder")
 
     def fake_stream(client, system, prompt, effort, on_piece=None, **kw):
-        text = "Bản dịch thử nghiệm: xin chào, đây là câu tiếng Việt có dấu."
+        text = ("Bản dịch thử nghiệm: xin chào mọi người, hôm nay chúng ta học về máy tính và cách "
+                "máy tính hiểu giọng nói; đây là câu tiếng Việt có dấu đầy đủ.")
         for word in text.split(" "):
             if on_piece:
                 on_piece(word + " ")
-            time.sleep(0.02)
+            time.sleep(0.01)
         return text
     app.claude_stream = fake_stream
 
-# ---- run the app UI exactly as main() does ----
+# ---- the app, exactly as main() starts it ----
 import multiprocessing                                 # noqa: E402
 multiprocessing.freeze_support()
 root = tk.Tk()
 if app.IS_MAC:
     root.tk.call("tk", "scaling", 1.33)
 threading.Thread(target=app.preload_models, daemon=True).start()
+WORDS = {"t": None}
+
+
+def letters(w):
+    return re.sub(r"Người nói \d+:|Teacher( \d+)?:", "", w.get("1.0", "end")).strip()
+
+
+def pump(seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        root.update()
+        if WORDS["t"] is None and PLAY["start"] and letters(mw.left):
+            WORDS["t"] = time.time()
+        time.sleep(0.02)
+
 
 # 1) login screen
 app.LoginWindow(root, lambda c: None)
 root.update()
 time.sleep(1.5)
 root.update()
-shot("1_login")
+shot("01_login")
 check("mac_buttons_keep_colors", tk.Button is app._FlatButton, f"tk.Button is {tk.Button.__name__}")
 for w in root.winfo_children():
     w.destroy()
 
 # 2) main window
-# keep the app's own window size and position (it centers itself on the screen)
 mw = app.MainWindow(root, client)
 t0 = time.time()
-while not mw.ready and time.time() - t0 < 120:          # models loaded?
+while not mw.ready and time.time() - t0 < 120:
     root.update()
     time.sleep(0.05)
 check("speech_models_ready", mw.ready, f"{time.time() - t0:.1f}s")
+root.update()
 x, y, ww, wh = root.winfo_rootx(), root.winfo_rooty(), root.winfo_width(), root.winfo_height()
 sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
 check("window_fits_screen", x >= 0 and y >= 0 and x + ww <= sw and y + wh <= sh,
       f"window {ww}x{wh} at ({x},{y}), screen {sw}x{sh}")
-shot("2_main_ready")
+shot("02_main_ready")
+# smaller window so the text overflows and auto-scroll can really be tested
+root.geometry(f"{min(1000, sw - 20)}x420+10+40")
+pump(1)
 
-mw.toggle_onoff()                                         # ON -> starts listening (fake mic)
-root.update()
+mw.toggle_onoff()
+pump(0.3)
 check("toggle_on_green", mw.toggle.cget("text") == "ON" and mw.toggle.cget("bg") == "#27ae60",
       f"{mw.toggle.cget('text')} {mw.toggle.cget('bg')}")
-end = time.time() + results["audio_seconds"] + 25
-mid = time.time() + results["audio_seconds"] / 2
-took_mid = False
-while time.time() < end:
-    root.update()
-    time.sleep(0.03)
-    if not took_mid and time.time() > mid:
-        shot("3_listening")
-        took_mid = True
+while PLAY["start"] is None:
+    pump(0.1)
+start = PLAY["start"]
 
+
+def at(sec):                                           # pump until <sec> after playback start
+    pump(max(0.0, start + sec - time.time()))
+
+
+# --- live words latency (speech starts 1.0 s into playback) ---
+at(seg_times[0][1] + 4)
+lat = (WORDS["t"] - (start + seg_times[0][1])) if WORDS["t"] else None
+results["timings"]["first_live_words_s"] = lat
+check("live_words_latency", lat is not None and lat < 2.5,
+      f"first English words {lat:.2f}s after speech started (Windows target < 1 s + first word)" if lat else "no words")
+shot("03_listening")
+at(seg_times[0][2] + 4)
+mw.summarizer.kick.set()                                # takeaways for the first speaker's part
+
+# --- after segment 2: follow newest text, then user scrolls up ---
+at(seg_times[1][2] + 5)
+yl, yr, yt = mw.left.yview(), mw.right.yview(), mw.bottom.yview()
+overflow = yl[0] > 0
+check("auto_scroll_follows_new_text", yl[1] >= 0.999 and yr[1] >= 0.999,
+      f"EN view {yl[0]:.2f}-{yl[1]:.2f}, VI view {yr[0]:.2f}-{yr[1]:.2f}, text overflows: {overflow}")
+if not overflow:
+    results["notes"].append("text did not overflow the pane: scroll checks are weaker")
+mw.left.yview_moveto(0)
+mw._sync_from(mw.left, mw.right)
+mw._user_scrolled()
+shot("04_user_scrolled_up")
+
+# --- rest of the speech arrives while the user reads above ---
+at(seg_times[-1][2] + 8)
+yl = mw.left.yview()
+check("no_fight_with_user_scroll", (not overflow) or yl[0] < 0.05,
+      f"EN view stayed at {yl[0]:.2f}-{yl[1]:.2f} while new text arrived")
+mw.left.yview_moveto(1.0)
+mw._sync_from(mw.left, mw.right)
+mw._user_scrolled()
+pump(1)
+check("follow_resumes_at_bottom", mw.follow and mw.left.yview()[1] >= 0.999, f"follow={mw.follow}")
+
+# --- recognized text ---
 english = mw.left.get("1.0", "end").strip()
 vietnamese = mw.right.get("1.0", "end").strip()
 results["english_text"] = english
 results["vietnamese_text"] = vietnamese
-want = ["morning", "machine", "learning", "speech", "notebooks"]
+want = ["morning", "machine", "learning", "speech", "notebooks", "homework", "friday", "questions"]
 found = [w for w in want if w in english.lower()]
-check("english_recognized", len(found) >= 3, f"found {found} of {want}")
-check("vietnamese_column_filled", len(vietnamese) > 10, vietnamese[:120])
-shot("4_after_speech")
+check("english_recognized", len(found) >= 6, f"found {found} of {want}")
+check("vietnamese_column_filled", len(vietnamese) > 20, vietnamese[:160])
 
-# 3) Claude panel from both sides
+# --- speakers: two voices -> two labels; the first voice comes back with the same label ---
+labels = re.findall(r"(Người nói \d+|Teacher(?: \d+)?):", english)
+distinct = list(dict.fromkeys(labels))
+check("speakers_two_voices_two_labels", len(distinct) == 2,
+      f"labels in order: {labels} (voices in order: {[s for s, _, _ in seg_times]})")
+
+# --- EN/VI rows level ---
+mw._align_all()
+pump(1)
+diffs = []
+for tag in mw.left.tag_names():
+    if tag.startswith("b") and tag[1:].isdigit() and mw.right.tag_ranges(tag):
+        ya = mw.left.count("1.0", mw.left.tag_ranges(tag)[0], "update", "ypixels")
+        yb = mw.right.count("1.0", mw.right.tag_ranges(tag)[0], "update", "ypixels")
+        ya = (ya[0] if isinstance(ya, tuple) else ya) or 0
+        yb = (yb[0] if isinstance(yb, tuple) else yb) or 0
+        diffs.append(abs(ya - yb))
+check("en_vi_rows_level", diffs and max(diffs) <= 3, f"{len(diffs)} rows, max offset {max(diffs) if diffs else '-'} px")
+
+# --- takeaways: timestamped, history kept ---
+mw.toggle_onoff()                                       # OFF -> final summary
+check("toggle_off_gray", mw.toggle.cget("text") == "OFF", mw.toggle.cget("bg"))
+pump(8)
+take = mw.bottom.get("1.0", "end")
+stamps = re.findall(r"\[\d\d:\d\d\]", take)
+check("takeaways_timestamped_history", len(stamps) >= 2, f"{len(stamps)} timestamped blocks kept")
+check("takeaways_follow_newest", mw.bottom.yview()[1] >= 0.999, f"view {mw.bottom.yview()}")
+shot("05_after_speech")
+root.geometry(f"{min(1280, sw - 20)}x{min(800, sh - 110)}+10+30")
+pump(1)
+
+# --- Claude panel from both sides: prompt box as tall as Key takeaways ---
 for side in ("left", "right"):
     mw.toggle_panel(side)
-    for _ in range(20):
-        root.update()
-        time.sleep(0.05)
-    shot(f"5_claude_panel_{side}")
+    pump(1.2)
+    pf, tf = mw.prompt_row.master, mw.bottom.master
+    hp, ht = pf.winfo_height(), tf.winfo_height()
+    yp, yt_ = pf.winfo_rooty(), tf.winfo_rooty()
+    check(f"prompt_height_equals_takeaways_{side}", abs(hp - ht) <= 6 and abs(yp - yt_) <= 6,
+          f"prompt {hp}px at y={yp}, takeaways {ht}px at y={yt_}")
+    shot(f"06_claude_panel_{side}")
+    if side == "right":
+        # Enter sends the prompt; Vietnamese text stays intact
+        q = "Xin chào Claude, hãy tóm tắt bài học hôm nay giúp tôi: ắ ằ ẳ ẵ ặ ơ ư đ."
+        mw.prompt.delete("1.0", "end")
+        mw.prompt.insert("1.0", q)
+        mw.prompt.focus_set()
+        if isinstance(mw.prompt, tk.Text):              # Mac: Tk text box, press Enter for real
+            mw.prompt.event_generate("<Return>")
+        else:                                            # Windows: native box (Enter is polled by the app)
+            mw.prompt._enter = True
+        pump(4)
+        chat = mw.chat.get("1.0", "end")
+        check("enter_sends_prompt_vietnamese_intact", q in chat and mw.prompt.get("1.0", "end").strip() == "",
+              chat.strip()[:200])
+        shot("07_chat_answer")
     mw.toggle_panel(side)
-    root.update()
-check("claude_panel_both_sides", True)
+    pump(0.5)
 
-mw.toggle_onoff()
-root.update()
-check("toggle_off_gray", mw.toggle.cget("text") == "OFF", mw.toggle.cget("bg"))
+# --- backup / restore ---
+bk = os.path.join(OUT, "backup.json")
+filedialog.asksaveasfilename = lambda *a, **k: bk
+filedialog.askopenfilename = lambda *a, **k: bk
+before = mw.left.get("1.0", "end")
+mw.backup_session()
+pump(0.5)
+mw.restore_session()
+pump(1.5)
+check("backup_restore_roundtrip", os.path.exists(bk) and mw.left.get("1.0", "end").strip() == before.strip(),
+      f"backup {os.path.getsize(bk) if os.path.exists(bk) else 0} bytes")
 
-results["passed"] = all(c["ok"] for c in results["checks"].values())
-with open(os.path.join(OUT, "result.json"), "w", encoding="utf-8") as f:
-    json.dump(results, f, ensure_ascii=False, indent=2)
+# --- friendly credit-balance error ---
+msg = app.friendly_error(Exception("Error code: 400 - Your credit balance is too low to access the Anthropic API."))
+check("friendly_credit_balance_error", "credit" in msg and "Billing" in msg, msg[:120])
+
+# --- Learning ---
+def toplevels():
+    return [w for w in root.winfo_children() if isinstance(w, tk.Toplevel)]
+
+
+def find_button(widget, text):
+    for c in widget.winfo_children():
+        if isinstance(c, tk.Button) and text in str(c.cget("text")):
+            return c
+        b = find_button(c, text)
+        if b:
+            return b
+    return None
+
+
+n0 = len(toplevels())
+mw.learning.documents()
+pump(1)
+check("learning_documents_window", len(toplevels()) == n0 + 1)
+shot("08_learning_documents")
+toplevels()[-1].destroy()
+
+from PIL import Image, ImageDraw                       # noqa: E402
+cert = os.path.join(OUT, "certificate_test.png")
+img = Image.new("RGB", (800, 560), "white")
+ImageDraw.Draw(img).rectangle([20, 20, 780, 540], outline="#d97757", width=8)
+img.save(cert)
+learning.filedialog.askopenfilename = lambda *a, **k: cert
+mw.learning.certificate()
+pump(1)
+top = toplevels()[-1]
+up = find_button(top, "Upload")
+if up:
+    up.invoke()
+pump(1.5)
+certs = mw.learning.lib.data.get("certificates") or []
+check("learning_certificate_upload", up is not None and len(certs) >= 1, f"{len(certs)} certificate(s)")
+shot("09_learning_certificate")
+cp = find_button(top, "Copy")
+if app.IS_MAC:
+    subprocess.run(["osascript", "-e", "set the clipboard to \"\""], capture_output=True)
+    if cp:
+        cp.invoke()
+        pump(1)
+    info = subprocess.run(["osascript", "-e", "clipboard info"], capture_output=True, text=True).stdout
+    check("mac_clipboard_has_certificate_picture", "PNGf" in info, info.strip()[:160])
+else:
+    results["notes"].append("clipboard check runs on Mac only")
+top.destroy()
+pump(0.3)
+
+pdf = os.path.join(OUT, "vietnamese_test.pdf")
+viet = "Lời giải bài tập: Tiếng Việt có dấu ắ ằ ẳ ẵ ặ ơ ư đ Đ — kiểm tra phông chữ."
+learning.write_pdf(pdf, f"<h2>Kiểm tra PDF</h2><p>{viet}</p>")
+import pymupdf                                         # noqa: E402
+with pymupdf.open(pdf) as d:
+    text = d[0].get_text()
+    fonts = [f[3] for f in d[0].get_fonts()]
+check("learning_pdf_vietnamese", viet in " ".join(text.split()), f"fonts {fonts}; text {text.strip()[:100]}")
+
+# --- clean exit: no extra processes, no hang ---
+save_results()
 print(json.dumps(results, ensure_ascii=False, indent=2), flush=True)
 root.destroy()
 os._exit(0 if results["passed"] else 1)

@@ -6,3 +6,5 @@ vosk
 sounddevice
 numpy
 sherpa-onnx
+pymupdf
+pillow

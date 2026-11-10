@@ -13,3 +13,5 @@ vendor/
 # Local settings / logins
 config.json
 selftest.txt
+# Learning library created when running from source
+/learning/
