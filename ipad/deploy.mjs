@@ -38,7 +38,7 @@ git("add", "-A");
 git("-c", "user.name=Live Translator", "-c", `user.email=${user}@users.noreply.github.com`,
     "commit", "-q", "-m", `Publish ${JSON.parse(fs.readFileSync(path.join(SITE, "releases.json"), "utf8")).releases.map((r) => `${r.version}-${r.build}`).join(", ")}`);
 console.log("Uploading (the first time takes a few minutes: ~250 MB of models) ...");
-execFileSync("git", ["-C", SITE, "push", "-q", "--force", `https://github.com/${repo}.git`, "gh-pages"], { stdio: "inherit" });
+execFileSync("git", ["-C", SITE, "-c", "http.postBuffer=524288000", "push", "-q", "--force", `https://github.com/${repo}.git`, "gh-pages"], { stdio: "inherit" });
 fs.rmSync(path.join(SITE, ".git"), { recursive: true, force: true });
 
 try {
