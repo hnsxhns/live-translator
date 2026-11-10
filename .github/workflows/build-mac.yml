@@ -1,0 +1,57 @@
+# Builds the Mac app (LiveTranslator_v<version>_mac.dmg) on GitHub's Mac machines.
+# Runs on every push to mac-portable, or by hand: Actions tab > Build Mac app > Run workflow.
+# The .dmg appears under the run's "Artifacts".
+name: Build Mac app
+
+on:
+  push:
+    branches: [mac-portable]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15          # Apple Silicon (M1 and newer)
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Speech models are not in git (too big); fetch the same files from their official sources
+      - name: Cache models
+        id: models
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: models-base.en-vosk-small-0.15-campplus-v1
+
+      - name: Download models
+        if: steps.models.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p models/base.en models/spk-onnx
+          HF=https://huggingface.co/Systran/faster-whisper-base.en/resolve/main
+          for f in config.json model.bin tokenizer.json vocabulary.txt README.md; do
+            curl -fsSL -o "models/base.en/$f" "$HF/$f"
+          done
+          curl -fsSL -o vosk.zip https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+          unzip -q vosk.zip && mv vosk-model-small-en-us-0.15 models/vosk-en-small && rm vosk.zip
+          curl -fsSL -o models/spk-onnx/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx
+          # same files as on the Windows PC
+          echo "2a166925539a16005f14ff328359f9b9adb9dc4fb631bb3b227526862e93e2ef  models/base.en/model.bin" | shasum -a 256 -c
+          [ "$(md5 -q models/spk-onnx/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx)" = "b3934a80bda2e80abdb134fcbc1cdc80" ]
+          du -sh models/*
+
+      - name: Build
+        run: PYTHON=python bash build_mac.sh
+
+      - name: Upload .dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveTranslator-mac
+          path: dist/*.dmg
+          compression-level: 0
+          retention-days: 30

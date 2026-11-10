@@ -1,5 +1,6 @@
 #!/bin/bash
-# Builds the portable Mac app: dist/LiveTranslator_v<version>_mac.zip (holds LiveTranslator_v<version>_mac.app).
+# Builds the portable Mac app: dist/LiveTranslator_v<version>_mac.dmg - ONE file to copy to other Macs.
+# Normally built by GitHub Actions (.github/workflows/build-mac.yml); this script also works on any Mac.
 # Must be run ON A MAC (PyInstaller cannot build Mac apps from Windows).
 #
 #   1. Copy the whole project folder to the Mac, including models/ (and vendor/ant if you have the Mac build of `ant`).
@@ -59,14 +60,22 @@ PLIST="$APP/Contents/Info.plist"
 # Info.plist changed -> re-sign (ad-hoc; no Apple developer account needed)
 codesign --force --deep --sign - "$APP"
 
-# Quick check that the bundled speech models load
-"$APP/Contents/MacOS/$NAME" --selftest || true
+# Quick check that the bundled speech models load (stop the build if they do not)
 SELFTEST="$HOME/Library/Application Support/LiveTranslator/selftest.txt"
-[ -f "$SELFTEST" ] && { echo "--- selftest ---"; cat "$SELFTEST"; echo; }
+rm -f "$SELFTEST"
+"$APP/Contents/MacOS/$NAME" --selftest || true
+echo "--- selftest ---"; cat "$SELFTEST" 2>/dev/null || echo "(no selftest.txt)"; echo
+grep -q '^OK' "$SELFTEST" 2>/dev/null || { echo "Selftest failed"; exit 1; }
 
-# One zip to copy to other Macs (ditto keeps the app's permissions and signature)
-rm -f "dist/$NAME.zip"
-ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/$NAME.zip"
-echo "Done: dist/$NAME.zip  ($(du -h "dist/$NAME.zip" | cut -f1))"
-echo "On the other Mac: unzip, drag the app to Applications, then open it once; if macOS blocks it: System Settings > Privacy & Security > Open Anyway."
-echo "If macOS still says it is damaged/unverified, run:  xattr -dr com.apple.quarantine \"/Applications/$NAME.app\""
+# ONE file to copy to other Macs: a .dmg with the app and an Applications shortcut
+STAGE="build/mac/dmg"
+rm -rf "$STAGE" && mkdir -p "$STAGE"
+ditto "$APP" "$STAGE/Live Translator.app"
+ln -s /Applications "$STAGE/Applications"
+DMG="dist/$NAME.dmg"
+rm -f "$DMG"
+hdiutil create -volname "Live Translator $VER" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+rm -rf "$STAGE"
+echo "Done: $DMG  ($(du -h "$DMG" | cut -f1))"
+echo "On the other Mac: open the .dmg, drag Live Translator into Applications, double-click it."
+echo "First time only, if macOS blocks it: System Settings > Privacy & Security > Open Anyway."
