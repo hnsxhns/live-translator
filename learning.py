@@ -664,6 +664,27 @@ def copy_file_to_clipboard(path):
     return True
 
 
+def to_recycle_bin(path):
+    """Move a file to the Recycle Bin (Windows) so a delete can be undone; elsewhere delete it. True if gone."""
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class SHFILEOPSTRUCTW(ctypes.Structure):
+            _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", wintypes.LPCWSTR),
+                        ("pTo", wintypes.LPCWSTR), ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
+                        ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
+        op = SHFILEOPSTRUCTW(None, 3, os.path.abspath(path) + "\0", None, 0x0040 | 0x0010 | 0x0004 | 0x0400,
+                             False, None, None)        # FO_DELETE; ALLOWUNDO | NOCONFIRMATION | SILENT | NOERRORUI
+        ctypes.WinDLL("shell32").SHFileOperationW(ctypes.byref(op))
+        return not os.path.exists(path)
+    try:
+        os.remove(path)
+    except OSError:
+        return False
+    return True
+
+
 def mapi_send(path, subject, body):
     """Open the default mail app's 'new message' window with the file attached (Windows Simple MAPI).
     Returns True when the mail app accepted it."""
@@ -1106,6 +1127,9 @@ class LearningUI:
         m.add_command(label="📂  Output Folder — " + (f"…{out[-38:]}" if len(out) > 40 else out or
                                                      "chọn nơi lưu backup & kết quả"),
                       command=self.mw.choose_output_folder)
+        n_out = len(self.lib.data.get("outputs", []))
+        m.add_command(label="📋  List output files — các file đã tạo" + (f" ({n_out})" if n_out else ""),
+                      command=self.list_outputs)
         b = anchor or self.button
         m.update_idletasks()
         try:
@@ -1913,7 +1937,10 @@ class LearningUI:
         elif kind == "exsummary" and ok and answer:
             try:
                 out = solution_pdf(self.lib, s, answer)
-                self.chat_note(f"Hoàn thành bài tập \"{s['ex']['title']}\". File PDF lời giải:\n")
+                self.add_output("solution", out, f"Lời giải: {s['ex']['title']}", day=s["ex"].get("day", 0),
+                                detail=f"{len(s['ex']['steps'])} bước")
+                self.chat_note(f"Hoàn thành bài tập \"{s['ex']['title']}\". File PDF lời giải (cũng có trong "
+                               "📋 List output files):\n")
                 self.file_links(out, "Lưu lời giải")
             except Exception as e:  # noqa: BLE001
                 self.chat_note(f"Chưa tạo được file PDF lời giải: {e}", "err")
@@ -1928,6 +1955,194 @@ class LearningUI:
                 self.prompt_step()                          # a side question or an error: same step again
         else:
             self.summary_prompt(send=False)
+
+    # ---- List output files: every file the app created, with clear descriptions, sortable, open/save/delete ----
+    OUT_KINDS = {"takeaways": ("📄", "Ý chính (Key takeaways)"), "journal": ("📓", "Nhật ký buổi học"),
+                 "solution": ("✏", "Lời giải bài tập"), "backup": ("💾", "Backup phiên nghe")}
+    OUT_PREFIX = (("KeyTakeaways_", "takeaways"), ("NhatKy_", "journal"), ("LoiGiai_", "solution"),
+                  ("LiveTranslator_backup_", "backup"))
+    OUT_SORTS = (("new", "Mới nhất trước"), ("old", "Cũ nhất trước"), ("kind", "Theo loại file"),
+                 ("name", "Theo tên (A → Z)"), ("day", "Theo buổi học"), ("size", "Theo dung lượng"))
+
+    def add_output(self, kind, path, title, detail="", day=0):
+        """Record a file the app just created, so it shows in List output files."""
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return
+        key = os.path.normcase(os.path.abspath(path))
+        entry = {"path": os.path.abspath(path), "kind": kind, "title": title, "detail": detail, "day": day or 0,
+                 "created": time.strftime("%Y-%m-%d %H:%M:%S"), "size": size}
+        with self.lib.lock:
+            outs = [o for o in self.lib.data.get("outputs", []) if os.path.normcase(o["path"]) != key]
+            self.lib.data["outputs"] = outs + [entry]
+        self.lib.save()
+
+    def adopt_outputs(self):
+        """Add files made earlier (or before this list existed) from the output folders; drop deleted ones."""
+        folders = [os.path.join(self.lib.dir, "journals"), os.path.join(self.lib.dir, "solutions")]
+        for sub in ("Outputs", "Backup"):
+            d = A.output_dir(sub) if hasattr(A, "output_dir") else None
+            if d:
+                folders.append(d)
+        with self.lib.lock:
+            outs = [o for o in self.lib.data.get("outputs", []) if os.path.exists(o["path"])]
+            known = {os.path.normcase(o["path"]) for o in outs}
+            for folder in folders:
+                try:
+                    names = os.listdir(folder)
+                except OSError:
+                    continue
+                for name in names:
+                    path = os.path.join(folder, name)
+                    kind = next((k for p, k in self.OUT_PREFIX if name.startswith(p)), None)
+                    if not kind or os.path.normcase(path) in known or not os.path.isfile(path):
+                        continue
+                    what = re.sub(r"_\d{8}_\d{4}\.(pdf|json)$", "", name)
+                    what = re.sub(r"^(KeyTakeaways|NhatKy_|LoiGiai_|LiveTranslator_backup)_?", "", what).replace("_", " ")
+                    title = {"takeaways": "Ý chính phiên nghe", "backup": "Backup phiên nghe",
+                             "journal": f"Nhật ký: {what}", "solution": f"Lời giải: {what}"}[kind]
+                    st = os.stat(path)
+                    outs.append({"path": path, "kind": kind, "title": title.strip(": "), "detail": "", "day": 0,
+                                 "created": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),
+                                 "size": st.st_size})
+                    known.add(os.path.normcase(path))
+            self.lib.data["outputs"] = outs
+        self.lib.save()
+
+    def list_outputs(self):
+        self.adopt_outputs()
+        top = self._dialog("📋 List output files — các file đã tạo", "1000x520", modal=False)
+        bar = tk.Frame(top, bg="white")
+        bar.pack(fill="x", padx=12, pady=(10, 4))
+        sorts = dict(self.OUT_SORTS)
+        kinds = {"": "Tất cả loại file", **{k: f"{i} {t}" for k, (i, t) in self.OUT_KINDS.items()}}
+        sort_var = tk.StringVar(value=sorts.get(self.lib.data.get("out_sort", "new"), sorts["new"]))
+        kind_var = tk.StringVar(value=kinds[""])
+        tk.Label(bar, text="Sắp xếp:", bg="white", font=(A.UI_FONT, 10, "bold")).pack(side="left")
+        ttk.Combobox(bar, textvariable=sort_var, values=list(sorts.values()), state="readonly",
+                     width=20).pack(side="left", padx=(4, 14))
+        tk.Label(bar, text="Lọc:", bg="white", font=(A.UI_FONT, 10, "bold")).pack(side="left")
+        ttk.Combobox(bar, textvariable=kind_var, values=list(kinds.values()), state="readonly",
+                     width=26).pack(side="left", padx=4)
+        info = tk.Label(top, text="", bg="white", fg="#666", font=(A.UI_FONT, 9), anchor="w")
+        info.pack(fill="x", padx=12)
+        cols = (("kind", "Loại", 150), ("title", "Mô tả", 300), ("day", "Buổi", 50), ("when", "Thời gian", 125),
+                ("size", "Dung lượng", 80), ("file", "Tên file", 260))
+        tree = ttk.Treeview(top, columns=[c[0] for c in cols], show="tree headings")
+        tree.column("#0", width=24, stretch=False)
+        for col, txt, w in cols:
+            tree.heading(col, text=txt)
+            tree.column(col, width=w, anchor="w", stretch=col in ("title", "file"))
+        tree.tag_configure("group", font=(A.UI_FONT, 10, "bold"), background="#f3ece7")
+        sb = ttk.Scrollbar(top, command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        btns = tk.Frame(top, bg="white")
+        btns.pack(side="bottom", fill="x", padx=12, pady=8)
+        sb.pack(side="right", fill="y", pady=4, padx=(0, 12))
+        tree.pack(fill="both", expand=True, padx=(12, 0), pady=4)
+        rows = {}
+
+        def when(o):
+            try:
+                return time.strftime("%H:%M · %d/%m/%Y", time.strptime(o["created"], "%Y-%m-%d %H:%M:%S"))
+            except (ValueError, KeyError):
+                return ""
+
+        def size(n):
+            return f"{n / 1e6:.1f} MB" if n > 1e6 else f"{max(1, round(n / 1e3))} KB"
+
+        def fill(*_):
+            tree.delete(*tree.get_children())
+            rows.clear()
+            by = next(k for k, v in sorts.items() if v == sort_var.get())
+            only = next(k for k, v in kinds.items() if v == kind_var.get())
+            with self.lib.lock:
+                self.lib.data["out_sort"] = by
+            allouts = self.lib.data.get("outputs", [])
+            outs = [o for o in allouts if not only or o["kind"] == only]
+            keyf = {"new": lambda o: o["created"], "old": lambda o: o["created"], "kind": lambda o: o["kind"],
+                    "name": lambda o: o["title"].lower(), "day": lambda o: o.get("day") or 999,
+                    "size": lambda o: o["size"]}[by]
+            outs.sort(key=lambda o: o["created"], reverse=True)          # newest first inside groups
+            outs.sort(key=keyf, reverse=by in ("new", "size"))
+            parent, group = "", None
+            for n, o in enumerate(outs):
+                icon, label = self.OUT_KINDS.get(o["kind"], ("📄", "File"))
+                g = label if by == "kind" else (f"Buổi {o['day']}" if o.get("day") else "Không theo buổi") \
+                    if by == "day" else None
+                if g and g != group:
+                    group = g
+                    parent = tree.insert("", "end", text="", open=True, tags=("group",), values=(g, "", "", "", "", ""))
+                iid = f"o{n}"
+                rows[iid] = o
+                tree.insert(parent if g else "", "end", iid=iid, values=(
+                    f"{icon} {label}", o["title"] + (f" — {o['detail']}" if o.get("detail") else ""),
+                    o.get("day") or "-", when(o), size(o["size"]), os.path.basename(o["path"])))
+            info.config(text=f"{len(outs)}/{len(allouts)} file. Nhấn đúp để mở; chọn file rồi dùng các nút bên dưới."
+                        if allouts else "Chưa có file nào. Các file app tạo ra (Xuất PDF ý chính, Backup, nhật ký, "
+                                        "lời giải bài tập) sẽ hiện ở đây.")
+
+        def selected():
+            s = tree.selection()
+            return rows.get(s[0]) if s else None
+
+        def open_out():
+            o = selected()
+            if not o:
+                return
+            if not os.path.exists(o["path"]):
+                messagebox.showinfo("List output files", "Không tìm thấy file này nữa.", parent=top)
+                self.adopt_outputs()
+                fill()
+                return
+            open_path(o["path"])
+
+        def show_in_folder():
+            o = selected()
+            if o and os.path.exists(o["path"]):
+                if sys.platform == "win32":
+                    subprocess.Popen(["explorer", "/select,", os.path.normpath(o["path"])])
+                else:
+                    open_path(os.path.dirname(o["path"]))
+
+        def save_copy():
+            o = selected()
+            if not o or not os.path.exists(o["path"]):
+                return
+            ext = os.path.splitext(o["path"])[1]
+            dst = filedialog.asksaveasfilename(parent=top, title="Lưu bản sao", initialfile=os.path.basename(o["path"]),
+                                               defaultextension=ext, filetypes=[(ext.upper().strip("."), "*" + ext)])
+            if dst:
+                shutil.copy2(o["path"], dst)
+                self.mw.status.config(text=f"✓ Đã lưu bản sao: {os.path.basename(dst)}", fg="#7ee2a8")
+
+        def delete():
+            o = selected()
+            if not o:
+                return
+            if not messagebox.askyesno("Xoá file", f"Xoá \"{o['title']}\"?\n\n{o['path']}\n\nFile được chuyển vào "
+                                       "Thùng rác (có thể khôi phục lại).", parent=top):
+                return
+            if os.path.exists(o["path"]) and not to_recycle_bin(o["path"]):
+                messagebox.showerror("Xoá file", "Không xoá được file này.", parent=top)
+                return
+            with self.lib.lock:
+                self.lib.data["outputs"] = [x for x in self.lib.data.get("outputs", []) if x is not o]
+            self.lib.save()
+            fill()
+
+        sort_var.trace_add("write", fill)
+        kind_var.trace_add("write", fill)
+        tree.bind("<Double-1>", lambda e: open_out())
+        st = dict(font=(A.UI_FONT, 10), relief="flat", cursor="hand2", padx=12, pady=3)
+        tk.Button(btns, text="Đóng", command=top.destroy, bg="#eee", **st).pack(side="right")
+        tk.Button(btns, text="🗑 Xoá", command=delete, bg="#eee", **st).pack(side="right", padx=6)
+        tk.Button(btns, text="💾 Lưu bản sao…", command=save_copy, bg="#eee", **st).pack(side="right")
+        tk.Button(btns, text="📁 Mở thư mục chứa file", command=show_in_folder, bg="#eee", **st).pack(side="right", padx=6)
+        tk.Button(btns, text="📄 Mở", command=open_out, bg="#d97757", fg="white", activebackground="#c4643f",
+                  **st).pack(side="right")
+        fill()
 
     # ---- Documents ----
     def documents(self):
@@ -2060,7 +2275,7 @@ class LearningUI:
             f"Hãy điền nhật ký buổi học cho {when} theo đúng mẫu \"{template['name']}\", dựa trên tài liệu của "
             "buổi này và nội dung thầy giảng trên màn hình. Viết ngắn gọn, cụ thể, đúng từng mục trong mẫu, "
             "rồi trả lại file PDF đã điền để tải về.",
-            {"kind": "journal", "label": f"Journal · {when} · mẫu {template['name'][:30]}",
+            {"kind": "journal", "label": f"Journal · {when} · mẫu {template['name'][:30]}", "when": when, "day": day,
              "doc_ids": [d["id"] for d in docs if d["id"] != template["id"]], "template": template["id"]})
 
     def run_journal(self, instruction, job):
@@ -2077,7 +2292,8 @@ class LearningUI:
             try:
                 out, preview = make_journal(self.mw.client, self.lib, template, day_docs, session, instruction)
                 q.put(("chat_piece", (preview.strip() + "\n") if preview else ""))
-                self.later(lambda: self.file_links(out))
+                self.later(lambda: (self.file_links(out), self.add_output(
+                    "journal", out, "Nhật ký: " + job.get("when", "buổi học"), day=job.get("day", 0))))
             except Exception as e:  # noqa: BLE001
                 why = A.friendly_error(e) if isinstance(e, anthropic.APIError) else str(e)[:200]
                 q.put(("chat_error", f"[Chưa điền được nhật ký: {why}]"))
