@@ -12,7 +12,7 @@
 import { askJson, uploadFile, ClaudeError, friendlyError } from "./claude.js";
 import { fileToBlock, docxText } from "./files.js";
 import { openFile, shareFile, mimeOf } from "./viewer.js";
-import { bookmarklet } from "./source.js";
+import { bookmarklet, BOOKMARK_VERSION } from "./source.js";
 
 const ROOT = new URL("../../../", import.meta.url).href;
 const PDFJS = ROOT + "lib/pdfjs-4.10.38/";
@@ -1535,8 +1535,9 @@ export class LearningUI {
     const steps = el("ol", "srcSteps");
     for (const [b, t] of [
       ["Mở trang tài liệu", " — trang khóa học mở ở tab mới. Đăng nhập nếu được hỏi (chỉ lần đầu: Safari/Chrome nhớ phiên)."],
-      ["Vào mục chứa tài liệu", " (Materials, Tài liệu, Resources...)."],
-      ["Chạm dấu trang 📥 Live Translator", " — app tải các tài liệu trên trang (kể cả file cần đăng nhập) và gửi về đây."],
+      ["Chạm dấu trang 📥 Live Translator", " — nếu trang chưa hiện tài liệu, dấu trang tự mở tab Materials / Tài liệu " +
+        "(hoặc tab bạn đã bấm lần trước), rồi tải các tài liệu trên trang (kể cả file cần đăng nhập, trang Salesforce) " +
+        "và gửi về đây. Lần đầu nếu chưa thấy tài liệu: tự bấm vào phần tài liệu rồi chạm lại — lần sau dấu trang nhớ."],
       ["Quay lại tab Live Translator", ": tài liệu chưa có được thêm vào thư viện và upload cho Claude."],
     ]) { const li = el("li"); li.append(el("b", "", b), t); steps.append(li); }
     const srcInfo = el("p", "hint", `Trang tài liệu: ${host}` +
@@ -1545,7 +1546,9 @@ export class LearningUI {
     const open = el("button", "primary", "🌐 Mở trang tài liệu");
     // not noopener: the opened tab's "opener" is this app, so the bookmark can send the files straight back
     open.onclick = () => { window.open(url, "_blank"); this.app.closeSheet(); this.app.setStatus("🌐 Đăng nhập, mở trang tài liệu rồi chạm dấu trang 📥 Live Translator.", "ok"); };
-    const setup = el("button", "", this.lib.data.bookmark_ready ? "📥 Dấu trang (xem lại cách cài)" : "📥 Cài dấu trang (một lần)");
+    const bv = this.lib.data.bookmark_version || (this.lib.data.bookmark_ready ? 1 : 0);
+    const setup = el("button", bv && bv < BOOKMARK_VERSION ? "primary" : "",
+      !bv ? "📥 Cài dấu trang (một lần)" : bv < BOOKMARK_VERSION ? "📥 Cập nhật dấu trang (bản mới)" : "📥 Dấu trang (xem lại cách cài)");
     setup.onclick = () => this.bookmarkSetup();
     const direct = el("button", "", "🔎 Quét trực tiếp (trang công khai)");
     direct.onclick = () => { this.app.closeSheet(); this.scanSource(url); };
@@ -1567,6 +1570,7 @@ export class LearningUI {
       try { await navigator.clipboard.writeText(code); note.textContent = "✓ Đã copy — làm tiếp các bước dưới."; }
       catch { prompt("Copy mã này:", code); }
       this.lib.data.bookmark_ready = true;
+      this.lib.data.bookmark_version = BOOKMARK_VERSION;
       this.lib.save();
     };
     const drag = el("a", "srcDrag", "📥 Live Translator");

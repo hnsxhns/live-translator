@@ -260,6 +260,18 @@
         "Cài dấu trang một lần: Learning → 🌐 Source → 📥 Cài dấu trang (có hướng dẫn cho Safari và Chrome). Trang công khai vẫn quét trực tiếp được.",
         "Từ bản 18: nhãn Giáo viên sau 3 phút; bản 17: lọc âm cho Whisper, Ý chính viết sạch hơn."
       ]
+    },
+    {
+      "version": "1.9.9",
+      "build": 20,
+      "channel": "beta",
+      "date": "2026-11-12",
+      "notes": [
+        "🌐 Source sửa như bản Windows 1.9.9 mới nhất — dấu trang “📥 Live Translator” bản 2 (cần Copy mã và dán đè vào dấu trang cũ: Learning → 🌐 Source → 📥 Cập nhật dấu trang):",
+        "Đọc được trang Salesforce/Lightning (ví dụ exec.mit.edu): tìm link cả bên trong các thành phần của trang và khung lồng; link xem trước tài liệu Salesforce được đổi thành link tải file thật.",
+        "Tự mở phần tài liệu: trang chưa hiện tài liệu thì dấu trang tự bấm tab Materials / Tài liệu / Resources (hoặc tab bạn đã bấm lần trước), chờ trang tải xong rồi mới lấy.",
+        "Từ bản 19: Source dùng được với trang khóa học cần đăng nhập (dấu trang chạy ngay trong trang đã đăng nhập)."
+      ]
     }
   ]
 }
