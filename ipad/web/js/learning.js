@@ -1535,7 +1535,7 @@ export class LearningUI {
     const steps = el("ol", "srcSteps");
     for (const [b, t] of [
       ["Mở trang tài liệu", " — trang khóa học mở ở tab mới. Đăng nhập nếu được hỏi (chỉ lần đầu: Safari/Chrome nhớ phiên)."],
-      ["Chạm dấu trang 📥 Live Translator", " — nếu trang chưa hiện tài liệu, dấu trang tự mở tab Materials / Tài liệu " +
+      ["Chạy dấu trang ltsource", " (Chrome: gõ ltsource vào thanh địa chỉ rồi chạm gợi ý ☆; Safari: mở Dấu trang và chạm) — nếu trang chưa hiện tài liệu, dấu trang tự mở tab Materials / Tài liệu " +
         "(hoặc tab bạn đã bấm lần trước), rồi tải các tài liệu trên trang (kể cả file cần đăng nhập, trang Salesforce) " +
         "và gửi về đây. Lần đầu nếu chưa thấy tài liệu: tự bấm vào phần tài liệu rồi chạm lại — lần sau dấu trang nhớ."],
       ["Quay lại tab Live Translator", ": tài liệu chưa có được thêm vào thư viện và upload cho Claude."],
@@ -1545,7 +1545,7 @@ export class LearningUI {
     const row = el("div", "actions");
     const open = el("button", "primary", "🌐 Mở trang tài liệu");
     // not noopener: the opened tab's "opener" is this app, so the bookmark can send the files straight back
-    open.onclick = () => { window.open(url, "_blank"); this.app.closeSheet(); this.app.setStatus("🌐 Đăng nhập, mở trang tài liệu rồi chạm dấu trang 📥 Live Translator.", "ok"); };
+    open.onclick = () => { window.open(url, "_blank"); this.app.closeSheet(); this.app.setStatus("🌐 Đăng nhập, mở trang tài liệu rồi chạy dấu trang ltsource (Chrome: gõ ltsource vào thanh địa chỉ).", "ok"); };
     const bv = this.lib.data.bookmark_version || (this.lib.data.bookmark_ready ? 1 : 0);
     const setup = el("button", bv && bv < BOOKMARK_VERSION ? "primary" : "",
       !bv ? "📥 Cài dấu trang (một lần)" : bv < BOOKMARK_VERSION ? "📥 Cập nhật dấu trang (bản mới)" : "📥 Dấu trang (xem lại cách cài)");
@@ -1555,7 +1555,19 @@ export class LearningUI {
     const change = el("button", "", "✎ Đổi link");
     change.onclick = () => this.changeSource();
     row.append(change, direct, el("span", "spacer"), setup, open);
-    body.append(steps, srcInfo, row);
+    // unlike Windows (its own browser window), the course page opens in Safari/Chrome: no button appears there and
+    // nothing happens by itself until the bookmark is run on that page
+    const notice = el("div", "srcNotice");
+    notice.append(el("b", "", "Lưu ý trên iPad: "),
+      "trang khóa học mở trong Safari/Chrome nên KHÔNG tự hiện nút và không tự sang tab Materials. " +
+      "Ở trang đó hãy chạy dấu trang ltsource (Chrome: chạm thanh địa chỉ, gõ ltsource, chạm gợi ý ☆) — " +
+      "thanh đen “📥 Live Translator” hiện ở đáy trang, tự mở tab Materials và tải tài liệu.");
+    if (!this.lib.data.bookmark_tested) {
+      setup.textContent = "🧪 Cài & thử dấu trang";
+      setup.className = "primary";
+      open.className = "";
+    }
+    body.append(notice, steps, srcInfo, row);
     this.app.sheet("🌐 Source — tài liệu từ trang khóa học", body, true);
   }
 
@@ -1590,24 +1602,47 @@ export class LearningUI {
       el("p", "", "Dấu trang này là một nút nhỏ chạy ngay trong trang khóa học bạn đang đăng nhập, nên tải được cả tài liệu " +
         "cần đăng nhập rồi gửi về Live Translator. Chỉ cần cài một lần."),
       copyRow,
-      guide("Safari trên iPad", [
-        "Bấm Copy mã ở trên.",
-        "Mở một trang bất kỳ trong Safari → nút Chia sẻ (□↑) → Thêm dấu trang → đặt tên “📥 Live Translator” → Lưu.",
-        "Mở Dấu trang (biểu tượng quyển sách) → Sửa → chạm dấu trang vừa tạo → xoá địa chỉ, chạm giữ → Dán → Xong.",
-        "Dùng: ở trang tài liệu, mở Dấu trang và chạm “📥 Live Translator”.",
-      ]),
       guide("Chrome trên iPad", [
         "Bấm Copy mã ở trên.",
         "Mở một trang bất kỳ → ⋯ → Thêm vào dấu trang. Rồi ⋯ → Dấu trang → chạm giữ dấu trang đó → Sửa dấu trang → " +
-          "đặt tên “📥 Live Translator”, dán mã vào ô URL → Xong.",
-        "Dùng: ở trang tài liệu, gõ “Live Translator” vào thanh địa chỉ và chọn dấu trang 📥 (hoặc mở từ Dấu trang).",
-      ]));
+          "đặt tên ltsource → xoá hết ô URL, chạm giữ → Dán → Xong.",
+        "Dùng (quan trọng): chạm vào thanh địa chỉ, gõ ltsource rồi chạm gợi ý có hình ngôi sao ☆. " +
+          "Chrome trên iPad KHÔNG chạy dấu trang khi mở từ danh sách Dấu trang — chạm ở đó sẽ không thấy gì.",
+      ]),
+      guide("Safari trên iPad", [
+        "Bấm Copy mã ở trên.",
+        "Mở một trang bất kỳ trong Safari → nút Chia sẻ (□↑) → Thêm dấu trang → đặt tên ltsource → Lưu.",
+        "Mở Dấu trang (biểu tượng quyển sách) → Sửa → chạm dấu trang vừa tạo → xoá địa chỉ, chạm giữ → Dán → Xong.",
+        "Dùng: mở Dấu trang và chạm ltsource (hoặc gõ ltsource vào thanh địa chỉ).",
+      ]),
+      el("p", "hint", "Dùng app và trang khóa học trong CÙNG một trình duyệt (cùng Chrome hoặc cùng Safari): mỗi trình duyệt " +
+        "có thư viện và đăng nhập riêng. Sau khi cài, bấm 🧪 Thử dấu trang để chắc nó chạy."));
     const row = el("div", "actions");
     const back = el("button", "", "‹ Quay lại Source");
     back.onclick = () => this.sourcePanel(this.lib.data.source_url || "");
-    row.append(back);
+    const test = el("button", "primary", "🧪 Thử dấu trang");
+    // opened as a tab of this app (opener = app): tapping the bookmark there says whether it works
+    test.onclick = () => { window.open(new URL("bm-test.html", location.href).href, "_blank"); this.app.closeSheet(); };
+    row.append(back, el("span", "spacer"), test);
     body.append(row);
     this.app.sheet("📥 Cài dấu trang Live Translator", body, true);
+  }
+
+  /** The bookmark was tapped on the test page and reached the app. */
+  bookmarkWorks(n) {
+    this.lib.data.bookmark_tested = stamp();
+    this.lib.data.bookmark_version = Math.max(this.lib.data.bookmark_version || 0, BOOKMARK_VERSION);
+    this.lib.save();
+    const body = el("div", "lform srcPanel");
+    body.append(el("p", "", `✓ Dấu trang chạy tốt trong trình duyệt này${n ? " (đã nhận tài liệu mẫu)" : ""}. ` +
+      "Giờ mở trang khóa học, vào phần tài liệu và chạm dấu trang như vừa làm."));
+    const row = el("div", "actions");
+    const ok = el("button", "primary", "🌐 Về Source");
+    ok.onclick = () => this.sourcePanel(this.lib.data.source_url || "");
+    row.append(el("span", "spacer"), ok);
+    body.append(row);
+    this.app.sheet("🧪 Thử dấu trang", body, true);
+    this.chatNote("🧪 Dấu trang 📥 chạy tốt trong trình duyệt này.");
   }
 
   /** The bookmark sent documents: ask once (any page that can open this app could send files). */

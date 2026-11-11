@@ -129,7 +129,7 @@ export function bookmarklet(app = ROOT) {
         const buf = await r.arrayBuffer();
         if (buf.byteLength > 200 * 1048576) { fails.push((l.text || name) + " (quá lớn)"); continue; }
         files.push({ url: l.url, name: String(name || "").trim(), text: l.text, type, buf });
-      } catch (e) { fails.push(l.text || l.url); }
+      } catch (e) { fails.push((l.text || l.url) + " (trang không cho tải file này từ đây — tải tay rồi dùng 📁 Folder)"); }
     }
     if (!files.length) { done("không tải được tài liệu nào" + (fails.length ? " (" + fails.length + " lỗi)" : "") + "."); return; }
     const data = { type: "lt-files", v: VERSION, url: location.href, title: document.title, files, pages, fails };
@@ -159,7 +159,8 @@ export function bookmarklet(app = ROOT) {
     };
   };
   /* eslint-enable */
-  const code = fn.toString().replace(/\n\s*/g, " ");
+  // one line, comments dropped (shorter to paste into a bookmark)
+  const code = fn.toString().replace(/\/\*[^*]*\*\//g, "").replace(/\n\s*/g, " ").replace(/ {2,}/g, " ");
   if (code.includes("%")) throw new Error("bookmarklet must not contain a percent sign");
   return `javascript:(${code})(${JSON.stringify(app)});void 0`;
 }
@@ -178,6 +179,11 @@ export class SourceBridge {
     if (!d || d.type !== "lt-files" || !Array.isArray(d.files)) return;
     const L = this.app.learning;
     await L.ready;
+    // the test page (Learning → Source → Dấu trang → Thử): only say that the bookmark works in this browser
+    if (e.origin === location.origin && /\/bm-test\.html(\?|#|$)/.test(String(d.url || ""))) {
+      L.bookmarkWorks(d.files.length);
+      return;
+    }
     let host = e.origin;
     try { host = new URL(d.url).host; } catch { /* */ }
     const known = (L.lib.data.source_files ||= {});

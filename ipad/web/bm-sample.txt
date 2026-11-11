@@ -1,0 +1,1 @@
+Tài liệu mẫu để thử dấu trang Live Translator. Nếu app nhận được file này, dấu trang đã chạy tốt.
