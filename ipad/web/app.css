@@ -118,6 +118,15 @@ small { font-size: .82em; }
 .top .status.warn { color: #ffd98a; }
 .top .status.warn::before { background: #f5b83d; }
 .top .status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* "working on it" line: shown while something takes time (Claude answering, restore, sync...) */
+.busy { flex: 0 1 auto; min-width: 0; max-width: 46%; display: inline-flex; align-items: center; gap: 8px;
+  padding: 4px 11px 4px 9px; border-radius: 99px; background: rgba(245, 184, 61, .12); color: #ffd98a; font-size: 13px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.busy > span { overflow: hidden; text-overflow: ellipsis; }
+.busy .spin { flex: none; width: 12px; height: 12px; border-radius: 50%; border: 2px solid rgba(255, 217, 138, .3);
+  border-top-color: #ffd98a; animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .busy .spin { animation-duration: 2.4s; } }
 .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .group { display: flex; background: rgba(255, 255, 255, .06); border-radius: 10px; padding: 2px; }
 .group .tool { background: none; }
@@ -162,16 +171,18 @@ small { font-size: .82em; }
 
 /* body: edge tabs + the cards */
 .body { flex: 1; display: grid; grid-template-columns: 40px minmax(0, 1fr) 40px; min-height: 0; padding: 10px 0 8px; }
-.edge { align-self: center; justify-self: center; width: 30px; height: 220px; border: 0; border-radius: 99px;
-  background: linear-gradient(180deg, #d6714d, var(--accent)); color: #fff; font-weight: 700; font-size: 12.5px;
-  white-space: pre; line-height: 1.22; padding: 0; box-shadow: 0 4px 12px rgba(201, 100, 66, .3); }
-.edge.open { background: #8b857b; box-shadow: none; }
-.edge.unread { background: linear-gradient(180deg, #f08a4b, #e0662f); animation: nudge 2s ease-in-out infinite; }
-@keyframes nudge { 0%, 100% { box-shadow: 0 4px 12px rgba(224, 102, 47, .35); } 50% { box-shadow: 0 0 0 6px rgba(224, 102, 47, .18); } }
+.edge { align-self: center; justify-self: center; width: 28px; height: 200px; border: 1px solid var(--border);
+  border-radius: 99px; background: var(--surface); color: var(--accent-dark); font-weight: 650; font-size: 12px;
+  white-space: pre; line-height: 1.22; padding: 0; box-shadow: var(--shadow); transition: background .15s, color .15s; }
+.edge:active { background: var(--accent-soft); }
+.edge.open { background: var(--surface-2); color: var(--faint); box-shadow: none; }
+.edge.unread { background: var(--accent); border-color: var(--accent); color: #fff; animation: nudge 2s ease-in-out infinite; }
+@keyframes nudge { 0%, 100% { box-shadow: 0 2px 8px rgba(201, 100, 66, .3); } 50% { box-shadow: 0 0 0 6px rgba(201, 100, 66, .16); } }
 .strip { position: relative; display: grid; min-height: 0; }
-.edgeLearn { position: absolute; left: 5px; bottom: 4px; width: 30px; height: 172px; border: 0; border-radius: 99px;
-  background: linear-gradient(180deg, #9a4a2b, #7c3a21); color: #fff; font-weight: 700; font-size: 11.5px; white-space: pre;
-  line-height: 1.2; padding: 0; box-shadow: 0 4px 12px rgba(124, 58, 33, .3); }
+.edgeLearn { position: absolute; left: 6px; bottom: 4px; width: 28px; height: 168px; border: 1px solid #ecd3c5; border-radius: 99px;
+  background: var(--accent-soft); color: var(--accent-dark); font-weight: 650; font-size: 11.5px; white-space: pre;
+  line-height: 1.2; padding: 0; box-shadow: var(--shadow); }
+.edgeLearn:active { background: #f1d6c8; }
 
 .center { --split: .75; position: relative; min-height: 0;
   display: grid; grid-template-rows: minmax(70px, calc((100% - 12px) * var(--split))) 12px minmax(70px, 1fr); }
@@ -183,7 +194,7 @@ small { font-size: .82em; }
 .panes { overflow-y: auto; -webkit-overflow-scrolling: touch; border-radius: var(--radius);
   /* the line between English and Vietnamese runs the full height of the card */
   background: linear-gradient(to right, transparent calc(50% - .5px), var(--border) calc(50% - .5px),
-              var(--border) calc(50% + .5px), transparent calc(50% + .5px)) var(--surface) local;
+              var(--border) calc(50% + .5px), transparent calc(50% + .5px)) var(--surface);
   box-shadow: var(--shadow); min-height: 0; border: 1px solid rgba(0, 0, 0, .03); }
 .rows { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-content: start;
   font-size: 18px; line-height: 1.55; }
@@ -362,6 +373,17 @@ small { font-size: .82em; }
 /* ---------- narrow screens (iPad portrait split view, small windows) ---------- */
 @media (max-width: 900px) {
   .top .brand span { display: none; }
+  /* portrait: the tools fit on one line */
+  .top { gap: 10px; }
+  .toolbar { gap: 6px; }
+  .presetLbl > span { display: none; }
+  .presetLbl { padding-left: 2px; }
+  .presetLbl select { max-width: 168px; }
+  .tool { padding: 7px 9px; }
+}
+@media (max-width: 780px) {                  /* iPad mini portrait */
+  .presetLbl select { max-width: 138px; }
+  .onoff { min-width: 80px; }
 }
 @media (max-width: 700px) {
   .rows, .ptext { font-size: 16px; }
@@ -394,6 +416,13 @@ small { font-size: .82em; }
 .lform .actions .wide { width: auto; flex: 1 1 180px; min-width: 0; padding: 8px 10px; font-size: 15px; }
 
 /* course prompt: pick an option (e.g. your table) with a preview of what it fills in */
+.lform > b.fieldsTitle { text-transform: none; letter-spacing: 0; font-size: 15px; color: var(--accent-dark); margin: 0; }
+.lform .hint { margin: -4px 0 2px; color: var(--muted); font-size: 13.5px; }
+.lform .field { display: grid; gap: 6px; }
+.lform .fieldQ { font-size: 15px; font-weight: 500; }
+.lform .field textarea { width: 100%; font-size: 16px; padding: 9px 11px; border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); background: var(--surface-2); resize: vertical; min-height: 58px; }
+.lform .field textarea:focus { outline: none; border-color: var(--accent); background: #fff; box-shadow: 0 0 0 3px var(--accent-soft); }
 .choiceWrap { display: grid; grid-template-columns: minmax(130px, 200px) 1fr; gap: 10px; min-height: 240px; }
 .choiceList { display: grid; align-content: start; gap: 6px; max-height: 50dvh; overflow: auto; }
 .choiceOpt { text-align: left; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); font-size: 15px; }

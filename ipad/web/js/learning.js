@@ -870,6 +870,7 @@ const DONE = /\[\[\s*(?:XONG BƯỚC|XONG BUOC)\s*\]\]/i;
 const DRAFT_BLOCK = /-{3,} *MẪU BƯỚC SAU *-{3,} *\n([\s\S]*?)\n *-{3,} *HẾT MẪU *-{3,}/i;
 const DRAFT_ANY = /-{3,} *MẪU BƯỚC SAU *-{3,} *\n[\s\S]*?(?:\n *-{3,} *HẾT MẪU *-{3,}|$)/gi;
 const BLANK = /\[cần điền[^\]]*\]/gi;
+const BLANK_LABEL = /\[cần điền:?\s*([^\]]*)\]/gi;
 const OUTPUT_BLOCK = /-{3,} *KẾT QUẢ GỌN *-{3,} *\n([\s\S]*?)\n *-{3,} *HẾT KẾT QUẢ *-{3,}/i;
 const OUTPUT_ANY = /-{3,} *KẾT QUẢ GỌN *-{3,} *\n[\s\S]*?(?:\n *-{3,} *HẾT KẾT QUẢ *-{3,}|$)/gi;
 const SLOT_MARK = /\{\{\s*([^{}]+?)\s*\}\}/g;
@@ -1180,6 +1181,56 @@ export class LearningUI {
     this.app.refreshAttachBar();
     if (!this.app.panelSide) this.app.togglePanel("right");
     p.focus({ preventScroll: true });
+    // information only the learner has: ask it in a small dialog, then write it into the prompt (Windows 1.9.1)
+    if (job.kind === "exstep" && /\[cần điền[^\]]*\]/i.test(text)) setTimeout(() => this.fillPromptBlanks(job), 120);
+  }
+
+  /** Ask for every [cần điền: ...] left in the exercise prompt (one short question each) and fill them in. */
+  async fillPromptBlanks(job) {
+    if (this.job !== job) return;                       // the prompt was sent or replaced meanwhile
+    const p = document.getElementById("prompt");
+    let text = p.value;
+    const labelOf = (m) => m[1].trim() || "thông tin";
+    const labels = [...new Set([...text.matchAll(BLANK_LABEL)].map(labelOf))];
+    if (!labels.length) return;
+    const values = await this.askFields(job.label || "Bài tập", labels);
+    if (this.job !== job || !values) return;
+    text = p.value;                                     // what is in the box now (it may have been edited)
+    for (const m of [...text.matchAll(BLANK_LABEL)].reverse()) {
+      const v = values[labelOf(m)];
+      if (v) text = text.slice(0, m.index) + v + text.slice(m.index + m[0].length);
+    }
+    p.value = text;
+    job.prompt = text;
+    const left = (text.match(BLANK) || []).length;
+    this.app.setStatus(left ? `🎓 Đã điền vào prompt — còn ${left} chỗ [cần điền].` : "🎓 Đã điền đủ thông tin vào prompt — bấm Gửi.",
+                       left ? "warn" : "ok");
+    p.focus({ preventScroll: true });
+  }
+
+  /** A sheet with one short question per missing item; resolves {item: answer} (null if skipped). */
+  askFields(title, labels) {
+    const body = el("div", "lform");
+    body.append(el("b", "fieldsTitle", title),
+                el("p", "hint", "Trả lời ngắn gọn từng câu; app sẽ điền vào đúng chỗ trong prompt."));
+    const boxes = {};
+    labels.forEach((label, k) => {
+      const q = label.replace(/[\s?:]+$/, "") + "?";
+      const wrap = el("label", "field");
+      wrap.append(el("span", "fieldQ", `${k + 1}. ${q[0].toUpperCase()}${q.slice(1)}`));
+      const box = document.createElement("textarea");
+      box.rows = 2;
+      wrap.append(box);
+      body.append(wrap);
+      boxes[label] = box;
+    });
+    const res = this.ask("Thông tin cần cho bước này", body, "Điền vào prompt", () => {
+      const out = {};
+      for (const [k, b] of Object.entries(boxes)) if (b.value.trim()) out[k] = b.value.trim();
+      return out;
+    });
+    setTimeout(() => Object.values(boxes)[0]?.focus(), 120);
+    return res;
   }
 
   takeJob() {
@@ -1379,7 +1430,8 @@ export class LearningUI {
     if (this.syncing) return;
     this.syncing = true;
     this.chatNote(files ? `Bắt đầu đồng bộ ${files.length} file` : "Bắt đầu làm mới thư viện");
-    const progress = (msg) => this.app.setStatus("🎓 " + msg);
+    const progress = (msg) => { this.app.setStatus("🎓 " + msg); this.app.busy("sync", msg); };
+    progress(files ? "Đang đồng bộ thư mục học..." : "Đang làm mới thư viện...");
     try {
       const r = await new Syncer(this.lib, this.app.apiKey, progress).run(files);
       let msg = `Đồng bộ xong: ${r.found} file đã chọn, ${r.new} tài liệu mới đã upload, ${r.known} đã có từ trước, ` +
@@ -1392,6 +1444,7 @@ export class LearningUI {
       this.app.setStatus(`🎓 Đồng bộ lỗi: ${friendlyError(e)}`, "err");
     } finally {
       this.syncing = false;
+      this.app.done("sync");
       onDone?.();
     }
   }
@@ -1725,13 +1778,14 @@ export class LearningUI {
       refreshBtn.disabled = true;
       try {
         const [n, problems] = await scanExercises(this.lib, this.app.apiKey,
-          (msg) => { if (alive()) status.textContent = "⏳ " + msg; }, full.checked);
+          (msg) => { this.app.busy("scan", msg); if (alive()) status.textContent = "⏳ " + msg; }, full.checked);
         this.chatNote(`Đã cập nhật danh sách: ${n} bài tập lớn.` +
           (problems.length ? "\nLưu ý:\n" + problems.slice(0, 8).map((p) => "• " + p).join("\n") : ""));
       } catch (e) {
         this.chatNote(`Chưa cập nhật được danh sách bài tập: ${friendlyError(e)}`, true);
       } finally {
         this.scanning = false;
+        this.app.done("scan");
         if (alive()) fill();
       }
     };
@@ -1773,7 +1827,8 @@ export class LearningUI {
         };
       }
       this.app.setStatus("🎓 Đang chuẩn bị bài tập...");
-      plan().then((sess) => {
+      this.app.busy("prepare", "Claude đang đọc file và chuẩn bị các bước bài tập...");
+      plan().finally(() => this.app.done("prepare")).then((sess) => {
         this.app.setStatus("🎓 Bài tập đã sẵn sàng", "ok");
         this.startSession(sess, redo);
       }).catch((e) => {
@@ -1792,8 +1847,9 @@ export class LearningUI {
   prefetch(key, fn) {
     this.prep = this.prep || new Map();
     if (this.prep.has(key)) return;
+    this.app.busy(`prep:${key}`, "Đang chuẩn bị bài tập ở chế độ nền (Claude đọc file)...");
     const p = Promise.resolve().then(fn).catch(() => {})       // ▶ Bắt đầu tries again and shows the error
-      .finally(() => this.prep.delete(key));
+      .finally(() => { this.prep.delete(key); this.app.done(`prep:${key}`); });
     this.prep.set(key, p);
   }
 
@@ -1916,11 +1972,11 @@ export class LearningUI {
       lines.push(draft);
     } else if (s.carry) lines.push(`Mang sang từ bước trước: ${s.carry}`);
     if (course) { /* the prompt above is the input */ } else if (draft) {                     // Claude prepared this input: template + known values, blanks for the rest
-      lines.push("Thông tin của tôi (đã điền sẵn — chỉ cần điền các chỗ [cần điền: ...]):");
+      lines.push("Thông tin của tôi (đã điền sẵn):");
       lines.push(draft);
     } else if (s.next_inputs) {                                // Claude said this step needs the learner's information
       lines.push("Thông tin của tôi:");
-      lines.push(...s.next_inputs.map((f) => `• ${f}: `));
+      lines.push(...s.next_inputs.map((f) => `• ${f.trim()}: [cần điền: ${f.trim()}]`));
     }
     let label = step.part ? `${this.stepName(i)} · ${step.part_title.slice(0, 25)}` : `Bài tập · ${this.stepName(i)} · ${ex.title.slice(0, 30)}`;
     const blanks = (draft || "").match(BLANK)?.length || 0;
@@ -2052,7 +2108,7 @@ export class LearningUI {
   /** Claude asked for the learner's own information: a fill-in form in the prompt box. */
   promptInputs(fieldsList) {
     const s = this.session, i = s.i;
-    const text = `${this.stepName(i)} — thông tin của tôi:\n` + fieldsList.map((f) => `• ${f.trim()}: `).join("\n");
+    const text = `${this.stepName(i)} — thông tin của tôi:\n` + fieldsList.map((f) => `• ${f.trim()}: [cần điền: ${f.trim()}]`).join("\n");
     this.setPrompt(text, { kind: "exstep", step: i, input: true, doc_ids: s.resume ? s.ex.doc_ids || [] : [],
       blocks: [{ type: "text", text: EXERCISE_RULES }, this.nextStepBlock(i), ...this.resumeBlocks()],
       label: `${this.stepName(i)} · điền thông tin` });
@@ -2316,6 +2372,7 @@ export class LearningUI {
       ? `<key_takeaways>\n${summary}\n</key_takeaways>\n<transcript_english>\n${en}\n</transcript_english>\n` +
         `<translation_vietnamese>\n${vi}\n</translation_vietnamese>` : "";
     emit("chat_piece", "đang đọc mẫu nhật ký và điền thông tin...\n");
+    this.app.busy("chat", "Claude đang điền nhật ký theo mẫu PDF...");      // cleared when it ends
     try {
       const out = await makeJournal(this.app.apiKey, this.lib, template, dayDocs, session, instruction);
       if (out.preview) emit("chat_piece", out.preview.trim() + "\n");

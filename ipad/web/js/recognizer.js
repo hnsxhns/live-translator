@@ -11,6 +11,11 @@ export const SR = 16000;
 const FRAME = 480;              // 30 ms frames
 const UTT_SOFT = 3.0;           // after this long, cut the utterance at the next short pause (s)
 const UTT_HARD = 7.0;           // always cut by this length (s)
+/** Whisper in the browser marks silence/noise with tags such as "[BLANK_AUDIO]", "[Music]", "(applause)":
+ *  they are not words (an empty result keeps Vosk's text). */
+export const noSpeechTags = (t) => String(t || "")
+  .replace(/\[[^\]]*\]|\((?:music|applause|laughter|laughs|silence|inaudible|noise|blank[^)]*|static|coughs?)\)|\*[^*]*\*/gi, " ")
+  .replace(/\s+/g, " ").trim();
 const WHISPER_BACKLOG = 3;      // if Whisper falls further behind, older utterances keep their draft text
 
 const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
@@ -136,6 +141,7 @@ export class Recognizer {
 
   /** ctx: an AudioContext created during the user's tap (iPad only allows audio started by a tap). */
   async start(ctx) {
+    if (this.stopping) await this.stopping;      // OFF then ON quickly: let the old stop finish first
     this.emit("status", "Đang mở micro...");
     this.fixes = 0;
     this.useScript = false;
@@ -241,37 +247,48 @@ export class Recognizer {
       this.ctx = null;
       try { await old?.close(); } catch { /* */ }
       this.workletCtx = null;
-      try {
-        await this._open(null);                              // the mic first, then a new context
-        this.running = true;
-        this.emit("ctx", this.ctx);
-        this.emit("status", "Đang nghe... (nói tiếng Anh)");
-        this._watch();
-      } catch (e) {
-        this.paused = true;
-        this.emit("mic_resume_failed", e);
-      }
+      this.paused = true;                                    // until the mic is open again
+      this.resuming = (async () => {
+        try {
+          await this._open(null);                            // the mic first, then a new context
+          this.paused = false;
+          this.running = true;
+          this.emit("ctx", this.ctx);
+          this.emit("status", "Đang nghe... (nói tiếng Anh)");
+          this._watch();
+        } catch (e) {
+          this.emit("mic_resume_failed", e);
+        }
+      })().finally(() => { this.resuming = null; });
     }, 3000);
   }
 
-  async stop() {
-    if (!this.running && !this.paused) return;
+  stop() {
+    if (!this.running && !this.paused) return this.stopping || Promise.resolve();
     this.running = false;
     this.paused = false;
-    try {
-      this.rec.retrieveFinalResult();          // the last words still become an utterance
-      await new Promise((r) => setTimeout(r, 600));
-      this.rec.remove();
-    } catch { /* recognizer already gone */ }
-    this.rec = null;
-    this._close();
-    try { await this.ctx?.suspend(); } catch { /* */ }
-    this.emit("level", 0);
-    this.emit("status", "Đã tắt.");
+    const rec = this.rec;                      // this run's own recognizer and mic, never a newer one
+    this.stopping = (async () => {
+      if (this.resuming) { try { await this.resuming; } catch { /* */ } }   // a mic being opened is closed too
+      this.running = false;
+      this.paused = false;
+      try {
+        rec.retrieveFinalResult();             // the last words still become an utterance
+        await new Promise((r) => setTimeout(r, 600));
+        rec.remove();
+      } catch { /* recognizer already gone */ }
+      if (this.rec === rec) this.rec = null;
+      this._close();
+      try { await this.ctx?.suspend(); } catch { /* */ }
+      this.emit("level", 0);
+      this.emit("status", "Đã tắt.");
+    })().finally(() => { this.stopping = null; });
+    return this.stopping;
   }
 
   /** Leaving the screen: the words so far become an utterance, the mic is released (iOS shows it off). */
   async pause() {
+    if (this.resuming) { try { await this.resuming; } catch { /* */ } }     // screen switched while re-opening
     if (!this.running) return;
     this.running = false;
     this.paused = true;
@@ -284,12 +301,17 @@ export class Recognizer {
   /** Back on the screen: open the mic again and carry on with the same recognizer.
    *  ctx: a context made during a tap, if there was one. Throws (code "needTap") when iPad wants a tap. */
   async resume(ctx = null) {
+    if (this.stopping) await this.stopping;
+    if (this.resuming) return this.resuming;   // one re-open at a time (two left a mic feeding audio twice)
     if (this.running || !this.paused || !this.rec) return;
-    this.fixes = 0;
-    await this._open(ctx || this.ctx);
-    this.paused = false;
-    this.running = true;
-    this._watch();
+    this.resuming = (async () => {
+      this.fixes = 0;
+      await this._open(ctx || this.ctx);
+      this.paused = false;
+      this.running = true;
+      this._watch();
+    })().finally(() => { this.resuming = null; });
+    return this.resuming;
   }
 
   /** iPad stopped the mic while on screen (call, Siri, another app): open it again. */
@@ -396,6 +418,7 @@ export class Recognizer {
       let text = "";
       if (this.whisper) {
         try { text = (await this.whisper.call("run", item.audio)).text; } catch { text = ""; }
+        text = noSpeechTags(text);
       }
       const nW = text.split(/\s+/).filter(Boolean).length, nD = item.draft.split(/\s+/).filter(Boolean).length;
       // empty, or far longer than what Vosk heard (Whisper sometimes invents text on cut-off audio)

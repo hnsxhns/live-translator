@@ -149,7 +149,7 @@ export async function askJson(apiKey, system, content, schema, { effort = "low",
     try {
       const text = await claudeStream(apiKey, { system, prompt, effort, maxTokens, timeoutMs: LONG_TIMEOUT, retries: 2,
                                                 format: useFormat ? { type: "json_schema", schema } : undefined });
-      return parseJson(text);
+      return parseJson(text, schema?.required);
     } catch (e) {
       last = e;
       if (e instanceof ClaudeError && e.status !== 400) throw e;
@@ -158,11 +158,45 @@ export async function askJson(apiKey, system, content, schema, { effort = "low",
   throw last;
 }
 
-export function parseJson(text) {
-  const t = text.trim().replace(/^```(?:json)?\s*|\s*```$/g, "");
-  const a = t.indexOf("{"), b = t.lastIndexOf("}");
-  if (a < 0 || b < a) throw new Error("Claude không trả về JSON");
-  return JSON.parse(t.slice(a, b + 1));
+/** The JSON object in Claude's answer. The answer can hold more than one (the request switched to a fallback
+ *  model part-way and started again, or text around it): every complete object is read and the last one that
+ *  has the fields asked for is used (Windows 1.9.1). */
+export function parseJson(text, required = null) {
+  const t = String(text).trim().replace(/```(?:json)?/g, "");
+  const found = [];
+  let i = t.indexOf("{");
+  while (i !== -1) {
+    const end = objectEnd(t, i);
+    if (end < 0) { i = t.indexOf("{", i + 1); continue; }
+    try {
+      const obj = JSON.parse(t.slice(i, end + 1));
+      if (obj && typeof obj === "object" && !Array.isArray(obj)) found.push(obj);
+      i = t.indexOf("{", end + 1);
+    } catch {
+      i = t.indexOf("{", i + 1);
+    }
+  }
+  if (!found.length) throw new Error("Claude không trả về JSON hợp lệ");
+  if (required?.length) {
+    const good = found.filter((o) => required.every((k) => k in o));
+    if (good.length) return good[good.length - 1];
+  }
+  return found[found.length - 1];
+}
+
+/** Index of the "}" closing the object that starts at i (strings and escapes respected), or -1. */
+function objectEnd(t, i) {
+  let depth = 0, str = false;
+  for (let k = i; k < t.length; k++) {
+    const c = t[k];
+    if (str) {
+      if (c === "\\") k++;
+      else if (c === '"') str = false;
+    } else if (c === '"') str = true;
+    else if (c === "{") depth++;
+    else if (c === "}" && --depth === 0) return k;
+  }
+  return -1;
 }
 
 /** Claude API errors -> short Vietnamese explanation. */

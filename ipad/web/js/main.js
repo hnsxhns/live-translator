@@ -235,8 +235,8 @@ class App {
     $("toggle").onclick = () => this.toggleOnOff();
     $("btnMicCheck").onclick = () => new MicCheck(this).open();
     $("btnLogout").onclick = () => this.logout();
-    $("btnBackup").onclick = () => this.backupSession();
-    $("btnRestore").onclick = () => $("restorePick").click();
+    $("btnBackup").onclick = () => this.restoring() || this.backupSession();
+    $("btnRestore").onclick = () => this.restoring() || $("restorePick").click();
     $("restorePick").onchange = (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) this.restoreSession(f); };
     $("btnVersion").textContent = LABEL;
     $("btnVersion").onclick = () => this.showVersions();
@@ -253,8 +253,14 @@ class App {
     $("attach").onclick = () => $("filePick").click();
     $("filePick").accept = ACCEPT;
     $("filePick").onchange = (e) => { const fs = [...e.target.files]; e.target.value = ""; this.attachFiles(fs); };
+    // Vietnamese keyboards (Telex/VNI) compose words: the Enter that confirms a word must not send.
+    // Safari sends that Enter with keyCode 229 (or right after compositionend) instead of isComposing.
+    $("prompt").addEventListener("compositionend", () => { this.composedAt = performance.now(); });
     $("prompt").onkeydown = (e) => {
-      if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); this.sendPrompt(); }
+      if (e.key !== "Enter" || e.shiftKey) return;
+      if (e.isComposing || e.keyCode === 229 || performance.now() - (this.composedAt || 0) < 60) return;
+      e.preventDefault();
+      this.sendPrompt();
     };
     document.addEventListener("keydown", (e) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); this.togglePanel("right"); }
@@ -268,6 +274,31 @@ class App {
     this.applySplit();
     this.refreshPanelBtn();
     document.addEventListener("visibilitychange", () => this.onVisibility());
+  }
+
+  // ---- "working on it" line: shown while something takes time, gone when it is done (Windows 1.9.1) ----
+  busy(key, text) {
+    (this.busyJobs ||= new Map()).set(key, text);
+    this.showBusy();
+  }
+
+  done(key) {
+    this.busyJobs?.delete(key);
+    this.showBusy();
+  }
+
+  showBusy() {
+    const b = $("busy"), jobs = [...(this.busyJobs?.values() || [])];
+    b.hidden = !jobs.length;
+    b.lastChild.textContent = jobs.join("  ·  ");
+    b.title = jobs.join("\n");
+  }
+
+  /** True while a restore is still putting rows in (tells the user to wait). */
+  restoring() {
+    if (!this.restoringNow) return false;
+    this.setStatus("⏳ Đang khôi phục bản ghi — chờ chút cho xong rồi thử lại.", "warn");
+    return true;
   }
 
   setStatus(text, kind = "") {
@@ -388,6 +419,7 @@ class App {
     this.refreshAttachBar();
     this.chatBusy = true;
     this.chatFailed = false;
+    this.busy("chat", "Claude đang trả lời...");                  // cleared when the answer ends
     $("send").disabled = true;
     $("send").textContent = "...";
     const names = files.map(([n]) => n).concat(job ? ["🎓 " + job.label] : []);
@@ -629,6 +661,7 @@ class App {
       case "chat_error": this.chatFailed = true; $("chat").append(el("span", "err", val)); break;
       case "chat_end":
         this.chatBusy = false;
+        this.done("chat");
         $("send").disabled = false;
         $("send").textContent = "Gửi ➤";
         if (!this.panelSide) { this.unread = true; this.refreshPanelBtn(); }
@@ -699,6 +732,7 @@ class App {
 
   // ---------------- ON / OFF ----------------
   toggleOnOff() {
+    if (!this.on && this.restoring()) return;            // don't start listening in the middle of a restore
     this.on = !this.on;
     const b = $("toggle");
     b.textContent = this.on ? "ON" : "OFF";
@@ -731,6 +765,7 @@ class App {
     try {
       await this.recognizer.start(this.audioCtx);
       this.audioCtx = this.recognizer.ctx;
+      if (!this.on) await this.recognizer.stop();      // OFF was pressed while the mic was opening
     } catch (e) {
       if (e?.code === "needTap") { this.recognizer.paused = false; this.waitTap(e, true); return; }
       logError(e.message || e);
@@ -756,32 +791,57 @@ class App {
   /** Leaving the screen (another app, Home, lock): the mic is released. Coming back: it is opened again
    *  by itself; if iPad wants a tap first, a big "tap to turn the mic on" button shows. */
   async onVisibility() {
-    if (document.visibilityState !== "visible") {
-      if (this.on && this.recognizer.running) {
-        this.micPaused = true;
-        await this.recognizer.pause();
-        $("micLevel").classList.add("paused");
-        this.setStatus("⏸ Micro tạm dừng vì bạn rời màn hình — sẽ tự bật lại khi quay lại.", "warn");
-        if (this.wake) { try { await this.wake.release(); } catch { /* */ } this.wake = null; }
-      }
-      return;
-    }
-    this.checkUpdates();
-    if (this.on && this.micPaused) await this.resumeMic();
+    if (document.visibilityState === "visible") this.checkUpdates();
+    this.syncMic();
   }
 
+  /** Makes the mic match the screen: paused while the app is not on screen, listening again when it is back.
+   *  One loop at a time that checks again after every step, so fast switching (away, back, away...) always
+   *  ends in the right state (two re-opens at once left a second mic feeding audio). */
+  async syncMic() {
+    if (this.micSyncing) return;
+    this.micSyncing = true;
+    try {
+      for (let k = 0; k < 10 && this.on; k++) {
+        const R = this.recognizer, visible = document.visibilityState === "visible";
+        if (!visible && (R.running || R.resuming)) {
+          this.micPaused = true;
+          await R.pause();
+          $("micLevel").classList.add("paused");
+          this.setStatus("⏸ Micro tạm dừng vì bạn rời màn hình — sẽ tự bật lại khi quay lại.", "warn");
+          if (this.wake) { try { await this.wake.release(); } catch { /* */ } this.wake = null; }
+          continue;
+        }
+        if (visible && this.micPaused && !this.tapHandler) {
+          if (!(await this.resumeMic())) break;          // iPad wants a tap: the tap button takes over
+          continue;
+        }
+        break;
+      }
+    } finally {
+      this.micSyncing = false;
+    }
+  }
+
+  /** Opens the mic again. true when it is listening, false when it is waiting for a tap. */
   async resumeMic(ctx = null) {
-    if (!this.on) return;
+    if (!this.on) return false;
     try {
       await this.recognizer.resume(ctx);
+      if (!this.recognizer.running) {                      // nothing to re-open (stopped meanwhile)
+        if (!this.recognizer.paused) this.micPaused = false;
+        return !this.recognizer.paused;
+      }
       this.audioCtx = this.recognizer.ctx;
       this.micPaused = false;
       this.hideTap();
       $("micLevel").classList.remove("paused");
       this.keepAwake(true);
       this.setStatus("🎙 Đã bật lại micro — đang nghe tiếp (nói tiếng Anh)", "ok");
+      return true;
     } catch (e) {
       this.waitTap(e);
+      return false;
     }
   }
 
@@ -817,7 +877,7 @@ class App {
       const ctx = new AudioContext();                       // made during the tap: iPad lets it run
       ctx.resume().catch(() => {});
       if (fresh) { this.audioCtx = ctx; this.startListening(); }
-      else this.resumeMic(ctx);
+      else this.resumeMic(ctx).then(() => this.syncMic());     // the screen may have changed meanwhile
     };
     document.addEventListener("pointerdown", this.tapHandler, true);
   }
@@ -892,8 +952,10 @@ class App {
     }
     if (this.order.length && !confirm("Nội dung hiện tại sẽ được thay bằng nội dung trong file backup. Tiếp tục?")) return;
     if (this.on) this.toggleOnOff();                     // stop listening while loading
+    this.restoringNow = true;                            // ON/Backup/Restore wait from here on
+    await this.recognizer.stopping;                      // its last words land before the panes are replaced
     const t0 = performance.now();
-    const failed = this.loadSession(data);
+    const failed = await this.loadSession(data);
     const blocks = (this.lastSummary.match(/^\[\d\d:\d\d\]$/gm) || []).length;
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
     const msg = `Đã restore: ${file.name} — ${this.order.length} dòng, ${blocks} khối ý chính (${secs} s)`;
@@ -907,9 +969,9 @@ class App {
 
   /** Rebuild every pane from backup data (also restores voices so new speech matches old speakers).
    *  Key takeaways come first and each part on its own, so one failing part does not drop the rest
-   *  (Windows 1.8.6). Rows are built off-screen and scrolled once at the end (Windows 1.8.8).
-   *  Returns the names of the parts that failed. */
-  loadSession(data) {
+   *  (Windows 1.8.6). The EN/VI rows come in batch by batch: text is seen coming in and the app stays usable
+   *  (Windows 1.9.1). Resolves the names of the parts that failed. */
+  async loadSession(data) {
     const failed = [];
     const part = (name, fn) => {
       try { fn(); } catch (e) { console.error("restore", name, e); logError(`restore ${name}: ${e.message || e}`); failed.push(name); }
@@ -933,40 +995,6 @@ class App {
       tr.nextId = +(sp.next_id ?? (Math.max(0, ...tr.sums.keys()) + 1));
       tr.last = null;
     });
-    part("các dòng Anh | Việt", () => {
-      for (const r of this.rows.values()) { r.enEl.remove(); r.viEl.remove(); }
-      this.rows.clear();
-      this.order = [];
-      this.uidSpk = {};
-      this.translator.en = {};
-      this.translator.vi = {};
-      this.translator.gen = {};
-      this.setPartial("");
-      const rows = data.rows || [];
-      const frag = document.createDocumentFragment();
-      let maxUid = this.recognizer.uttId;
-      for (const r of rows) {
-        const uid = +r.uid, sid = +r.speaker;
-        if (!Number.isFinite(uid) || this.rows.has(uid)) continue;
-        const en = String(r.en || ""), vi = String(r.vi || "");
-        this.uidSpk[uid] = sid;
-        this.recognizer.uttSpk[uid] = sid;
-        this.translator.en[uid] = en;
-        this.translator.vi[uid] = vi;
-        this.translator.gen[uid] = 1;
-        const row = { uid, sid, en, draft: false, vi, viGen: 1, viFilled: true,
-                      enEl: this.cell("en", uid), viEl: this.cell("vi", uid) };
-        row.enEl.lastChild.textContent = splitSentences(en.trim());
-        row.viEl.lastChild.textContent = splitSentences(vi.trim() || " ");
-        this.rows.set(uid, row);
-        this.order.push(uid);
-        frag.append(row.enEl, row.viEl);
-        maxUid = Math.max(maxUid, uid);
-      }
-      $("rows").insertBefore(frag, $("partialEn"));     // one DOM change for all rows
-      this.recognizer.uttId = maxUid;
-      this.relabel();
-    });
     part("bản ghi lời giảng", () => {
       this.transcript = (data.transcript || []).map((t) => [+t[0], t[1]]);
       if (this.summarizer) this.summarizer.doneN = this.transcript.length;
@@ -977,10 +1005,67 @@ class App {
       for (const t of this.chatLog) this.chatTurn(t.q || "", t.files || [], t.a || "");
       this.chatter.history = [...(data.chat_history || [])];
     });
+    this.scrollEnd($("summary"));
+    try {
+      await this.restoreRows(data.rows || []);
+    } catch (e) {
+      console.error("restore rows", e);
+      logError(`restore rows: ${e.message || e}`);
+      failed.push("các dòng Anh | Việt");
+    }
     this.follow = true;
     this.followNow();
-    this.scrollEnd($("summary"));
     return failed;
+  }
+
+  static RESTORE_CHUNK = 250;              // rows put in per step; the screen redraws in between
+
+  async restoreRows(list) {
+    for (const r of this.rows.values()) { r.enEl.remove(); r.viEl.remove(); }
+    this.rows.clear();
+    this.order = [];
+    this.uidSpk = {};
+    this.translator.en = {};
+    this.translator.vi = {};
+    this.translator.gen = {};
+    this.setPartial("");
+    const rows = (Array.isArray(list) ? list : []).filter((r) => r && Number.isFinite(+r.uid));
+    // new speech continues after the last restored row: set first, so it is right even if something fails
+    // (Windows 1.9.1: old row numbers were reused and new speech seemed not to be translated)
+    this.recognizer.uttId = rows.reduce((m, r) => Math.max(m, +r.uid), this.recognizer.uttId || 0);
+    this.restoringNow = true;
+    try {
+      for (let i = 0; i < rows.length; i += App.RESTORE_CHUNK) {
+        this.busy("restore", `Đang khôi phục bản ghi ${i}/${rows.length} dòng...`);
+        const frag = document.createDocumentFragment(), from = this.order.length;
+        for (const r of rows.slice(i, i + App.RESTORE_CHUNK)) {
+          const uid = +r.uid;
+          if (this.rows.has(uid)) continue;
+          const sid = Number.isFinite(+r.speaker) && r.speaker !== null && r.speaker !== "" ? +r.speaker : 1;
+          const en = String(r.en ?? "").trim(), vi = String(r.vi ?? "").trim();
+          this.uidSpk[uid] = sid;
+          this.recognizer.uttSpk[uid] = sid;
+          this.translator.en[uid] = en;
+          this.translator.vi[uid] = vi;
+          this.translator.gen[uid] = 1;
+          const row = { uid, sid, en, draft: false, vi, viGen: 1, viFilled: true,
+                        enEl: this.cell("en", uid), viEl: this.cell("vi", uid) };
+          row.enEl.lastChild.textContent = splitSentences(en);
+          row.viEl.lastChild.textContent = vi ? splitSentences(vi) : "—";     // no translation: a dash, not a gap
+          this.rows.set(uid, row);
+          this.order.push(uid);
+          frag.append(row.enEl, row.viEl);
+        }
+        $("rows").insertBefore(frag, $("partialEn"));   // one DOM change per batch
+        this.relabel(from);
+        this.follow = true;
+        this.followNow();
+        if (i + App.RESTORE_CHUNK < rows.length) await new Promise((res) => setTimeout(res, 16));
+      }
+    } finally {
+      this.restoringNow = false;
+      this.done("restore");
+    }
   }
 
   // ---------------- TestFlight-style updates ----------------
