@@ -5,7 +5,7 @@
 import { APP_VERSION, BUILD, NOTES } from "./version.js";
 import { checkKey, friendlyError } from "./claude.js";
 import { splitSentences } from "./text.js";
-import { Recognizer } from "./recognizer.js";
+import { browserInfo, Recognizer } from "./recognizer.js";
 import { ensureFiles, hasWebGPU, modelFiles } from "./models.js";
 import { Translator, Chatter, Summarizer, TRANSLATE_PRESETS, DEFAULT_PRESET } from "./assistants.js";
 import { fileToBlock, ACCEPT } from "./files.js";
@@ -679,7 +679,7 @@ class App {
       case "error": logError(val); this.setStatus(val, "err"); break;
       case "mic_lost": this.micLost(); break;
       case "mic_silent":
-        this.setStatus("⚠ Micro không thu được tiếng. Kiểm tra: Cài đặt → Quyền riêng tư → Micro (bật cho Safari/app), " +
+        this.setStatus(`⚠ Micro không thu được tiếng (đã thử 4 cách). Kiểm tra: ${browserInfo().settings}; ` +
                        "không có app khác đang dùng micro; rồi tắt và bật ON lại. Bấm 🩺 Micro để kiểm tra từng bước.", "err");
         break;
       case "mic_resume_failed": this.waitTap(val); break;
@@ -770,7 +770,7 @@ class App {
       if (e?.code === "needTap") { this.recognizer.paused = false; this.waitTap(e, true); return; }
       logError(e.message || e);
       const denied = e?.name === "NotAllowedError";
-      this.handle("error", denied ? "Chưa cho phép dùng micro. Vào Cài đặt → Safari (hoặc app) → Micro, rồi bật ON lại."
+      this.handle("error", denied ? `Chưa cho phép dùng micro. Vào ${browserInfo().settings}, rồi bật ON lại.`
                                   : `Lỗi micro: ${e.message || e}`);
       this.handle("force_off", null);
     }
@@ -864,7 +864,7 @@ class App {
     logError("mic: " + (err?.message || err));
     if (err?.name === "NotAllowedError") {
       this.handle("force_off", null);
-      this.setStatus("Chưa cho phép dùng micro. Vào Cài đặt → Safari (hoặc app) → Micro, rồi bật ON lại.", "err");
+      this.setStatus(`Chưa cho phép dùng micro. Vào ${browserInfo().settings}, rồi bật ON lại.`, "err");
       return;
     }
     this.micPaused = !fresh;

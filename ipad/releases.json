@@ -167,6 +167,20 @@
         "Giao diện gọn và nhẹ hơn: thanh Claude/Learning hai bên sáng và nhẹ, thanh công cụ dọc màn hình nằm trên một dòng (cả iPad mini), đường chia Anh | Việt không còn bị nhoè khi bản ghi dài.",
         "Từ bản 11: 🩺 Kiểm tra micro; bài tập dùng đúng prompt của sách (Windows 1.9.0). Từ bản 10: micro tự mở lại, tự tắt/bật khi rời/quay lại màn hình."
       ]
+    },
+    {
+      "version": "1.9.2",
+      "build": 13,
+      "channel": "beta",
+      "date": "2026-11-11",
+      "notes": [
+        "Sửa lỗi micro không đưa tiếng vào trên một số iPad (cả Safari và Chrome):",
+        "Khi micro chỉ cho im lặng, app tự thử lần lượt 4 cách thu âm (kể cả cài đặt micro mặc định của iPad và bộ âm thanh cùng tần số với micro), rồi nhớ cách chạy được trên máy này cho các lần sau.",
+        "App bắt đầu nghe ngay khi Vosk sẵn sàng, không còn chờ Whisper: Whisper nạp không xong (ví dụ trên GPU của iPadOS 26) từng làm app đứng mãi ở \"Đang chuẩn bị\".",
+        "Whisper không trả lời trong 15 giây thì câu đó dùng chữ của Vosk; chậm hai lần thì tắt Whisper — câu chữ và bản dịch không còn bị kẹt.",
+        "Hướng dẫn cấp quyền micro ghi đúng trình duyệt đang dùng (Safari, Chrome...). 🩺 Kiểm tra micro thử thêm cách thu âm mới và tự lưu cách chạy được.",
+        "Từ bản 12: đủ tính năng Windows 1.9.1 (restore từng phần, hộp [cần điền], dòng \"đang làm việc\", sửa lỗi micro khi bật/tắt nhanh, gõ tiếng Việt)."
+      ]
     }
   ]
 }

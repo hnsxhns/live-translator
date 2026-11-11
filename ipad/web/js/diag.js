@@ -5,7 +5,7 @@
 // mic), so the problems seen while listening show up here too; when a link fails, the other ways the app
 // can capture audio are tried as well, to show which one works on this iPad.
 
-import { SR, downsampler } from "./recognizer.js";
+import { SR, downsampler, browserInfo, WAY_KEY } from "./recognizer.js";
 import { APP_VERSION, BUILD } from "./version.js";
 
 const el = (tag, cls = "", text = "") => {
@@ -181,15 +181,15 @@ export class MicCheck {
     this.startBtn.textContent = "Đang kiểm tra...";
     const facts = {};
     let stream = null;
-    const extra = [];
+    const extra = [], extraStreams = [];
     try {
       // 1. the device
       let s = this.step("Thiết bị và trình duyệt");
       const standalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
       const ios = (/OS (\d+[_\d]*)/.exec(navigator.userAgent) || [])[1]?.replace(/_/g, ".") || "";
       const ver = (/Version\/([\d.]+)/.exec(navigator.userAgent) || [])[1] || "";
-      s.set("info", `${APP_VERSION} (${BUILD}) · ${window.LT_NATIVE ? "app TestFlight" : standalone ? "app ở Màn hình chính" : "Safari"}` +
-        ` · iOS ${ios || "?"} · Safari ${ver || "?"} · ${navigator.maxTouchPoints > 1 ? "màn cảm ứng" : "không cảm ứng"}` +
+      s.set("info", `${APP_VERSION} (${BUILD}) · ${browserInfo().name}${standalone ? " (Màn hình chính)" : ""}` +
+        ` · iOS ${ios || "?"} · WebKit ${ver || "?"} · cách thu âm đã nhớ ${(() => { try { return localStorage.getItem(WAY_KEY) || "0"; } catch { return "?"; } })()} · ${navigator.maxTouchPoints > 1 ? "màn cảm ứng" : "không cảm ứng"}` +
         ` · AudioWorklet ${typeof AudioWorkletNode !== "undefined" ? "có" : "KHÔNG"} · WebGPU ${"gpu" in navigator ? "có" : "không"}` +
         ` · HTTPS ${window.isSecureContext ? "có" : "KHÔNG"}`);
 
@@ -295,6 +295,35 @@ export class MicCheck {
           }
         }
       }
+      // 8b. iPad's own mic defaults (echo cancelling on) + an audio context at the mic's own rate:
+      //     on some iPads / in the Chrome app the mic only gives sound this way
+      if (!best) {
+        s = this.step("Cách khác: micro theo mặc định của iPad + bộ âm thanh cùng tần số với micro");
+        const g = await timed(navigator.mediaDevices.getUserMedia({ audio: true }), 10000);
+        if (!g.done || g.err) s.set("bad", g.err ? errText(g.err) : "mở micro quá 10 giây");
+        else {
+          extraStreams.push(g.val);
+          const rate = +(g.val.getAudioTracks()[0]?.getSettings?.().sampleRate || 0);
+          let ctx4;
+          try { ctx4 = rate ? new AudioContext({ sampleRate: rate }) : new AudioContext(); } catch { ctx4 = new AudioContext(); }
+          extra.push(ctx4);
+          await timed(ctx4.resume(), 2000);
+          if (ctx4.state !== "running") s.set("bad", `bộ âm thanh không chạy ("${ctx4.state}")`);
+          else {
+            const hows = typeof AudioWorkletNode !== "undefined" ? ["worklet", "script"] : ["script"];
+            const notes = [];
+            for (const how of hows) {
+              const c = await this.capture(ctx4, g.val, how, 3, how === "worklet" ? "Lần 4" : "Lần 5");
+              notes.push(`${how === "worklet" ? "AudioWorklet" : "ScriptProcessor"}: ${this.describe(c)}`);
+              if (c.good) { best = c; facts.cap4 = how; break; }
+            }
+            s.set(best ? "ok" : "bad", `${ctx4.sampleRate} Hz (micro ${rate || "?"} Hz) · ` + notes.join(" | "));
+          }
+        }
+      }
+      // the app keeps the way that worked on this iPad
+      const way = facts.cap1 ? 0 : facts.cap4 === "worklet" ? 1 : facts.cap4 === "script" ? 2 : facts.cap3 ? 3 : facts.cap2 ? 0 : -1;
+      if (way >= 0) { try { localStorage.setItem(WAY_KEY, String(way)); } catch { /* */ } }
       facts.loud = best ? best.peak : 0;
 
       // 9. Vosk on what was captured
@@ -317,7 +346,7 @@ export class MicCheck {
     } catch (e) {
       if (e.message !== "stop") this.report.push(`[LỖI] kiểm tra dừng: ${errText(e)}`);
     } finally {
-      for (const t of stream?.getTracks() || []) t.stop();
+      for (const t of [stream, ...extraStreams].flatMap((x) => x?.getTracks() || [])) t.stop();
       for (const c of [tapCtx, ...extra]) { try { c.close(); } catch { /* */ } }
       this.meter.hidden = true;
       this.startBtn.disabled = false;
@@ -330,7 +359,7 @@ export class MicCheck {
     let kind = "ok", text;
     if (f.gum === "NotAllowedError" || f.gum === "SecurityError") {
       kind = "bad";
-      text = "Micro chưa được cho phép. Vào Cài đặt → Safari → Micro (hoặc Cài đặt → Quyền riêng tư → Micro) → Cho phép, rồi mở lại app.";
+      text = `Micro chưa được cho phép. Vào ${browserInfo().settings}, rồi mở lại trang.`;
     } else if (f.gum) {
       kind = "bad";
       text = `Không mở được micro (${f.gum}). Có thể app khác đang giữ micro (gọi điện, ghi âm, Zoom...). Đóng app đó rồi thử lại.`;
@@ -341,6 +370,10 @@ export class MicCheck {
       kind = "bad";
       text = "NGUYÊN NHÂN: sau khi mở micro, bộ âm thanh tạo lúc chạm bị iPad treo — bản 9 chờ mãi ở bước này nên không nghe được. " +
              "Bộ âm thanh tạo sau khi mở micro thì chạy tốt (bản 10 đã tự chuyển sang cách này).";
+    } else if (f.cap1 === false && f.cap4) {
+      kind = "warn";
+      text = "NGUYÊN NHÂN: trên máy này micro chỉ đưa tiếng vào khi dùng cài đặt mặc định của iPad (bộ lọc vọng âm bật). " +
+             "App đã ghi nhớ cách này — bấm ON là nghe được.";
     } else if (f.cap1 === false && (f.cap2 || f.cap3)) {
       kind = "bad";
       text = "NGUYÊN NHÂN: bộ âm thanh tạo lúc chạm chỉ nhận được im lặng từ micro (lỗi của Safari trên iPad). " +

@@ -16,20 +16,54 @@ const UTT_HARD = 7.0;           // always cut by this length (s)
 export const noSpeechTags = (t) => String(t || "")
   .replace(/\[[^\]]*\]|\((?:music|applause|laughter|laughs|silence|inaudible|noise|blank[^)]*|static|coughs?)\)|\*[^*]*\*/gi, " ")
   .replace(/\s+/g, " ").trim();
-const WHISPER_BACKLOG = 3;      // if Whisper falls further behind, older utterances keep their draft text
+const WHISPER_BACKLOG = 3;
+const WHISPER_LIMIT = 15000;   // ms for one utterance; longer = Whisper is stuck      // if Whisper falls further behind, older utterances keep their draft text
 
 const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+
+/** Which browser on the iPad (they all use Safari's engine, but each has its own mic permission). */
+export function browserInfo() {
+  const ua = navigator.userAgent;
+  if (window.LT_NATIVE) return { name: "app TestFlight", settings: "Cài đặt → Live Translator → Micro" };
+  const standalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+  const name = /CriOS/.test(ua) ? "Chrome" : /EdgiOS/.test(ua) ? "Edge" : /FxiOS/.test(ua) ? "Firefox" : "Safari";
+  return { name: standalone ? `app ở Màn hình chính (${name})` : name,
+           settings: `Cài đặt → ${name} → Micro (bật), và trong ${name}: cho phép trang này dùng micro` };
+}
+
+/** The ways the mic can be captured, tried in turn when no sound comes in (and the one that works is kept):
+ *  "raw" = no echo cancelling (best for speech far away), "plain" = iPad's own defaults (some iPads and the
+ *  Chrome app only give sound this way); rate = an audio context at the mic's own sample rate. */
+export const WAYS = [
+  { cons: "raw", rate: false, script: false },
+  { cons: "plain", rate: true, script: false },
+  { cons: "plain", rate: true, script: true },
+  { cons: "raw", rate: true, script: true },
+];
+export const WAY_KEY = "lt_micway";
+const savedWay = () => { try { const w = +localStorage.getItem(WAY_KEY); return w > 0 && w < WAYS.length ? w : 0; } catch { return 0; } };
+const MIC_RAW = { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: true };
 const within = (p, ms) => Promise.race([Promise.resolve(p).catch(() => {}), new Promise((r) => setTimeout(r, ms))]);
 
 /** A running AudioContext: the given one if it can run, else a new one (iPad allows that while the mic is
  *  open). resume() is never awaited without a time limit: it can hang while iPad has the audio "interrupted". */
-async function runningContext(ctx) {
+async function runningContext(ctx, rate = 0) {
+  if (ctx && rate && ctx.sampleRate !== rate && ctx.state !== "closed") {   // one at the mic's own rate, if iPad lets it run
+    let f = null;
+    try { f = new AudioContext({ sampleRate: rate }); } catch { /* not supported */ }
+    if (f) {
+      if (f.state !== "running") await within(f.resume(), 1500);
+      if (f.state === "running") { within(ctx.close(), 500); return f; }
+      within(f.close(), 500);
+    }
+  }
   if (ctx && ctx.state !== "closed") {
     if (ctx.state !== "running") await within(ctx.resume(), 1500);
     if (ctx.state === "running") return ctx;
     within(ctx.close(), 500);
   }
-  const fresh = new AudioContext();
+  let fresh;
+  try { fresh = rate ? new AudioContext({ sampleRate: rate }) : new AudioContext(); } catch { fresh = new AudioContext(); }
   if (fresh.state !== "running") await within(fresh.resume(), 1500);
   if (fresh.state === "running") return fresh;
   within(fresh.close(), 500);
@@ -127,7 +161,9 @@ export class Recognizer {
     }
     if (!window.Vosk?.createModel) throw new Error("thiếu thư viện Vosk");
     this.vosk = await window.Vosk.createModel(VOSK_URL, -1);
-    await Promise.all([spkReady, whisperReady]);
+    // never wait for ever: a Whisper that does not load on this browser must not stop the listening
+    // (it joins later if it does finish)
+    await within(Promise.all([spkReady, whisperReady]), 25000);
   }
 
   // ---------------- microphone ----------------
@@ -144,7 +180,7 @@ export class Recognizer {
     if (this.stopping) await this.stopping;      // OFF then ON quickly: let the old stop finish first
     this.emit("status", "Đang mở micro...");
     this.fixes = 0;
-    this.useScript = false;
+    this.way = savedWay();
     await this._open(ctx);
     this.rec = new this.vosk.KaldiRecognizer(SR);
     this.rec.setWords(true);
@@ -171,11 +207,14 @@ export class Recognizer {
 
   /** Mic + a running context + the capture graph. Throws an error with code "needTap" if iPad wants a tap. */
   async _open(ctx) {
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: true },
-    });
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error(`${browserInfo().name} không cho trang này dùng micro — cập nhật iPadOS/trình duyệt, hoặc mở bằng Safari`);
+    }
+    const way = WAYS[this.way || 0];
+    this.stream = await navigator.mediaDevices.getUserMedia({ audio: way.cons === "plain" ? true : MIC_RAW });
     try {
-      this.ctx = await runningContext(ctx);
+      const rate = way.rate ? +(this.stream.getAudioTracks()[0]?.getSettings?.().sampleRate || 0) : 0;
+      this.ctx = await runningContext(ctx, rate);
       await this._graph();
     } catch (e) {
       this._close();
@@ -195,7 +234,7 @@ export class Recognizer {
     // iOS only runs a capture node that is connected to the output; keep it silent
     this.mute = ctx.createGain();
     this.mute.gain.value = 0;
-    if (ctx.audioWorklet && typeof AudioWorkletNode !== "undefined" && !this.useScript) {
+    if (ctx.audioWorklet && typeof AudioWorkletNode !== "undefined" && !WAYS[this.way || 0].script) {
       if (this.workletCtx !== ctx) {
         await ctx.audioWorklet.addModule(new URL("capture-worklet.js", import.meta.url));
         this.workletCtx = ctx;
@@ -231,18 +270,23 @@ export class Recognizer {
     this.peak = 0;
     clearTimeout(this.watchTimer);
     this.watchTimer = setTimeout(async () => {
-      if (!this.running || (this.blocks > 0 && this.peak > 0)) return;
+      if (!this.running) return;
+      if (this.blocks > 0 && this.peak > 0) {                // sound comes in: this way works here, keep it
+        try { localStorage.setItem(WAY_KEY, String(this.way || 0)); } catch { /* */ }
+        return;
+      }
       const why = this.blocks ? "chỉ nhận được im lặng" : "không nhận được âm thanh";
       this.fixes += 1;
-      console.warn(`mic: ${why} (${this.mode}, ctx ${this.ctx?.state}, ${this.ctx?.sampleRate} Hz) -> fix ${this.fixes}`);
-      if (this.fixes > 2) {
+      console.warn(`mic: ${why} (way ${this.way}, ${this.mode}, ctx ${this.ctx?.state}, ${this.ctx?.sampleRate} Hz) -> fix ${this.fixes}`);
+      if (this.fixes >= WAYS.length) {                       // every way was tried
+        try { localStorage.removeItem(WAY_KEY); } catch { /* */ }
         this.emit("mic_silent", why);
         return;
       }
-      this.emit("status", "Micro chưa thu được tiếng — đang mở lại micro...");
+      this.way = ((this.way || 0) + 1) % WAYS.length;        // the next way to capture
+      this.emit("status", `Micro chưa thu được tiếng — đang thử cách thu âm khác (${this.fixes + 1}/${WAYS.length})...`);
       this.running = false;
       this._close();
-      if (this.fixes === 2) this.useScript = true;          // the older capture way
       const old = this.ctx;
       this.ctx = null;
       try { await old?.close(); } catch { /* */ }
@@ -417,7 +461,25 @@ export class Recognizer {
       const item = this.queue.shift();
       let text = "";
       if (this.whisper) {
-        try { text = (await this.whisper.call("run", item.audio)).text; } catch { text = ""; }
+        // never wait for ever: a Whisper stuck on this iPad (e.g. on the GPU) kept every sentence from being
+        // finished and translated. Too slow twice -> Vosk text only.
+        const w = this.whisper;
+        let late = false;
+        try {
+          const r = await Promise.race([w.call("run", item.audio),
+            new Promise((res) => setTimeout(() => { late = true; res(null); }, WHISPER_LIMIT))]);
+          text = r?.text || "";
+        } catch { text = ""; }
+        if (late) {
+          this.whisperLate = (this.whisperLate || 0) + 1;
+          console.warn("whisper: no answer in", WHISPER_LIMIT, "ms", this.whisperLate);
+          if (this.whisperLate >= 2 && this.whisper === w) {
+            this.whisper = null;
+            this.whisperMode = "";
+            try { w.worker.terminate(); } catch { /* */ }
+            this.emit("status", "Whisper quá chậm trên máy này — dùng chữ của Vosk (vẫn nghe và dịch bình thường).");
+          }
+        } else this.whisperLate = 0;
         text = noSpeechTags(text);
       }
       const nW = text.split(/\s+/).filter(Boolean).length, nD = item.draft.split(/\s+/).filter(Boolean).length;
