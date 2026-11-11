@@ -11,6 +11,7 @@ import { Translator, Chatter, Summarizer, TRANSLATE_PRESETS, DEFAULT_PRESET } fr
 import { fileToBlock, ACCEPT } from "./files.js";
 import * as upd from "./updates.js";
 import { LearningUI, shareBlob, takeawaysPdf, courseTerms } from "./learning.js";
+import { SourceBridge } from "./source.js";
 import { MicCheck } from "./diag.js";
 
 // Running inside the TestFlight app (ipad/ios): files ship in the app, updates come from TestFlight.
@@ -83,6 +84,7 @@ class App {
     this.summarizer = null;
     this.takeFollow = true;        // takeaways pane shows the newest points unless the user scrolls up
     this.learning = new LearningUI(this);
+    this.sourceBridge = new SourceBridge(this);       // documents sent by the bookmark "📥 Live Translator"
     this.chatter.getLibrary = () => this.learning.catalogText();
     this.buildUI();
   }

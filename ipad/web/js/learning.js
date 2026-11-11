@@ -12,6 +12,7 @@
 import { askJson, uploadFile, ClaudeError, friendlyError } from "./claude.js";
 import { fileToBlock, docxText } from "./files.js";
 import { openFile, shareFile, mimeOf } from "./viewer.js";
+import { bookmarklet } from "./source.js";
 
 const ROOT = new URL("../../../", import.meta.url).href;
 const PDFJS = ROOT + "lib/pdfjs-4.10.38/";
@@ -97,12 +98,26 @@ async function idb(store, mode, fn) {
     const tx = d.transaction(store, mode);
     const req = fn(tx.objectStore(store));
     tx.oncomplete = () => resolve(req?.result);
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error);
+    // (some WebKit builds give no error object: say what failed instead of "null")
+    tx.onerror = () => reject(tx.error || new Error("không lưu được vào bộ nhớ của trình duyệt"));
+    tx.onabort = () => reject(tx.error || new Error("không lưu được vào bộ nhớ của trình duyệt (có thể đã đầy)"));
   });
 }
-const idbGet = (store, key) => idb(store, "readonly", (s) => s.get(key));
-const idbPut = (store, key, val) => idb(store, "readwrite", (s) => s.put(val, key));
+// Files are kept as Blobs; where the browser refuses to store a Blob (seen in some WebKit builds), the bytes are
+// stored instead and turned back into a Blob when read.
+const idbGet = async (store, key) => {
+  const v = await idb(store, "readonly", (s) => s.get(key));
+  return v && v.__bytes instanceof ArrayBuffer ? new Blob([v.__bytes], { type: v.type || "" }) : v;
+};
+const idbPut = async (store, key, val) => {
+  try {
+    return await idb(store, "readwrite", (s) => s.put(val, key));
+  } catch (e) {
+    if (!(val instanceof Blob)) throw e;
+    const bytes = await val.arrayBuffer();
+    return idb(store, "readwrite", (s) => s.put({ __bytes: bytes, type: val.type }, key));
+  }
+};
 const idbDel = (store, key) => idb(store, "readwrite", (s) => s.delete(key));
 
 // ---------------- PDF helpers (pdf.js, loaded only when needed) ----------------
@@ -1503,20 +1518,164 @@ export class LearningUI {
   async source() {
     await this.ready;
     const url = this.lib.data.source_url || await this.askSourceUrl();
-    if (url) this.scanSource(url);
+    if (url) this.sourcePanel(url);
   }
 
   async changeSource() {
     const url = await this.askSourceUrl(this.lib.data.source_url || "");
-    if (url) this.scanSource(url);
+    if (url) this.sourcePanel(url);
+  }
+
+  /** Course sites that need a login (Windows 1.9.9: its own login window). On the iPad: open the page in a new
+   *  tab, sign in there, open the materials page, tap the bookmark "📥 Live Translator" (source.js). */
+  sourcePanel(url) {
+    let host = url;
+    try { host = new URL(url).host; } catch { /* */ }
+    const body = el("div", "lform srcPanel");
+    const steps = el("ol", "srcSteps");
+    for (const [b, t] of [
+      ["Mở trang tài liệu", " — trang khóa học mở ở tab mới. Đăng nhập nếu được hỏi (chỉ lần đầu: Safari/Chrome nhớ phiên)."],
+      ["Vào mục chứa tài liệu", " (Materials, Tài liệu, Resources...)."],
+      ["Chạm dấu trang 📥 Live Translator", " — app tải các tài liệu trên trang (kể cả file cần đăng nhập) và gửi về đây."],
+      ["Quay lại tab Live Translator", ": tài liệu chưa có được thêm vào thư viện và upload cho Claude."],
+    ]) { const li = el("li"); li.append(el("b", "", b), t); steps.append(li); }
+    const srcInfo = el("p", "hint", `Trang tài liệu: ${host}` +
+      (this.lib.data.source_checked ? ` · lần nhận gần nhất ${this.lib.data.source_checked}` : ""));
+    const row = el("div", "actions");
+    const open = el("button", "primary", "🌐 Mở trang tài liệu");
+    // not noopener: the opened tab's "opener" is this app, so the bookmark can send the files straight back
+    open.onclick = () => { window.open(url, "_blank"); this.app.closeSheet(); this.app.setStatus("🌐 Đăng nhập, mở trang tài liệu rồi chạm dấu trang 📥 Live Translator.", "ok"); };
+    const setup = el("button", "", this.lib.data.bookmark_ready ? "📥 Dấu trang (xem lại cách cài)" : "📥 Cài dấu trang (một lần)");
+    setup.onclick = () => this.bookmarkSetup();
+    const direct = el("button", "", "🔎 Quét trực tiếp (trang công khai)");
+    direct.onclick = () => { this.app.closeSheet(); this.scanSource(url); };
+    const change = el("button", "", "✎ Đổi link");
+    change.onclick = () => this.changeSource();
+    row.append(change, direct, el("span", "spacer"), setup, open);
+    body.append(steps, srcInfo, row);
+    this.app.sheet("🌐 Source — tài liệu từ trang khóa học", body, true);
+  }
+
+  /** How to add the bookmark "📥 Live Translator" (once). */
+  bookmarkSetup() {
+    const code = bookmarklet();
+    const body = el("div", "lform srcPanel");
+    const copyRow = el("div", "actions");
+    const copy = el("button", "primary", "📋 Copy mã dấu trang");
+    const note = el("span", "hint", "");
+    copy.onclick = async () => {
+      try { await navigator.clipboard.writeText(code); note.textContent = "✓ Đã copy — làm tiếp các bước dưới."; }
+      catch { prompt("Copy mã này:", code); }
+      this.lib.data.bookmark_ready = true;
+      this.lib.save();
+    };
+    const drag = el("a", "srcDrag", "📥 Live Translator");
+    drag.href = code;
+    drag.title = "Máy tính: kéo nút này lên thanh dấu trang";
+    drag.onclick = (e) => { e.preventDefault(); note.textContent = "Trên máy tính: kéo nút này lên thanh dấu trang. Trên iPad: dùng nút Copy."; };
+    copyRow.append(copy, drag, note);
+    const guide = (title, items) => {
+      const box = el("div", "srcGuide");
+      box.append(el("b", "", title));
+      const ol = el("ol");
+      for (const t of items) ol.append(el("li", "", t));
+      box.append(ol);
+      return box;
+    };
+    body.append(
+      el("p", "", "Dấu trang này là một nút nhỏ chạy ngay trong trang khóa học bạn đang đăng nhập, nên tải được cả tài liệu " +
+        "cần đăng nhập rồi gửi về Live Translator. Chỉ cần cài một lần."),
+      copyRow,
+      guide("Safari trên iPad", [
+        "Bấm Copy mã ở trên.",
+        "Mở một trang bất kỳ trong Safari → nút Chia sẻ (□↑) → Thêm dấu trang → đặt tên “📥 Live Translator” → Lưu.",
+        "Mở Dấu trang (biểu tượng quyển sách) → Sửa → chạm dấu trang vừa tạo → xoá địa chỉ, chạm giữ → Dán → Xong.",
+        "Dùng: ở trang tài liệu, mở Dấu trang và chạm “📥 Live Translator”.",
+      ]),
+      guide("Chrome trên iPad", [
+        "Bấm Copy mã ở trên.",
+        "Mở một trang bất kỳ → ⋯ → Thêm vào dấu trang. Rồi ⋯ → Dấu trang → chạm giữ dấu trang đó → Sửa dấu trang → " +
+          "đặt tên “📥 Live Translator”, dán mã vào ô URL → Xong.",
+        "Dùng: ở trang tài liệu, gõ “Live Translator” vào thanh địa chỉ và chọn dấu trang 📥 (hoặc mở từ Dấu trang).",
+      ]));
+    const row = el("div", "actions");
+    const back = el("button", "", "‹ Quay lại Source");
+    back.onclick = () => this.sourcePanel(this.lib.data.source_url || "");
+    row.append(back);
+    body.append(row);
+    this.app.sheet("📥 Cài dấu trang Live Translator", body, true);
+  }
+
+  /** The bookmark sent documents: ask once (any page that can open this app could send files). */
+  confirmSource(host, title, names, already, unusable = 0) {
+    return new Promise((resolve) => {
+      const body = el("div", "lform srcPanel");
+      body.append(el("p", "", `Nhận tài liệu từ ${host}${title ? ` — “${String(title).slice(0, 80)}”` : ""}:`));
+      if (names.length) {
+        const ul = el("ul", "srcList");
+        for (const n of names.slice(0, 30)) ul.append(el("li", "", n));
+        if (names.length > 30) ul.append(el("li", "", `… và ${names.length - 30} file nữa`));
+        body.append(ul);
+      }
+      body.append(el("p", "hint", (names.length ? `${names.length} tài liệu mới` : "Không có tài liệu mới") +
+        (already ? `, ${already} đã có trong thư viện (bỏ qua)` : "") +
+        (unusable ? `, ${unusable} file loại chưa hỗ trợ (bỏ qua)` : "") + "."));
+      const row = el("div", "actions");
+      const no = el("button", "", "Huỷ"), yes = el("button", "primary", names.length ? "Thêm vào thư viện" : "Đóng");
+      let done = false;
+      const finish = (v) => { if (!done) { done = true; resolve(v); } };
+      no.onclick = () => { this.app.closeSheet(); finish(false); };
+      yes.onclick = () => { this.app.closeSheet(); finish(names.length > 0); };
+      row.append(el("span", "spacer"), no, yes);
+      body.append(row);
+      this.app.sheet("📥 Tài liệu từ trang khóa học", body, true);
+      document.getElementById("sheet").addEventListener("close", () => finish(false), { once: true });
+    });
+  }
+
+  /** The file name a downloaded document gets (its own, else the link text), with an extension from its type. */
+  sourceName(f) {
+    let name = String(f.name || "").replace(/[\\/:*?"<>|]+/g, " ").trim();
+    const ext = extOf(name) || MIME_EXT[String(f.type || "").toLowerCase()] || "";
+    if (!name) name = (String(f.text || "").replace(/[\\/:*?"<>|]+/g, " ").trim().slice(0, 80) || "tai-lieu") + ext;
+    else if (!extOf(name) && ext) name += ext;
+    return name.normalize("NFC");
+  }
+
+  /** True when the library can use this kind of file. */
+  sourceUsable(name) { return SUPPORTED.has(extOf(name)); }
+
+  /** Documents the bookmark downloaded (with the login) -> the library, like Windows 1.9.9's Source. */
+  async importSource(d, fresh) {
+    const known = (this.lib.data.source_files ||= {});
+    const files = [], skipped = [], got = {};
+    for (const f of fresh) {
+      const name = this.sourceName(f);
+      if (!SUPPORTED.has(extOf(name))) { skipped.push(name); continue; }
+      files.push(new File([f.buf], name, { type: mimeOf(name, f.type), lastModified: Date.now() }));
+      got[f.url] = { name, time: stamp() };          // remembered once the sync worked (else offered again)
+    }
+    for (const p of d.pages || []) known[p] ||= { page: true, time: stamp() };   // web pages, not documents
+    if (d.url && /^https?:/i.test(d.url)) this.lib.data.source_url = d.url;    // next time open this page directly
+    this.lib.data.source_checked = stamp();
+    await this.lib.save();
+    let msg = `Source (${d.title || d.url}): nhận ${files.length} tài liệu mới`;
+    if (skipped.length) msg += `; bỏ qua ${skipped.length} file loại chưa hỗ trợ (${skipped.slice(0, 5).join(", ")})`;
+    if (d.fails?.length) msg += `\nLưu ý: không tải được ${d.fails.length} link:\n` + d.fails.slice(0, 8).map((x) => "• " + x).join("\n");
+    this.chatNote(msg);
+    if (files.length && await this.sync(files, null, { keepFolder: true })) {
+      Object.assign(known, got);
+      await this.lib.save();
+    }
   }
 
   /** Asks for the link of the page that lists the materials; remembers it. Resolves the link or "". */
   askSourceUrl(current = "") {
     return new Promise((resolve) => {
       const body = el("div", "lform");
-      body.append(el("p", "", "Dán link trang web liệt kê tài liệu khóa học. Mỗi lần bấm 🌐 Source, app quét trang này; " +
-        "tài liệu mới (PDF, Word, ảnh, file chữ...) được tự tải về, thêm vào thư viện và upload cho Claude."));
+      body.append(el("p", "", "Dán link trang khóa học chứa tài liệu (trang cần đăng nhập cũng được). Mỗi lần bấm 🌐 Source, " +
+        "trang mở ở tab mới: đăng nhập, vào mục tài liệu rồi chạm dấu trang 📥 Live Translator — tài liệu mới " +
+        "(PDF, Word, ảnh, file chữ...) được tải về, thêm vào thư viện và upload cho Claude."));
       const input = el("input", "search");
       input.type = "url";
       input.placeholder = "https://...";
@@ -1525,7 +1684,7 @@ export class LearningUI {
       input.spellcheck = false;
       const msg = el("p", "hint", "");
       const row = el("div", "actions");
-      const cancel = el("button", "", "Huỷ"), ok = el("button", "primary", "Lưu & quét");
+      const cancel = el("button", "", "Huỷ"), ok = el("button", "primary", "Lưu & mở");
       let done = false;
       const finish = (v) => { if (!done) { done = true; resolve(v); } };
       cancel.onclick = () => { this.app.closeSheet(); finish(""); };
@@ -1551,7 +1710,7 @@ export class LearningUI {
     if (this.syncing) { this.app.setStatus("⏳ Đang đồng bộ — chờ xong rồi bấm Source lại.", "warn"); return; }
     this.chatNote(`Đang quét ${url} để tìm tài liệu mới...`);
     this.app.busy("source", "Đang quét trang Source tìm tài liệu mới...");
-    const problems = [], files = [];
+    const problems = [], files = [], got = {};
     let links = [];
     try {
       try {
@@ -1572,7 +1731,7 @@ export class LearningUI {
         try {
           const file = await sourceDownload(link, text, ext);
           files.push(file);
-          known[link] = { name: file.name, time: stamp() };
+          got[link] = { name: file.name, time: stamp() };     // remembered once the sync worked
         } catch (e) {
           problems.push(`${text || link}: ${e instanceof TypeError ? "trang không cho tải file này" : e.message || e}`);
         }
@@ -1593,7 +1752,10 @@ export class LearningUI {
     this.chatNote(msg, !links.length && problems.length > 0);
     if (files.length) {
       // the usual sync: same content as a document already there is skipped, the rest uploaded and catalogued
-      await this.sync(files, null, { keepFolder: true });
+      if (await this.sync(files, null, { keepFolder: true })) {
+        Object.assign((this.lib.data.source_files ||= {}), got);
+        await this.lib.save();
+      }
     } else {
       this.app.setStatus(problems.length && !links.length ? "🌐 Source: không quét được trang" : "🌐 Source: không có tài liệu mới",
                          problems.length && !links.length ? "err" : "ok");
@@ -1616,9 +1778,12 @@ export class LearningUI {
       this.chatNote(msg);
       this.app.setStatus(`🎓 Đồng bộ xong: +${r.new} tài liệu mới`, "ok");
       this.app.refreshGlossary?.();                        // new documents: new words to expect
+      return r;
     } catch (e) {
+      console.error("sync", e, e?.stack || "");
       this.chatNote(`Đồng bộ lỗi: ${friendlyError(e)}`, true);
       this.app.setStatus(`🎓 Đồng bộ lỗi: ${friendlyError(e)}`, "err");
+      return null;
     } finally {
       this.syncing = false;
       this.app.done("sync");
