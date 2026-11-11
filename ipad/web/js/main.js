@@ -409,11 +409,11 @@ class App {
   chatTurn(q, names, answer = null) {
     const w = $("chat");
     if (w.childNodes.length) w.append("\n\n");
-    w.append(el("span", "you", "Bạn: "), q + "\n");
+    w.append(el("span", "you", "Bạn"), " " + q + "\n");
     const plain = names.filter((n) => !n.startsWith("🎓 ")), learn = names.filter((n) => n.startsWith("🎓 "));
     if (plain.length) w.append(el("span", "file", "📎 " + plain.join(", ") + "\n"));
     for (const n of learn) w.append(el("span", "file", n + "\n"));
-    w.append(el("span", "who", "Claude: "), el("span", "ansStart"));   // file names after this become links
+    w.append(el("span", "who", "Claude"), " ", el("span", "ansStart"));   // file names after this become links
     if (answer !== null) w.append(answer);
     this.scrollEnd(w);
   }

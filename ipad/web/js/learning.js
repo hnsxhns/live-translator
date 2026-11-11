@@ -1146,7 +1146,7 @@ export class LearningUI {
   chatNote(text, err = false) {
     const w = document.getElementById("chat");
     if (w.childNodes.length) w.append("\n\n");
-    w.append(el("span", "who", "🎓 Learning: "), err ? el("span", "err", text) : text);
+    w.append(el("span", "who", "🎓 Learning"), " ", err ? el("span", "err", text) : text);
     this.app.scrollEnd(w);
   }
 
@@ -1360,7 +1360,7 @@ export class LearningUI {
   showSaved(title, c, redoHint) {
     const w = document.getElementById("chat");
     if (w.childNodes.length) w.append("\n\n");
-    w.append(el("span", "who", `🎓 ${title} `), el("span", "file", `(đã lưu lúc ${c.time} — ${redoHint})\n`),
+    w.append(el("span", "who", `🎓 ${title}`), " ", el("span", "file", `(đã lưu lúc ${c.time} — ${redoHint})\n`),
              el("span", "ansStart"), c.text);
     this.app.scrollEnd(w);
     try { this.linkify(); } catch { /* pane changed */ }
