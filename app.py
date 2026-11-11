@@ -24,7 +24,7 @@ import numpy as np
 import learning
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.9.1"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.9.2"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # The login client waits at most 20 s for data (right for live translation). Chat and the Learning menu send
 # whole documents, and Claude can read/think longer than that before the first word: give them more time.
@@ -623,7 +623,7 @@ class Recognizer(threading.Thread):
                 if rec.AcceptWaveform(pcm16):
                     self._end_utterance(json.loads(rec.Result()), utt)
                     utt, utt_len, last_partial = [], 0, ""
-                elif (secs >= UTT_SOFT and quiet >= 0.2) or secs >= UTT_HARD:
+                elif (secs >= UTT_SOFT and quiet >= 0.2) or (secs >= 1.0 and quiet >= 0.4) or secs >= UTT_HARD:
                     self._end_utterance(json.loads(rec.FinalResult()), utt)
                     utt, utt_len, last_partial = [], 0, ""
                 else:
@@ -868,7 +868,9 @@ class Translator:
         with self.lock:
             drafts = " ".join(self.en.get(u, "") for u in ids)
             norm = lambda s: re.sub(r"[^a-z0-9' ]", " ", s.lower()).split()
-            same = difflib.SequenceMatcher(None, norm(drafts), norm(text)).ratio() >= 0.85
+            # re-translate when Whisper corrected words (e.g. "right down" -> "write down"), not for case or
+            # punctuation only; one word in a short sentence matters, one in a long sentence less so
+            same = difflib.SequenceMatcher(None, norm(drafts), norm(text)).ratio() >= 0.93
             if same:                                   # draft translation is good: keep it
                 for u in ids:
                     self.en[u] = text if u == ids[0] else ""
@@ -881,8 +883,13 @@ class Translator:
                 self.vi.pop(u, None)
                 self.ui_q.put(("vi_drop", u))
             self.en[first] = text
-            self.vi.pop(first, None)
             g = self.gen[first]
+        if len(ids) == 1:
+            # the draft's translation stays on screen until the corrected one is ready, then it is swapped in
+            self.pool.submit(self._translate, first, g, text, False)
+            return
+        with self.lock:
+            self.vi.pop(first, None)
         self.ui_q.put(("vi_reset", (first, g)))
         self.pool.submit(self._translate, first, g, text)
 
@@ -894,7 +901,18 @@ class Translator:
             last_vi = self.vi.get(prev[-1], "") if prev else ""
         return earlier, last_vi
 
-    def _translate(self, uid, g, text):
+    def warm(self):
+        """Open the connection (and refresh the login) before the first sentence, with a free token count, so
+        the first translation is not slower than the others."""
+        def go():
+            try:
+                self.client.messages.count_tokens(model=self.model, messages=[{"role": "user", "content": "hi"}])
+            except Exception:  # noqa: BLE001
+                pass
+        self._warmed = time.time()
+        threading.Thread(target=go, daemon=True).start()
+
+    def _translate(self, uid, g, text, stream=True):
         ctx, last_vi = self._context(uid)
         prompt = (f"Earlier speech (context only, already translated):\n{ctx}\n\n" if ctx else "")
         if last_vi:
@@ -903,10 +921,13 @@ class Translator:
         out = ""
         try:
             out = claude_stream(self.client, self.SYSTEM, prompt, "low",
-                                lambda p: self.ui_q.put(("vi_piece", (uid, g, p))),
+                                (lambda p: self.ui_q.put(("vi_piece", (uid, g, p)))) if stream else None,
                                 model=self.model, thinking=self.thinking, max_tokens=1500)
+            if not stream and out.strip():
+                self.ui_q.put(("vi_replace", (uid, g, out.strip())))
         except Exception as e:  # noqa: BLE001
-            self.ui_q.put(("vi_piece", (uid, g, "[chưa dịch được đoạn này]")))
+            if stream:
+                self.ui_q.put(("vi_piece", (uid, g, "[chưa dịch được đoạn này]")))
             self.ui_q.put(("error", friendly_error(e)))
         with self.lock:
             if self.gen.get(uid) == g:
@@ -1243,6 +1264,7 @@ class MainWindow:
 
         self.recognizer = Recognizer(self.ui_q, self._on_english)
         self.translator = Translator(client, self.ui_q, self.preset_var.get())
+        self.translator.warm()
         self.summarizer = Summarizer(client, self.ui_q, self.transcript_range, lambda: self.last_summary)
         self.chatter = Chatter(client, self.ui_q, self._chat_context)
         self.recognizer.start()
@@ -2080,6 +2102,14 @@ class MainWindow:
         self._vi_edit(put)
         self._schedule_align(uid)
 
+    def _vi_replace(self, uid, g, text):
+        """A corrected translation replaces the row's text in one go (no "…" in between)."""
+        if g < self.vi_gen.get(uid, 0):
+            return
+        self.vi_gen[uid] = g
+        self.vi_filled[uid] = False
+        self._vi_piece(uid, g, text)
+
     def _vi_reset(self, uid, g):
         self.vi_gen[uid] = g
         self.vi_filled[uid] = False
@@ -2162,6 +2192,8 @@ class MainWindow:
         if self.on:
             self.toggle.config(text="ON", bg="#27ae60", activebackground="#1e8449")
             self.recognizer.running.set()
+            if time.time() - getattr(self.translator, "_warmed", 0) > 120:
+                self.translator.warm()
             if not self.ready:
                 self.status.config(text="Đang chuẩn bị nhận diện giọng nói... sẽ tự bắt đầu nghe khi xong.",
                                    fg="#ddd")
@@ -2210,6 +2242,8 @@ class MainWindow:
                     self._vi_piece(*val)
                 elif kind == "vi_reset":
                     self._vi_reset(*val)
+                elif kind == "vi_replace":
+                    self._vi_replace(*val)
                 elif kind == "vi_drop":
                     self._vi_drop(val)
                 elif kind == "chat_piece":
