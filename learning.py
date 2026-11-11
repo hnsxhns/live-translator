@@ -12,6 +12,7 @@
 Everything is stored in <DATA_DIR>/learning (library.json + copies of the original files).
 """
 import base64
+import unicodedata
 import hashlib
 import io
 import json
@@ -215,7 +216,7 @@ class Library:
         """Journal template PDFs (catalogued as such, or named like one)."""
         docs = [d for d in self.docs() if d["ext"] == ".pdf"]
         hit = [d for d in docs if d.get("kind") == "journal_template"]
-        return hit or [d for d in docs if JOURNAL_NAME.search(d["name"])]
+        return hit or [d for d in docs if JOURNAL_NAME.search(unicodedata.normalize("NFC", d["name"]))]
 
     def catalog_text(self):
         """Short description of the library for Claude's context."""
@@ -348,7 +349,7 @@ class Syncer:
                     old["sources"] = sorted(set(old.get("sources", [])) | set(rels))
                     continue
             src = paths[0]
-            name = os.path.basename(src)
+            name = unicodedata.normalize("NFC", os.path.basename(src))
             ext = os.path.splitext(name)[1].lower()
             stored = f"{doc_id}_{safe_name(name)}"
             try:
@@ -359,8 +360,8 @@ class Syncer:
                 continue
             with open(os.path.join(lib.dir, "text", doc_id + ".txt"), "w", encoding="utf-8") as f:
                 f.write(text)
-            doc = {"id": doc_id, "sha": sha, "name": name, "ext": ext, "stored": stored, "rel": rels[0],
-                   "sources": rels, "size": os.path.getsize(src), "pages": pages, "added": today,
+            doc = {"id": doc_id, "sha": sha, "name": name, "ext": ext, "stored": stored, "rel": unicodedata.normalize("NFC", rels[0]),
+                   "sources": [unicodedata.normalize("NFC", r) for r in rels], "size": os.path.getsize(src), "pages": pages, "added": today,
                    "mtime": time.strftime("%Y-%m-%d", time.localtime(os.path.getmtime(src))),
                    "file_id": "", "title": os.path.splitext(name)[0], "description": "", "kind": "other",
                    "day": 0, "date": "", "exercises": [], "catalogued": False}
@@ -703,11 +704,12 @@ def _mac_trash(path):
     trash = os.path.expanduser("~/.Trash")
     try:
         base, ext = os.path.splitext(os.path.basename(path))
-        dst, n = os.path.join(trash, base + ext), 1
-        while os.path.exists(dst):
-            n += 1
-            dst = os.path.join(trash, f"{base} {n}{ext}")
-        shutil.move(path, dst)
+        dst = os.path.join(trash, f"{base} {time.strftime('%Y-%m-%d %H.%M.%S')}{ext}")
+        if os.path.lexists(dst):                           # (this check may be blind: name is unique anyway)
+            dst = os.path.join(trash, f"{base} {time.time():.6f}{ext}")
+        if os.stat(path).st_dev != os.stat(trash).st_dev:
+            raise OSError("other volume")                  # don't copy across disks; let Finder do it
+        os.rename(path, dst)
         return not os.path.exists(path)
     except OSError:
         pass
@@ -1023,8 +1025,8 @@ def write_pdf(out, body_html):
     if fonts:
         folder, reg, bold = fonts
         archive = pymupdf.Archive(folder)
-        css = (f"@font-face {{font-family: vn; src: url({reg});}} "
-               f"@font-face {{font-family: vn; src: url({bold}); font-weight: bold;}} "
+        css = (f"@font-face {{font-family: vn; src: url(\"{reg}\");}} "
+               f"@font-face {{font-family: vn; src: url(\"{bold}\"); font-weight: bold;}} "
                "* {font-family: vn;} ") + css
     story = pymupdf.Story(html=f"<body>{body_html}</body>", user_css=css, archive=archive)
     writer = pymupdf.DocumentWriter(out)
@@ -1383,7 +1385,8 @@ class LearningUI:
         for d in sorted(self.lib.docs(), key=lambda d: -len(d["name"])):   # longest names first
             idx = start
             while True:
-                idx = w.search(d["name"], idx, stopindex="end", nocase=True, count=count)
+                idx = w.search(unicodedata.normalize("NFC", d["name"]), idx, stopindex="end", nocase=True,
+                               count=count)
                 if not idx or not count.get():
                     break
                 end = f"{idx}+{count.get()}c"

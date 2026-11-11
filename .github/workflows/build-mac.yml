@@ -78,18 +78,38 @@ jobs:
           hdiutil detach /Volumes/LT
           A="/Applications/Live Translator.app"
           ls "$A/Contents/Frameworks/pymupdf" >/dev/null && echo "pymupdf bundled" || { echo "pymupdf missing"; exit 1; }
+          /usr/libexec/PlistBuddy -c "Print :NSRequiresAquaSystemAppearance" "$A/Contents/Info.plist" | grep -q true \
+            && echo "light appearance key set" || { echo "NSRequiresAquaSystemAppearance missing"; exit 1; }
           mkdir -p shots
+          # open it with the Mac in Dark Mode: the app must still show dark text on its light panes
+          defaults write -g AppleInterfaceStyle Dark
           open "$A"
           COUNTS=""
           for i in 1 2 3 4 5 6; do
             sleep 10
             COUNTS="$COUNTS $(pgrep -f "Live Translator.app/Contents/MacOS/" | wc -l | tr -d ' ')"
-            [ "$i" = 3 ] && screencapture -x shots/new_build_login.png || true
+            [ "$i" = 3 ] && screencapture -x shots/new_build_login_darkmode.png || true
           done
+          defaults delete -g AppleInterfaceStyle || true
           echo "process counts every 10 s:$COUNTS"
           LAST=$(echo $COUNTS | awk '{print $NF}')
+          # quit like a user (Cmd+Q / Quit): must exit cleanly, no crash report
+          QUIT="not tried"
+          osascript -e 'tell application id "com.livetranslator.app" to quit' 2>/dev/null &
+          OP=$!
+          for _ in $(seq 30); do kill -0 $OP 2>/dev/null || break; sleep 1; done
+          kill $OP 2>/dev/null || true
+          if wait $OP; then
+            sleep 5
+            pgrep -f "Live Translator.app/Contents/MacOS/" >/dev/null && QUIT="still running after Quit" || QUIT="exited"
+          else
+            QUIT="Quit event not allowed on this runner"
+          fi
+          echo "quit: $QUIT"
           pkill -f "Live Translator.app/Contents/MacOS/" || true
           sleep 2
+          CRASH=$(ls "$HOME/Library/Logs/DiagnosticReports" 2>/dev/null | grep -i "live" || true)
+          echo "crash reports: ${CRASH:-none}"
           # the app must not write inside its own bundle (that breaks the signature on users' Macs)
           codesign --verify --deep --strict "$A" && echo "signature still valid after running"
           ls -d "$HOME/Library/Application Support/LiveTranslator" && echo "settings folder OK"
@@ -97,8 +117,11 @@ jobs:
             echo "## New build: installed and opened"
             echo "- Processes every 10 s:$COUNTS"
             [ "$LAST" -ge 1 ] && [ "$LAST" -le 2 ] && echo "- PASS: running after 60 s, no relaunch loop" || echo "- FAIL"
+            echo "- Quit: $QUIT; crash reports: ${CRASH:-none}"
+            echo "- Screenshot taken in Dark Mode: screenshot-new-build artifact"
           } >> "$GITHUB_STEP_SUMMARY"
-          [ "$LAST" -ge 1 ] && [ "$LAST" -le 2 ] && codesign --verify --deep --strict "$A"
+          [ "$LAST" -ge 1 ] && [ "$LAST" -le 2 ] && [ -z "$CRASH" ] && [ "$QUIT" != "still running after Quit" ] \
+            && codesign --verify --deep --strict "$A"
 
       - uses: actions/upload-artifact@v4
         if: always()

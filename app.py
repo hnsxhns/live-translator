@@ -24,7 +24,7 @@ import numpy as np
 import learning
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.8.9"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.8.9.1"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # The login client waits at most 20 s for data (right for live translation). Chat and the Learning menu send
 # whole documents, and Claude can read/think longer than that before the first word: give them more time.
@@ -657,6 +657,7 @@ class Recognizer(threading.Thread):
         last_partial = ""
         rms_hist = []                  # recent 30 ms loudness values -> background-noise floor
         quiet = 0.0                    # how long it has been quiet (s)
+        zero_s, warned_zero = 0.0, False     # seconds of exact-zero audio (no microphone access)
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
                             blocksize=FRAME * 5, callback=self._mic_cb):
             while self.running.is_set():
@@ -667,6 +668,16 @@ class Recognizer(threading.Thread):
                 while not self.audio_q.empty():          # take everything waiting (catch up)
                     blocks.append(self.audio_q.get_nowait())
                 block = np.concatenate(blocks)
+                # Mac: with microphone access denied, CoreAudio sends exact zeros instead of an error
+                if float(np.max(np.abs(block))) == 0.0:
+                    zero_s += len(block) / SAMPLE_RATE
+                    if zero_s >= 4.0 and not warned_zero:
+                        warned_zero = True
+                        self.ui_q.put(("error", "Micro không gửi âm thanh. Trên Mac: System Settings → Privacy & "
+                                                "Security → Microphone → bật Live Translator, rồi mở lại ứng dụng."
+                                       if IS_MAC else "Micro không gửi âm thanh. Kiểm tra micro trong cài đặt máy."))
+                else:
+                    zero_s = 0.0
                 utt.append(block)
                 utt_len += len(block)
 
@@ -1286,6 +1297,8 @@ class MainWindow:
         if IS_MAC:
             root.bind_all("<Command-k>", lambda e: self.toggle_panel("right"))
             root.bind_all("<Command-l>", lambda e: self.learning.show_menu())
+            if isinstance(self.prompt, tk.Text):     # Text's own Ctrl+K deletes to the end of the line
+                self.prompt.bind("<Control-k>", lambda e: (self.toggle_panel("right"), "break")[1])
         self._refresh_panel_btn()
         # keep the pane proportions when the window is resized (a dragged divider sets a new ratio)
         self.body.bind("<Configure>", lambda e: self._place_sashes())
@@ -2083,6 +2096,9 @@ class MainWindow:
             except Exception:  # noqa: BLE001
                 pass
         args = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, os.path.abspath(__file__)]
+        bundle = os.path.abspath(os.path.join(os.path.dirname(sys.executable), "..", ".."))
+        if IS_MAC and getattr(sys, "frozen", False) and bundle.endswith(".app"):
+            args = ["open", "-n", bundle]
         subprocess.Popen(args, cwd=APP_DIR)
         self.recognizer.running.clear()
         self.root.destroy()
@@ -2173,7 +2189,10 @@ class MainWindow:
                 elif kind == "error":
                     self.status.config(text=val, fg="#ff7b7b")
                 elif kind == "call":                # run a function on the UI thread (Learning menu)
-                    val()
+                    try:
+                        val()
+                    except Exception as e:  # noqa: BLE001  (keep the UI loop alive)
+                        self.status.config(text=friendly_error(e), fg="#ff7b7b")
                 elif kind == "force_off":
                     if self.on:
                         self.toggle_onoff()
@@ -2213,12 +2232,26 @@ def main():
         pass
     if IS_MAC:
         root.tk.call("tk", "scaling", 1.33)     # Mac Tk draws fonts ~25% smaller; match the Windows look
+        # the colors are designed for light mode (the .app also sets NSRequiresAquaSystemAppearance)
+        try:
+            root.tk.call("::tk::unsupported::MacWindowStyle", "appearance", root, "aqua")
+        except tk.TclError:
+            pass
+
+        def quit_app():
+            # stop the microphone / speech threads before Python shuts down (else macOS shows a crash report)
+            mw = getattr(root, "_main_window", None)
+            if mw is not None:
+                mw.recognizer.running.clear()
+            root.after(400, lambda: (root.destroy(), os._exit(0)))
+        root.protocol("WM_DELETE_WINDOW", quit_app)
+        root.createcommand("::tk::mac::Quit", quit_app)
 
     def start_main(client):
         for w in root.winfo_children():
             w.destroy()
         root.resizable(True, True)
-        MainWindow(root, client)
+        root._main_window = MainWindow(root, client)
 
     threading.Thread(target=preload_models, daemon=True).start()
     LoginWindow(root, start_main).try_auto_login()

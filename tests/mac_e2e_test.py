@@ -233,6 +233,8 @@ shot("04_user_scrolled_up")
 
 # --- rest of the speech arrives while the user reads above ---
 at(seg_times[-1][2] + 8)
+st = mw.status.cget("text")
+check("mic_silence_warning", "Micro không gửi âm thanh" in st, st[:120])
 yl = mw.left.yview()
 check("no_fight_with_user_scroll", (not overflow) or yl[0] < 0.05,
       f"EN view stayed at {yl[0]:.2f}-{yl[1]:.2f} while new text arrived")
@@ -395,6 +397,30 @@ pump(1.5)
 check("backup_restore_roundtrip", os.path.exists(bk) and mw.left.get("1.0", "end").strip() == before.strip(),
       f"backup {os.path.getsize(bk) if os.path.exists(bk) else 0} bytes")
 
+# --- a failing UI call must not stop later UI updates ---
+mw.ui_q.put(("call", lambda: 1 / 0))
+mw.ui_q.put(("status", "cập nhật sau lỗi"))
+pump(0.5)
+check("ui_keeps_running_after_error", mw.status.cget("text") == "cập nhật sau lỗi", mw.status.cget("text")[:80])
+
+# --- Mac: Ctrl+K toggles the Claude panel without deleting text in the prompt box ---
+if getattr(app, "IS_MAC", False) and isinstance(mw.prompt, tk.Text):
+    keep = "dòng này phải được giữ nguyên"
+    mw.prompt.delete("1.0", "end")
+    mw.prompt.insert("1.0", keep)
+    mw.prompt.mark_set("insert", "1.0")
+    mw.prompt.focus_force()
+    pump(0.3)
+    before_side = mw.panel_side
+    mw.prompt.event_generate("<Control-k>")
+    pump(0.8)
+    check("ctrl_k_keeps_prompt_text", mw.prompt.get("1.0", "end").strip() == keep and mw.panel_side != before_side,
+          f"text='{mw.prompt.get('1.0', 'end').strip()[:40]}', panel {before_side}->{mw.panel_side}")
+    if mw.panel_side:
+        mw.toggle_panel(mw.panel_side)
+    mw.prompt.delete("1.0", "end")
+    pump(0.3)
+
 # --- friendly credit-balance error ---
 msg = app.friendly_error(Exception("Error code: 400 - Your credit balance is too low to access the Anthropic API."))
 check("friendly_credit_balance_error", "credit" in msg and "Billing" in msg, msg[:120])
@@ -483,7 +509,7 @@ import pymupdf                                         # noqa: E402
 with pymupdf.open(pdf) as d:
     text = d[0].get_text()
     fonts = [f[3] for f in d[0].get_fonts()]
-check("learning_pdf_vietnamese", viet in " ".join(text.split()), f"fonts {fonts}; text {text.strip()[:100]}")
+check("learning_pdf_vietnamese", viet in " ".join(text.split()) and (not getattr(app, "IS_MAC", False) or any("Arial" in f for f in fonts)), f"fonts {fonts}; text {text.strip()[:100]}")
 
 # --- v1.8.6: List output files; 🗑 Xoá moves the file to the Trash (the dialog promises it can be restored) ---
 if hasattr(mw.learning, "list_outputs"):

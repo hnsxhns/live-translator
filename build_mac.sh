@@ -38,7 +38,7 @@ if [ -f vendor/ant ]; then
   chmod +x vendor/ant
   ADD+=(--add-binary "$PWD/vendor/ant:vendor")
 else
-  echo "Note: vendor/ant not found - the 'Sign in with Claude' button will use ant from PATH if installed; API-key login always works."
+  echo "Note: vendor/ant not found - 'Sign in with Claude' will not work in this build (an app opened from Finder does not see Homebrew's PATH); API-key login always works."
 fi
 
 .venv-mac/bin/python -m PyInstaller --noconfirm --clean --onedir --windowed --name "$NAME" \
@@ -57,6 +57,14 @@ PLIST="$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string 'Live Translator'" "$PLIST" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VER" "$PLIST" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$PLIST" 2>/dev/null || true
+# The colors are designed for light mode: in Dark Mode, Tk turns default text white (on our white panes)
+/usr/libexec/PlistBuddy -c "Add :NSRequiresAquaSystemAppearance bool true" "$PLIST" 2>/dev/null || true
+# Why the app may ask (shown in macOS's permission prompts)
+setkey() { /usr/libexec/PlistBuddy -c "Add :$1 string '$2'" "$PLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :$1 '$2'" "$PLIST"; }
+setkey NSAppleEventsUsageDescription "Live Translator dùng Finder để chuyển file bạn xoá vào Thùng rác."
+setkey NSDocumentsFolderUsageDescription "Live Translator đọc tài liệu học và lưu kết quả vào thư mục bạn chọn."
+setkey NSDesktopFolderUsageDescription "Live Translator đọc tài liệu học và lưu kết quả vào thư mục bạn chọn."
+setkey NSDownloadsFolderUsageDescription "Live Translator đọc tài liệu học và lưu kết quả vào thư mục bạn chọn."
 
 # Info.plist changed -> re-sign (ad-hoc; no Apple developer account needed)
 codesign --force --deep --sign - "$APP"
