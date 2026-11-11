@@ -850,8 +850,10 @@ if getattr(app, "IS_MAC", False) and os.path.exists(os.path.join(ROOT, "source_b
         page = json.load(open(outj, encoding="utf-8")) if os.path.exists(outj) else {}
         n_links = len(page.get("links") or [])
         ck = [c.get("name") for c in page.get("cookies") or []]
+        took = time.time() - t0
         check("source_login_browser_scans_page", n_links >= 3 and "session" in ck and not page.get("error"),
-              f"{time.time() - t0:.0f}s, {n_links} links, cookies {ck}, error {page.get('error')}")
+              f"{took:.0f}s, {n_links} links, cookies {ck}, error {page.get('error')}")
+        check("source_login_browser_closes_itself", took < 45, f"window process ended after {took:.0f}s")
         got = []
         if page.get("links"):
             hdr = {"Cookie": learning.cookie_header(page.get("cookies"), murl)}

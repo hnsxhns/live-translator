@@ -114,6 +114,24 @@ class Api:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(page, f, ensure_ascii=False)
         os.replace(tmp, self.out)
+        if sys.platform == "darwin":
+            # Mac (WebKit): this call comes from the page and the page waits for it to return; closing the
+            # window from here waited on that same page, so the window stayed open ("Đang gửi ... link") and
+            # the app kept waiting. Return first and close a moment later; if the browser process still has
+            # not ended after a few seconds, end it (the result file is already written).
+            import threading
+            import time
+
+            def close():
+                time.sleep(0.3)
+                try:
+                    self._window.destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(4.0)
+                os._exit(0)
+            threading.Thread(target=close, daemon=True).start()
+            return True
         self._window.destroy()
 
 

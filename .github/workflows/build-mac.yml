@@ -140,12 +140,14 @@ jobs:
           "$A/Contents/MacOS/$EXE" --source-browser "http://127.0.0.1:8765/materials.html" "$OUT" "$PWD/src_profile" &
           P=$!
           for _ in $(seq 90); do kill -0 $P 2>/dev/null || break; sleep 1; done
-          kill -0 $P 2>/dev/null && { echo "still open after 90 s"; screencapture -x shots/source_browser.png || true; kill $P; }
+          OPEN=0
+          kill -0 $P 2>/dev/null && { OPEN=1; echo "still open after 90 s"; screencapture -x shots/source_browser.png || true; kill $P; }
           cat "$OUT" 2>/dev/null | head -c 600; echo
           N=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(len(d.get('links',[])) if not d.get('error') else -1)" "$OUT" 2>/dev/null || echo 0)
           echo "links handed back by the packaged login window: $N"
           echo "- Source login window from the packaged app: $N links handed back" >> "$GITHUB_STEP_SUMMARY"
-          [ "$N" -ge 2 ]
+          echo "- window closed by itself: $([ $OPEN = 0 ] && echo yes || echo NO)" >> "$GITHUB_STEP_SUMMARY"
+          [ "$N" -ge 2 ] && [ "$OPEN" = 0 ]
 
       - uses: actions/upload-artifact@v4
         if: always()
