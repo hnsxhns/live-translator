@@ -152,6 +152,9 @@ if app.IS_MAC:
     root.tk.call("tk", "scaling", 1.33)
 threading.Thread(target=app.preload_models, daemon=True).start()
 WORDS = {"t": None}
+SEEN = {}                                   # word -> time it first appeared in the English pane
+LAST_WORDS = {0: "ideas", 1: "part", 2: "tonight"}
+BACKLOG = []                                # (seconds since playback start, audio blocks waiting)
 
 
 def letters(w):
@@ -164,6 +167,13 @@ def pump(seconds):
         root.update()
         if WORDS["t"] is None and PLAY["start"] and letters(mw.left):
             WORDS["t"] = time.time()
+        if PLAY["start"]:
+            low = mw.left.get("1.0", "end").lower()
+            for w in LAST_WORDS.values():
+                if w not in SEEN and w in low:
+                    SEEN[w] = time.time()
+            if not BACKLOG or time.time() - PLAY["start"] - BACKLOG[-1][0] >= 1.0:
+                BACKLOG.append((round(time.time() - PLAY["start"], 1), mw.recognizer.audio_q.qsize()))
         time.sleep(0.02)
 
 
@@ -235,7 +245,20 @@ shot("04_user_scrolled_up")
 at(seg_times[-1][2] + 8)
 st = mw.status.cget("text")
 check("mic_silence_warning", "Micro không gửi âm thanh" in st,
-      f"{st[:90]} | zero seconds counted: {getattr(mw.recognizer, 'zero_seconds', '?')}")
+      f"{st[:90]} | zero seconds counted: {getattr(mw.recognizer, 'zero_seconds', '?')}; "
+      f"audio blocks waiting now: {mw.recognizer.audio_q.qsize()}")
+# real-time check: each speaker's last words must appear soon after they stop talking
+lats = {}
+for i, (spk, a, b) in enumerate(seg_times):
+    w = LAST_WORDS.get(i)
+    if w in SEEN:
+        lats[w] = round(SEEN[w] - (start + b), 2)
+results["timings"]["end_of_speech_latency_s"] = lats
+results["timings"]["audio_backlog"] = BACKLOG
+worst_backlog = max((q for _, q in BACKLOG), default=0)
+check("realtime_end_of_speech_latency", len(lats) == len(LAST_WORDS) and max(lats.values()) < 3.0,
+      f"last words shown this long after each speaker stopped: {lats}; max audio backlog {worst_backlog} blocks "
+      f"({worst_backlog * 0.15:.1f} s)")
 yl = mw.left.yview()
 check("no_fight_with_user_scroll", (not overflow) or yl[0] < 0.05,
       f"EN view stayed at {yl[0]:.2f}-{yl[1]:.2f} while new text arrived")
