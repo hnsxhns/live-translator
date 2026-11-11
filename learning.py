@@ -96,13 +96,29 @@ def extract_text(path, ext):
     return "", 0
 
 
-def parse_json(text):
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
-    a, b = text.find("{"), text.rfind("}")
-    if a < 0 or b < a:
-        raise ValueError("Claude không trả về JSON")
-    return json.loads(text[a:b + 1])
+def parse_json(text, required=None):
+    """The JSON object in Claude's answer. The answer can hold more than one (e.g. when the request switched to
+    a fallback model part-way and the answer started again, or text around it): every complete object is read
+    and the last one is used — json.loads on the whole text fails with "Extra data" in that case."""
+    text = re.sub(r"```(?:json)?", "", text.strip())
+    dec, found = json.JSONDecoder(), []
+    i = text.find("{")
+    while i != -1:
+        try:
+            obj, end = dec.raw_decode(text, i)
+        except ValueError:
+            i = text.find("{", i + 1)
+            continue
+        if isinstance(obj, dict):
+            found.append(obj)
+        i = text.find("{", end)
+    if not found:
+        raise ValueError("Claude không trả về JSON hợp lệ")
+    if required:                                    # the last object that has the fields we asked for
+        good = [o for o in found if all(k in o for k in required)]
+        if good:
+            return good[-1]
+    return found[-1]
 
 
 def long_client(client):
@@ -131,7 +147,7 @@ def ask_json(client, system, content, schema, effort="low", max_tokens=16000):
                                             messages=messages, extra_body=extra,
                                             extra_headers=headers) as stream:
                     text = "".join(stream.text_stream)
-                return parse_json(text)
+                return parse_json(text, schema.get("required"))
             except anthropic.BadRequestError as e:
                 last = e
             except (ValueError, json.JSONDecodeError) as e:
@@ -1070,6 +1086,7 @@ DRAFT_BLOCK = re.compile(r"-{3,} *MẪU BƯỚC SAU *-{3,} *\n(.*?)\n *-{3,} *H�
 DRAFT_START_TK = r"-{3,} *MẪU BƯỚC SAU *-{3,}"
 DRAFT_END_TK = r"-{3,} *HẾT MẪU *-{3,}"
 BLANK = re.compile(r"\[cần điền[^\]]*\]", re.I)
+BLANK_LABEL = re.compile(r"\[cần điền:?\s*([^\]]*)\]", re.I)
 OUTPUT_BLOCK = re.compile(r"-{3,} *KẾT QUẢ GỌN *-{3,} *\n(.*?)\n *-{3,} *HẾT KẾT QUẢ *-{3,}", re.S | re.I)
 OUTPUT_START_TK = r"-{3,} *KẾT QUẢ GỌN *-{3,}"
 OUTPUT_END_TK = r"-{3,} *HẾT KẾT QUẢ *-{3,}"
@@ -1206,6 +1223,9 @@ class LearningUI:
         p.insert("end", text)
         job["prompt"] = text                # to know later whether the user edited it before sending
         self.job = job
+        if job.get("kind") == "exstep" and BLANK.search(text):
+            # information only the learner has: ask it in a small dialog, then write it into the prompt
+            self.root.after(80, lambda j=job: self.fill_prompt_blanks(j))
         self.mw._refresh_attach_bar()
         if not self.mw.panel_open:
             self.mw.toggle_panel("right")
@@ -1265,6 +1285,7 @@ class LearningUI:
 
         def progress(msg):
             self.mw.ui_q.put(("status", "🎓 " + msg))
+            self.later(lambda: self.mw.busy("sync", msg))
 
         def work():
             try:
@@ -1281,6 +1302,7 @@ class LearningUI:
                 self.mw.ui_q.put(("error", f"🎓 Đồng bộ lỗi: {A.friendly_error(e)}"))
             finally:
                 self.syncing = False
+                self.later(lambda: self.mw.done("sync"))
                 if on_done:
                     self.later(on_done)
         threading.Thread(target=work, daemon=True).start()
@@ -1637,6 +1659,7 @@ class LearningUI:
             refresh_btn.config(state="disabled")
 
             def progress(msg):
+                self.later(lambda: self.mw.busy("scan", msg))
                 self.later(lambda: alive() and status.config(text="⏳ " + msg))
 
             def work():
@@ -1650,6 +1673,7 @@ class LearningUI:
                     self.later(lambda: self.chat_note(f"Chưa cập nhật được danh sách bài tập: {why}", "err"))
                 finally:
                     busy["scan"] = False
+                    self.later(lambda: self.mw.done("scan"))
                     self.later(lambda: alive() and fill())
             threading.Thread(target=work, daemon=True).start()
 
@@ -1700,6 +1724,7 @@ class LearningUI:
 
             def work():
                 try:
+                    self.later(lambda: self.mw.busy("prepare", "Claude đang đọc file và chuẩn bị các bước bài tập..."))
                     sess = plan()
                     self.later(lambda: (self.mw.status.config(text="🎓 Bài tập đã sẵn sàng", fg="#7ee2a8"),
                                         self.start_session(sess, restart=redo)))
@@ -1707,6 +1732,8 @@ class LearningUI:
                     why = A.friendly_error(e) if isinstance(e, anthropic.APIError) or "timed out" in str(e) \
                         else str(e)
                     self.later(lambda: self.chat_note(f"Chưa chuẩn bị được bài tập: {why}", "err"))
+                finally:
+                    self.later(lambda: self.mw.done("prepare"))
             threading.Thread(target=work, daemon=True).start()
 
         st = dict(font=(A.UI_FONT, 10), relief="flat", cursor="hand2", padx=12, pady=3)
@@ -1738,6 +1765,7 @@ class LearningUI:
             return
         done = threading.Event()
         jobs[key] = done
+        self.mw.busy(f"prep:{key}", "Đang chuẩn bị bài tập ở chế độ nền (Claude đọc file)...")
 
         def work():
             try:
@@ -1747,6 +1775,7 @@ class LearningUI:
             finally:
                 done.set()
                 jobs.pop(key, None)
+                self.later(lambda: self.mw.done(f"prep:{key}"))
         threading.Thread(target=work, daemon=True).start()
 
     def wait_prefetch(self, key):
@@ -1881,11 +1910,11 @@ class LearningUI:
         if step.get("prompt_template"):
             pass
         elif draft:                     # Claude prepared this input: template + known values, blanks for the rest
-            lines.append("Thông tin của tôi (đã điền sẵn — chỉ cần điền các chỗ [cần điền: ...]):")
+            lines.append("Thông tin của tôi (đã điền sẵn):")
             lines.append(draft)
         elif s.get("next_inputs"):                         # Claude said this step needs the learner's information
             lines.append("Thông tin của tôi:")
-            lines += [f"• {f.strip()}: " for f in s["next_inputs"]]
+            lines += [f"• {f.strip()}: [cần điền: {f.strip()}]" for f in s["next_inputs"]]
         label = (f"{self._step_name(i)} · {step['part_title'][:25]}" if step.get("part")
                  else f"Bài tập · {self._step_name(i)} · {ex['title'][:30]}")
         blanks = len(BLANK.findall(draft or ""))
@@ -1990,6 +2019,57 @@ class LearningUI:
         top.wait_window()
         return options[result[0][0]] if result and result[0] else None
 
+    def fill_prompt_blanks(self, job):
+        """Ask for every [cần điền: ...] left in the exercise prompt (one short question each) and fill them in."""
+        if self.job is not job:                    # the prompt was sent or replaced meanwhile
+            return
+        text = self.mw.prompt.get("1.0", "end").rstrip("\n")
+        labels = list(dict.fromkeys(m.group(1).strip() or "thông tin" for m in BLANK_LABEL.finditer(text)))
+        if not labels:
+            return
+        values = self.ask_fields(job.get("label", "Bài tập"), labels)
+        if not values:
+            return
+        for m in reversed(list(BLANK_LABEL.finditer(text))):
+            v = values.get(m.group(1).strip() or "thông tin")
+            if v:
+                text = text[:m.start()] + v + text[m.end():]
+        p = self.mw.prompt
+        p.delete("1.0", "end")
+        p.insert("end", text)
+        job["prompt"] = text
+        left = len(BLANK.findall(text))
+        self.mw.status.config(text=(f"🎓 Đã điền vào prompt — còn {left} chỗ [cần điền]." if left else
+                                    "🎓 Đã điền đủ thông tin vào prompt — bấm Gửi."),
+                              fg="#ffd479" if left else "#7ee2a8")
+        p.focus_set()
+
+    def ask_fields(self, title, labels):
+        """A dialog with one short question per missing item; returns {item: answer} (empty if skipped)."""
+        top = self._dialog("Thông tin cần cho bước này", f"640x{min(620, 170 + 78 * len(labels))}")
+        tk.Label(top, text=title, font=(A.UI_FONT, 10, "bold"), bg="white", fg="#8a3f22", wraplength=600,
+                 justify="left").pack(anchor="w", padx=14, pady=(12, 2))
+        tk.Label(top, text="Trả lời ngắn gọn từng câu; app sẽ điền vào đúng chỗ trong prompt.", fg="#666",
+                 bg="white", font=(A.UI_FONT, 9)).pack(anchor="w", padx=14, pady=(0, 6))
+        frame = tk.Frame(top, bg="white")
+        frame.pack(fill="both", expand=True, padx=14)
+        boxes = {}
+        for k, label in enumerate(labels):
+            q = label.rstrip(" ?:") + "?"
+            tk.Label(frame, text=f"{k + 1}. {q[:1].upper() + q[1:]}", bg="white", font=(A.UI_FONT, 10),
+                     wraplength=590, justify="left").pack(anchor="w", pady=(4, 0))
+            box = tk.Text(frame, height=2, wrap="word", font=(A.UI_FONT, 10), bd=1, relief="solid")
+            box.pack(fill="x")
+            boxes[label] = box
+        if boxes:
+            next(iter(boxes.values())).focus_set()
+        result = []
+        self._buttons(top, lambda: (result.append({k: b.get("1.0", "end").strip() for k, b in boxes.items()}),
+                                    top.destroy()), ok="Điền vào prompt")
+        top.unbind("<Return>")                         # Enter makes a new line in a box
+        top.wait_window()
+        return {k: v for k, v in (result[0] if result else {}).items() if v}
+
     def ask_text(self, slot):
         """Ask once for a value only the learner can give (e.g. their problem statement); reused in later prompts."""
         top = self._dialog("Thông tin cho prompt", "620x300")
@@ -2010,7 +2090,8 @@ class LearningUI:
         """Claude asked for the learner's own information: a fill-in form in the prompt box."""
         s = self.session
         i = s["i"]
-        text = f"{self._step_name(i)} — thông tin của tôi:\n" + "\n".join(f"• {f.strip()}: " for f in fields)
+        text = f"{self._step_name(i)} — thông tin của tôi:\n" + "\n".join(
+            f"• {f.strip()}: [cần điền: {f.strip()}]" for f in fields)
         self.set_prompt(text, {"kind": "exstep", "step": i, "input": True,
                                "doc_ids": s["ex"].get("doc_ids", []) if s.get("resume") else [],
                                "blocks": [{"type": "text", "text": EXERCISE_RULES}, self._next_step_block(i)]
@@ -2494,6 +2575,7 @@ class LearningUI:
                    f"<translation_vietnamese>\n{vi}\n</translation_vietnamese>") if (en or vi or summary) else ""
         q = self.mw.ui_q
         q.put(("chat_piece", "đang đọc mẫu nhật ký và điền thông tin...\n"))
+        self.mw.busy("chat", "Claude đang điền nhật ký theo mẫu PDF...")      # cleared when it ends
 
         def work():
             try:
