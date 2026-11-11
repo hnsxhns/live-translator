@@ -24,7 +24,7 @@ import numpy as np
 import learning
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.9.0.1"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.9.1"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # The login client waits at most 20 s for data (right for live translation). Chat and the Learning menu send
 # whole documents, and Claude can read/think longer than that before the first word: give them more time.
@@ -1137,6 +1137,10 @@ class MainWindow:
         top.grid(row=0, column=0, columnspan=4, sticky="ew")
         self.status = tk.Label(top, text="Nhấn ON để bắt đầu.", bg="#2b2b2b", fg="#ddd", font=(UI_FONT, 10))
         self.status.pack(side="left", padx=12, pady=6)
+        # "working on it" line: shown while something takes time (restore, Claude reading files...)
+        self._busy, self._busy_tick = {}, 0
+        self.busy_lbl = tk.Label(top, text="", bg="#2b2b2b", fg="#ffd479", font=(UI_FONT, 10))
+        root.after(120, self._busy_spin)
         self.toggle = tk.Button(top, text="OFF", width=7, font=(UI_FONT, 10, "bold"), relief="flat",
                                 bg="#777", fg="white", activebackground="#555", command=self.toggle_onoff)
         self.toggle.pack(side="right", padx=10, pady=5)
@@ -1528,6 +1532,7 @@ class MainWindow:
             except Exception as e:  # noqa: BLE001
                 self.status.config(text=f"🎓 Không đọc được tài liệu: {e}", fg="#ff7b7b")
         self.chat_busy = True
+        self.busy("chat", "Claude đang trả lời...")                  # cleared when the answer ends
         self.send_btn.config(state="disabled", text="...")
         w = self.chat
         w.configure(state="normal")
@@ -1580,6 +1585,8 @@ class MainWindow:
 
     def backup_session(self):
         from tkinter import filedialog, messagebox
+        if self.restoring():
+            return
         default = f"LiveTranslator_backup_{time.strftime('%Y%m%d_%H%M')}.json"
         path = filedialog.asksaveasfilename(parent=self.root, title="Lưu backup", defaultextension=".json",
                                             initialfile=default, initialdir=output_dir("Backup"),
@@ -1596,8 +1603,17 @@ class MainWindow:
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("Backup lỗi", str(e), parent=self.root)
 
+    def restoring(self):
+        """True while a restore is still putting rows in or lining them up (tells the user to wait)."""
+        if getattr(self, "_restoring", False) or getattr(self, "_align_job", None):
+            self.status.config(text="⏳ Đang khôi phục bản ghi — chờ chút cho xong rồi thử lại.", fg="#ffd479")
+            return True
+        return False
+
     def restore_session(self):
         from tkinter import filedialog, messagebox
+        if self.restoring():
+            return
         path = filedialog.askopenfilename(parent=self.root, title="Mở file backup", initialdir=output_dir("Backup"),
                                           filetypes=[("Live Translator backup", "*.json"), ("Tất cả", "*.*")])
         if not path:
@@ -1615,37 +1631,51 @@ class MainWindow:
             return
         if self.on:
             self.toggle_onoff()                       # stop listening while loading
-        problems = self.load_session(data)
-        n_take = len(re.findall(r"^\[\d\d:\d\d\]$", self.last_summary, re.M)) or (1 if self.last_summary.strip() else 0)
-        self.status.config(text=f"✓ Đã restore: {os.path.basename(path)} ({len(data.get('rows', []))} dòng, "
-                                f"{n_take} mốc Key takeaways)", fg="#7ee2a8" if not problems else "#ffd479")
-        if problems:
-            messagebox.showwarning("Restore chưa đầy đủ", "Một số phần chưa khôi phục được (các phần khác vẫn "
-                                   "đã được khôi phục):\n\n" + "\n".join("• " + p for p in problems),
-                                   parent=self.root)
+        t0 = time.time()
 
-    def load_session(self, data):
+        def finished(problems):
+            n_take = len(re.findall(r"^\[\d\d:\d\d\]$", self.last_summary, re.M)) or \
+                (1 if self.last_summary.strip() else 0)
+            self.status.config(text=f"✓ Đã restore: {os.path.basename(path)} ({len(data.get('rows', []))} dòng, "
+                                    f"{n_take} mốc Key takeaways, {time.time() - t0:.0f}s)",
+                               fg="#7ee2a8" if not problems else "#ffd479")
+            if problems:
+                messagebox.showwarning("Restore chưa đầy đủ", "Một số phần chưa khôi phục được (các phần khác vẫn "
+                                       "đã được khôi phục):\n\n" + "\n".join("• " + p for p in problems),
+                                       parent=self.root)
+        self.load_session(data, finished)
+
+    def load_session(self, data, on_done=None):
         """Rebuild every pane from backup data (also restores voices so new speech matches old speakers).
-        Each part is restored on its own, Key takeaways first: if one part fails (e.g. low memory) the others
-        are still restored. Returns the list of parts that failed."""
+        Each part is restored on its own, Key takeaways first: if one part fails the others are still restored.
+        The EN/VI rows come in progressively (the app stays usable); on_done(problems) is called at the end."""
         for w in (self.left, self.right, self.bottom, self.chat):
             w.configure(state="normal")
             w.delete("1.0", "end")
-            for t in w.tag_names():
-                if t[:1] in ("b", "u", "v") and t[1:].isdigit() or t.startswith(("pad", "vsep")):
-                    w.tag_delete(t)
+            old = [t for t in w.tag_names()
+                   if (t[:1] in ("b", "u", "v") and t[1:].isdigit()) or t.startswith(("pad", "vsep"))]
+            if old:
+                w.tag_delete(*old)                         # one call (thousands of row tags)
             w.configure(state="disabled")
         problems = []
         for name, fn in (("Key takeaways", self._restore_takeaways), ("người nói", self._restore_speakers),
-                         ("bản ghi tiếng Anh/tiếng Việt", self._restore_rows), ("khung Claude", self._restore_chat)):
+                         ("khung Claude", self._restore_chat)):
             try:
                 fn(data)
             except Exception as e:  # noqa: BLE001
                 problems.append(f"{name}: {e}")
-        self.summarizer.done_n = len(self.transcript)      # what is restored is not summarized again
-        self._schedule_align_all()
-        self.root.after(200, lambda: (self.left.see("end"), self._sync_from(self.left, self.right),
-                                      self.chat.see("end"), self.bottom.see("end")))
+        self.root.after_idle(lambda: (self.chat.see("end"), self.bottom.see("end")))
+
+        def rows_done(row_problems):
+            self.summarizer.done_n = len(self.transcript)  # what is restored is not summarized again
+            if on_done:
+                on_done(problems + row_problems)
+        try:
+            self._restore_rows(data, rows_done)
+        except Exception as e:  # noqa: BLE001
+            self._restoring = False
+            self.done("restore")
+            rows_done([f"bản ghi tiếng Anh/tiếng Việt: {e}"])
         return problems
 
     def _restore_takeaways(self, data):
@@ -1679,30 +1709,159 @@ class MainWindow:
         tr.next_id = int(sp.get("next_id", max(tr.sums, default=0) + 1))
         tr.last = None
 
-    def _restore_rows(self, data):
+    RESTORE_CHUNK = 120                  # rows put in per step; the window redraws (and stays usable) in between
+    ALIGN_CHUNK = 150
+
+    def _restore_rows(self, data, on_done=None):
+        """Rebuild the EN/VI rows quickly and progressively: the final text of a batch of rows is put in with one
+        insert per pane (no draft -> final, no "…" -> translation edits), the window redraws between batches
+        (text appears while loading and the app stays usable), and rows are lined up afterwards from the
+        newest one up. on_done(problems) is called at the end."""
         self.spk_shown, self.last_spk = {}, {"en": None, "vi": None}
         self.uid_spk, self.vi_gen, self.vi_filled = {}, {}, {}
         self.translator.en, self.translator.vi, self.translator.gen = {}, {}, {}
         self.transcript = [tuple(t) for t in data.get("transcript", [])]
-        rows = data.get("rows", [])
-        # While rebuilding, don't scroll/redraw after every row (that is what made a long restore take a minute
-        # and look frozen); the panes are scrolled to the end once, when everything is in.
+        rows = [r for r in data.get("rows", []) if "uid" in r]
+        # new speech continues after the last restored row (set first, so it is right even if something fails)
+        self.recognizer.utt_id = max([int(r["uid"]) for r in rows], default=self.recognizer.utt_id)
         self._restoring = True
+        self._restore_job = {"rows": rows, "i": 0, "on_done": on_done, "problems": [], "tags": set()}
+        self.busy("restore", f"Đang khôi phục bản ghi 0/{len(rows)} dòng...")
+        self._restore_step()
+
+    def _row_segments(self, pane, uid, sid, text, job):
+        """The text pieces (with their tags) of one row, exactly as the live path leaves a finished row."""
+        w = self.left if pane == "en" else self.right
+        blk, sid = f"b{uid}", self._res(sid)
+        if (pane, sid) not in job["tags"]:                     # color tags: configure once per speaker
+            self._spk_tags(w, sid)
+            job["tags"].add((pane, sid))
+        segs = []
+        if self.last_spk[pane] != sid:
+            self.last_spk[pane] = sid
+            if job.get(f"nonempty_{pane}"):
+                segs += ["\n", (blk,)]                         # blank line between speakers
+            name = self.speaker_name(sid)
+            self.spk_shown[sid] = name
+            segs += [name + ": ", ("lbl", f"lbl{sid}", blk)]
+        tags = (f"spk{sid}", blk) if pane == "en" else (f"v{uid}", f"spk{sid}", blk)
+        segs += [text, tags, "\n", (blk, f"pad{uid}")]
+        job[f"nonempty_{pane}"] = True
+        return segs
+
+    def _restore_step(self):
+        job = getattr(self, "_restore_job", None)
+        if not job:
+            return
+        rows, i = job["rows"], job["i"]
         try:
-            for r in rows:
-                uid, sid = int(r["uid"]), int(r["speaker"])
+            if i == 0:
+                job["nonempty_en"] = self.left.index("end-1c") != "1.0"
+                job["nonempty_vi"] = self.right.index("end-1c") != "1.0"
+            en, vi = [], []
+            for r in rows[i:i + self.RESTORE_CHUNK]:
+                uid, sid = int(r["uid"]), int(r.get("speaker", 1))
                 self.uid_spk[uid] = sid
                 self.recognizer.utt_spk[uid] = sid
-                self.translator.en[uid] = r.get("en", "")
-                self.translator.vi[uid] = r.get("vi", "")
-                self.translator.gen[uid] = 1
-                self._add_draft(uid, r.get("en", ""))
-                self._finalize([uid], r.get("en", ""))
-                self._vi_slot(uid)
-                self._vi_piece(uid, 1, r.get("vi", "") or " ")
-        finally:
-            self._restoring = False
-        self.recognizer.utt_id = max([int(r["uid"]) for r in rows], default=self.recognizer.utt_id)
+                e, v = (r.get("en") or "").strip(), (r.get("vi") or "").strip()
+                self.translator.en[uid], self.translator.vi[uid], self.translator.gen[uid] = e, v, 1
+                self.vi_gen[uid], self.vi_filled[uid] = 1, True
+                en += self._row_segments("en", uid, sid, split_sentences(e), job)
+                vi += self._row_segments("vi", uid, sid, split_sentences(v) if v else "—", job)
+            for w, segs in ((self.left, en), (self.right, vi)):
+                if segs:
+                    w.configure(state="normal")
+                    w.insert("end", *segs)
+                    w.configure(state="disabled")
+                    w.see("end")                               # the text is seen coming in
+            job["i"] = i = min(len(rows), i + self.RESTORE_CHUNK)
+        except Exception as e:  # noqa: BLE001
+            job["problems"].append(f"bản ghi tiếng Anh/tiếng Việt (dòng {i + 1}): {e}")
+            job["i"] = i = len(rows)
+        if i < len(rows):
+            self.busy("restore", f"Đang khôi phục bản ghi {i}/{len(rows)} dòng...")
+            self.root.update_idletasks()                       # redraw now, so the rows are seen coming in
+            self.root.after(1, self._restore_step)
+            return
+        # all rows are in: line them up, newest first (what is on screen), a batch per step
+        self._restoring = False
+        self._restore_job = None
+        job["align"] = [int(r["uid"]) for r in reversed(rows)]
+        self._align_job = job
+        self._align_step()
+
+    def _align_step(self):
+        job = getattr(self, "_align_job", None)
+        if not job:
+            return
+        todo = job["align"]
+        batch, job["align"] = todo[:self.ALIGN_CHUNK], todo[self.ALIGN_CHUNK:]
+        try:
+            self._align_uids(batch)
+        except Exception as e:  # noqa: BLE001
+            job["problems"].append(f"căn hàng: {e}")
+            job["align"] = []
+        if job["align"]:
+            done = len(job["rows"]) - len(job["align"])
+            self.busy("restore", f"Đang căn thẳng hàng tiếng Anh/tiếng Việt {done}/{len(job['rows'])}...")
+            self.root.update_idletasks()
+            self.root.after(1, self._align_step)
+            return
+        self._align_job = None
+        self.done("restore")
+        self.left.see("end")
+        self._sync_from(self.left, self.right)
+        if job.get("on_done"):
+            job["on_done"](job["problems"])
+
+    def _align_uids(self, uids):
+        """Give each row the same height in both panes (padding under the shorter one)."""
+        for uid in uids:
+            pad = f"pad{uid}"
+            if not (self.left.tag_ranges(pad) and self.right.tag_ranges(pad)):
+                continue                              # the other side of this row doesn't exist yet
+            for w in (self.left, self.right):
+                # Tk takes line spacing from the line's first character, so the padding tag must
+                # cover the row's whole last line (not just its line break)
+                rng = w.tag_ranges(f"b{uid}")
+                if rng:
+                    # only the CURRENT last line: when a row grew, its old last line (or the speaker
+                    # label left at its start) kept the tag and the padding was added twice
+                    w.tag_remove(pad, rng[0], rng[1])
+                    w.tag_add(pad, w.index(f"{rng[1]} -1c linestart"), rng[1])
+                w.tag_configure(pad, spacing3=0)
+            hl, hr = self._row_height(self.left, uid), self._row_height(self.right, uid)
+            if hl is None or hr is None:
+                continue
+            if hl > hr:
+                self.right.tag_configure(pad, spacing3=hl - hr)
+            elif hr > hl:
+                self.left.tag_configure(pad, spacing3=hr - hl)
+
+    # ---- "working on it" indicator: shown while something takes time, gone when it is done ----
+    def busy(self, key, text):
+        self._busy[key] = text
+        self._show_busy()
+
+    def done(self, key):
+        self._busy.pop(key, None)
+        self._show_busy()
+
+    def _show_busy(self):
+        if not self._busy:
+            self.busy_lbl.config(text="")
+            self.busy_lbl.pack_forget()
+            return
+        dots = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[self._busy_tick % 10]
+        self.busy_lbl.config(text=f"{dots} " + "   ·   ".join(self._busy.values()))
+        if not self.busy_lbl.winfo_ismapped():
+            self.busy_lbl.pack(side="left", padx=(4, 8), pady=6, after=self.status)
+
+    def _busy_spin(self):
+        self._busy_tick += 1
+        if self._busy:
+            self._show_busy()
+        self.root.after(120, self._busy_spin)
 
     def _restore_chat(self, data):
         self.chat_log = list(data.get("chat", []))
@@ -1997,6 +2156,8 @@ class MainWindow:
                 w.insert(rng[1], text, (f"v{uid}", spk_tag, f"b{uid}"))
             # one sentence per line, like the English side: turn "sentence. Next" into a line break
             rng = w.tag_ranges(f"v{uid}")
+            if not rng:                              # empty text: nothing to split (and no range to read)
+                return
             body = w.get(rng[0], rng[1])
             for m in reversed(list(sentence_gaps(body))):
                 a = w.index(f"{rng[0]} + {m.start(1)}c")
@@ -2053,27 +2214,7 @@ class MainWindow:
 
     def _run_align(self):
         uids, self._align_pending = sorted(self._align_pending), set()
-        for uid in uids:
-            pad = f"pad{uid}"
-            if not (self.left.tag_ranges(pad) and self.right.tag_ranges(pad)):
-                continue                              # the other side of this row doesn't exist yet
-            for w in (self.left, self.right):
-                # Tk takes line spacing from the line's first character, so the padding tag must
-                # cover the row's whole last line (not just its line break)
-                rng = w.tag_ranges(f"b{uid}")
-                if rng:
-                    # only the CURRENT last line: when a row grew, its old last line (or the speaker
-                    # label left at its start) kept the tag and the padding was added twice
-                    w.tag_remove(pad, rng[0], rng[1])
-                    w.tag_add(pad, w.index(f"{rng[1]} -1c linestart"), rng[1])
-                w.tag_configure(pad, spacing3=0)
-            hl, hr = self._row_height(self.left, uid), self._row_height(self.right, uid)
-            if hl is None or hr is None:
-                continue
-            if hl > hr:
-                self.right.tag_configure(pad, spacing3=hl - hr)
-            elif hr > hl:
-                self.left.tag_configure(pad, spacing3=hr - hl)
+        self._align_uids(uids)
         self._follow()
 
     def _set_preset(self, name):
@@ -2105,6 +2246,8 @@ class MainWindow:
         self.root.destroy()
 
     def toggle_onoff(self):
+        if not self.on and self.restoring():          # don't start listening in the middle of a restore
+            return
         self.on = not self.on
         if self.on:
             self.toggle.config(text="ON", bg="#27ae60", activebackground="#1e8449")
@@ -2170,6 +2313,7 @@ class MainWindow:
                     self.chat.configure(state="disabled")
                 elif kind == "chat_end":
                     self.chat_busy = False
+                    self.done("chat")
                     self.send_btn.config(state="normal", text="Gửi ➤")
                     if self.panel_open:
                         self.prompt.focus_set()

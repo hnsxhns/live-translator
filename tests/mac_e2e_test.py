@@ -416,8 +416,19 @@ filedialog.askopenfilename = lambda *a, **k: bk
 before = mw.left.get("1.0", "end")
 mw.backup_session()
 pump(0.5)
+
+
+def wait_restore(limit=120):
+    t0 = time.time()
+    pump(0.3)
+    while "restore" in getattr(mw, "_busy", {}) and time.time() - t0 < limit:
+        pump(0.1)
+    return time.time() - t0
+
+
 mw.restore_session()
-pump(1.5)
+wait_restore()
+pump(0.5)
 check("backup_restore_roundtrip", os.path.exists(bk) and mw.left.get("1.0", "end").strip() == before.strip(),
       f"backup {os.path.getsize(bk) if os.path.exists(bk) else 0} bytes")
 
@@ -622,6 +633,66 @@ if hasattr(mw.learning, "ask_choice"):
     root.after(800, lambda: click_in_last_dialog("Điền vào prompt", type_text))
     got = mw.learning.ask_text({"name": "de_bai", "label": "Đề bài"})
     check("dialog_type_value_vietnamese", got == typed, f"returned {got!r}"[:120])
+    pump(0.3)
+
+# --- v1.9.1: a long session restores quickly, a row without translation doesn't stop it ---
+if hasattr(mw, "_restore_step"):
+    with open(bk, encoding="utf-8") as f:
+        data = json.load(f)
+    base = data.get("rows", [])
+    if base:
+        big, uid = [], 0
+        for k in range(1500):
+            r = dict(base[k % len(base)])
+            uid += 1
+            r["uid"] = uid
+            if k == 700:
+                r["vi"] = ""                               # the case that used to stop the restore part-way
+            big.append(r)
+        data["rows"] = big
+        bigf = os.path.join(OUT, "backup_1500_rows.json")
+        with open(bigf, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        filedialog.askopenfilename = lambda *a, **k: bigf
+        took = wait_restore() if (mw.restore_session() or True) else 0
+        pump(0.5)
+        n_rows = sum(1 for t in mw.left.tag_names() if t.startswith("b") and t[1:].isdigit())
+        tail = [t for t in (f"b{u}" for u in range(1490, 1501)) if mw.right.tag_ranges(t)]
+        offs = []
+        for tg in tail:
+            ya = ypix(mw.left, "1.0", mw.left.tag_ranges(tg)[0])
+            yb = ypix(mw.right, "1.0", mw.right.tag_ranges(tg)[0])
+            offs.append(abs(ya - yb))
+        check("restore_1500_rows_fast_and_complete",
+              took < 30 and n_rows >= 1500 and mw.recognizer.utt_id >= 1500 and "restore" not in mw._busy,
+              f"{took:.1f}s, {n_rows} rows, next row number {mw.recognizer.utt_id}")
+        check("restore_rows_level_after_long_restore", offs and max(offs) <= 3, f"last rows offsets {offs}")
+        results["timings"]["restore_1500_rows_s"] = round(took, 1)
+        filedialog.askopenfilename = lambda *a, **k: bk
+
+# --- v1.9.1: [cần điền: ...] blanks in an exercise prompt open one dialog and are filled in ---
+if hasattr(mw.learning, "fill_prompt_blanks"):
+    job = {"kind": "exstep", "label": "Bài tập thử"}
+    mw.learning.job = job
+    mw.prompt.delete("1.0", "end")
+    mw.prompt.insert("1.0", "Phân tích bảng [cần điền: tên bảng] cho năm [cần điền: năm].")
+    answers = ["Doanh thu quý 3 ắ ơ ư đ", "2026"]
+
+    def fill_boxes(top):
+        boxes, stack = [], [top]
+        while stack:
+            x = stack.pop(0)
+            if isinstance(x, tk.Text):
+                boxes.append(x)
+            stack.extend(x.winfo_children())
+        for b, a in zip(boxes, answers):
+            b.insert("1.0", a)
+    root.after(800, lambda: click_in_last_dialog("Điền vào prompt", fill_boxes))
+    mw.learning.fill_prompt_blanks(job)
+    got = mw.prompt.get("1.0", "end").strip()
+    check("exercise_blanks_filled", got == "Phân tích bảng Doanh thu quý 3 ắ ơ ư đ cho năm 2026.", got[:100])
+    mw.prompt.delete("1.0", "end")
+    mw.learning.job = None
     pump(0.3)
 
 # --- clean exit: no extra processes, no hang ---
