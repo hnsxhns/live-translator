@@ -18,6 +18,7 @@ const NATIVE = !!(window.LT_NATIVE && window.webkit?.messageHandlers?.lt);
 const LABEL = NATIVE ? `v${window.LT_NATIVE.version} (${window.LT_NATIVE.build})` : upd.BUILD_LABEL;
 
 const TEACHER_MINUTES = 10;   // whoever has spoken this long becomes "Teacher" (several -> Teacher 1, 2...)
+const TEACHER_EARLY_MINUTES = 3;   // ...or sooner: the main speaker (half of all speech so far) after this long
 // soft, muted colors: steel blue, terracotta, moss green, dusty purple, ochre, teal, plum
 const SPK_COLORS = ["#2f5d8a", "#9a5235", "#3f7a4f", "#6c5190", "#8a6d1f", "#2e7676", "#86476a"];
 
@@ -779,8 +780,12 @@ class App {
         }
         if (JSON.stringify(merged) !== JSON.stringify(this.spkAlias)) this.applyMerges(merged);
         let changed = false;
+        const total = Object.values(talk).reduce((a, b) => a + b, 0) || 1;
         for (const [s, secs] of Object.entries(talk)) {
-          if (secs >= TEACHER_MINUTES * 60 && !this.teachers.includes(+s)) { this.teachers.push(+s); changed = true; }
+          // Teacher (or Teacher 2, 3...): spoke 10 min, or is clearly the main speaker after 3 min (half of all
+          // speech) so the label shows early in a new class (Windows 1.9.8)
+          const main = secs >= TEACHER_EARLY_MINUTES * 60 && secs >= 0.5 * total;
+          if ((secs >= TEACHER_MINUTES * 60 || main) && !this.teachers.includes(+s)) { this.teachers.push(+s); changed = true; }
         }
         if (changed) this.relabel();
         break;
