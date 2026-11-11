@@ -24,7 +24,7 @@ import numpy as np
 import learning
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.8.7"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.8.9"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # The login client waits at most 20 s for data (right for live translation). Chat and the Learning menu send
 # whole documents, and Claude can read/think longer than that before the first word: give them more time.
@@ -1441,7 +1441,7 @@ class MainWindow:
 
     def _follow(self):
         """Show the newest rows in both panes (unless the user scrolled up to read)."""
-        if self.follow:
+        if self.follow and not getattr(self, "_restoring", False):
             self.left.see("end")
             self._sync_from(self.left, self.right)
             if self.right.yview()[1] < 0.999 and not self.right.dlineinfo("end-1c"):
@@ -1671,17 +1671,23 @@ class MainWindow:
         self.translator.en, self.translator.vi, self.translator.gen = {}, {}, {}
         self.transcript = [tuple(t) for t in data.get("transcript", [])]
         rows = data.get("rows", [])
-        for r in rows:
-            uid, sid = int(r["uid"]), int(r["speaker"])
-            self.uid_spk[uid] = sid
-            self.recognizer.utt_spk[uid] = sid
-            self.translator.en[uid] = r.get("en", "")
-            self.translator.vi[uid] = r.get("vi", "")
-            self.translator.gen[uid] = 1
-            self._add_draft(uid, r.get("en", ""))
-            self._finalize([uid], r.get("en", ""))
-            self._vi_slot(uid)
-            self._vi_piece(uid, 1, r.get("vi", "") or " ")
+        # While rebuilding, don't scroll/redraw after every row (that is what made a long restore take a minute
+        # and look frozen); the panes are scrolled to the end once, when everything is in.
+        self._restoring = True
+        try:
+            for r in rows:
+                uid, sid = int(r["uid"]), int(r["speaker"])
+                self.uid_spk[uid] = sid
+                self.recognizer.utt_spk[uid] = sid
+                self.translator.en[uid] = r.get("en", "")
+                self.translator.vi[uid] = r.get("vi", "")
+                self.translator.gen[uid] = 1
+                self._add_draft(uid, r.get("en", ""))
+                self._finalize([uid], r.get("en", ""))
+                self._vi_slot(uid)
+                self._vi_piece(uid, 1, r.get("vi", "") or " ")
+        finally:
+            self._restoring = False
         self.recognizer.utt_id = max([int(r["uid"]) for r in rows], default=self.recognizer.utt_id)
 
     def _restore_chat(self, data):

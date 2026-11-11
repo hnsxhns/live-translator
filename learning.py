@@ -1065,17 +1065,29 @@ EXERCISE_RULES = (
     "course book's template when it has one, filled in with the learner's information).\n"
     "3. Then one line: '➡ Mang sang bước sau: ...' with only what the next step needs from this result (very "
     "short). Skip it at the last step.\n"
-    "4. If the next step (see <next_step>) will need information from the learner, end with the line "
-    "[[CẦN NHẬP TIẾP: item 1 | item 2]] (item names in Vietnamese).\n"
+    "4. If the next step (see <next_step>) will need input from the learner (information, a plan, a prompt to "
+    "write...), " + "{draft}" + "\n"
     "5. Finish with the line [[XONG BƯỚC]].\n"
     "Reply in Vietnamese.\n"
     "</exercise_rules>")
+# how Claude prepares the learner's next input: as complete as possible, blanks only for what is unknown
+DRAFT_RULE = (
+    "prepare that input for them as completely as possible, between a line '----- MẪU BƯỚC SAU -----' and a "
+    "line '----- HẾT MẪU -----': copy the course book's template for that step when there is one; fill in "
+    "everything already known — from the book, from the results of earlier steps in this conversation, and "
+    "from what the learner already gave; leave ONLY what is truly unknown as [cần điền: short description]. "
+    "Then end with the line [[CẦN NHẬP TIẾP: item 1 | item 2]] listing just those unknown items (in Vietnamese).")
+EXERCISE_RULES = EXERCISE_RULES.replace("{draft}", DRAFT_RULE)
 OVERVIEW_RULES = (
     "<overview_rules>\n"
     "Summarize the exercise in 2-3 short lines (task, goal, expected result) — just enough to understand it. "
-    "Do not start any step. If the first step (see <next_step>) will need information from the learner, end "
-    "with the line [[CẦN NHẬP TIẾP: item 1 | item 2]] (item names in Vietnamese). Reply in Vietnamese.\n"
+    "Do not start any step. If the first step (see <next_step>) will need input from the learner, "
+    + DRAFT_RULE + " Reply in Vietnamese.\n"
     "</overview_rules>")
+DRAFT_BLOCK = re.compile(r"-{3,} *MẪU BƯỚC SAU *-{3,} *\n(.*?)\n *-{3,} *HẾT MẪU *-{3,}", re.S | re.I)
+DRAFT_START_TK = r"-{3,} *MẪU BƯỚC SAU *-{3,}"
+DRAFT_END_TK = r"-{3,} *HẾT MẪU *-{3,}"
+BLANK = re.compile(r"\[cần điền[^\]]*\]", re.I)
 MARKER = re.compile(r"\[\[\s*(?:CẦN NHẬP|CAN NHAP|XONG BƯỚC|XONG BUOC)[^\]]*\]\]", re.I)
 MARKER_TK = r"\[\[ *(CẦN NHẬP|CAN NHAP|XONG BƯỚC|XONG BUOC)[^]]*\]\]"      # the same, for Tk's text search
 NEEDS_INPUT = re.compile(r"\[\[\s*(?:CẦN NHẬP|CAN NHAP)(?!\s*TI)\s*:?\s*([^\]]*)\]\]", re.I)
@@ -1119,8 +1131,9 @@ def solution_pdf(lib, session, summary):
                 parts.append(f"<p class='instr'>{_html.escape(st['instruction'])}</p>")
         if item.get("input"):
             filled = item["q"]
-            if "thông tin của tôi:" in item["q"].lower():           # only the lines the learner filled in
-                filled = item["q"][item["q"].lower().index("thông tin của tôi:") + len("thông tin của tôi:"):]
+            m = re.search(r"thông tin của tôi[^\n]*\n", item["q"], re.I)      # only what the learner sent
+            if m:
+                filled = item["q"][m.end():]
             parts.append(f"<p class='instr'><b>Thông tin của học viên:</b><br/>"
                          f"{_html.escape(filled.strip()).replace(chr(10), '<br/>')}</p>")
         parts.append(text_html(item["a"]))
@@ -1502,7 +1515,7 @@ class LearningUI:
         bold = (A.UI_FONT, 10, "bold")
         head = tk.Frame(top, bg="white")
         head.pack(fill="x", padx=12, pady=(10, 4))
-        mode = tk.StringVar(value="big")
+        mode = tk.StringVar(value=self.lib.data.get("ex_mode", "big"))      # the mode used last time
         tk.Radiobutton(head, text="Bài tập lớn (đọc toàn bộ thư mục, theo các bước)", value="big", variable=mode,
                        bg="white", font=bold).pack(side="left")
         tk.Radiobutton(head, text="Theo file bài tập (chọn file cụ thể)", value="doc", variable=mode, bg="white",
@@ -1543,8 +1556,8 @@ class LearningUI:
                 status.config(text=f"{n} bài tập lớn · cập nhật {upd}" if upd else
                               "Chưa có danh sách — nhấn 🔄 Refresh để Claude đọc toàn bộ thư mục.")
             else:
-                status.config(text="Chọn một file bài tập: bấm ▶ để làm lần lượt toàn bộ bài trong file, "
-                                   "hoặc mở file (▸) và chọn một bài cụ thể.")
+                status.config(text="Chọn dòng 📄 (cả file: làm lần lượt mọi bài con) hoặc một dòng ✏ (một bài con), "
+                                   "rồi bấm ▶ Bắt đầu.")
 
         def fill(*_):
             tree.delete(*tree.get_children())
@@ -1564,14 +1577,16 @@ class LearningUI:
                     exs = file_exercises(d)
                     fid = f"f{k}"
                     items[fid] = {"kind": "file", "doc": d, "exs": exs}
-                    tree.insert("", "end", iid=fid, tags=("file",), values=(
+                    # parent = the whole file, children = its sub-exercises, shown open: either can be started
+                    tree.insert("", "end", iid=fid, tags=("file",), open=True, values=(
                         d.get("day") or "-", "📄 " + (d.get("title") or d["name"]),
-                        f"{len(exs)} bài" if exs else "-", d["name"]))
+                        f"{len(exs)} bài con" if exs else "-", d["name"]))
                     for j, ex in enumerate(exs):
                         eid = f"{fid}_{j}"
                         items[eid] = {"kind": "ex", "doc": d, "ex": ex}
                         tree.insert(fid, "end", iid=eid, values=(
-                            d.get("day") or "-", "✏ " + ex["title"], len(ex["steps"]) or "-", d["name"]))
+                            d.get("day") or "-", f"✏ {j + 1}. {ex['title']}",
+                            f"{len(ex['steps'])} bước" if ex["steps"] else "-", d["name"]))
             detail.delete("1.0", "end")
             show_status()
             refresh_btn.config(state="disabled" if busy["scan"] else "normal")
@@ -1723,6 +1738,7 @@ class LearningUI:
         tree.bind("<<TreeviewSelect>>", on_select)
         tree.bind("<Double-1>", lambda e: start())
         mode.trace_add("write", fill)
+        mode.trace_add("write", lambda *_: self.lib.data.__setitem__("ex_mode", mode.get()))
         fill()
         if not self.lib.data.get("big_exercises_updated"):
             refresh()                          # first time: read the folder right away
@@ -1761,6 +1777,7 @@ class LearningUI:
             self.lib.data.setdefault("sessions", {})[s["key"]] = {
                 "ex": s["ex"], "i": s["i"], "log": s["log"], "overview": s.get("overview", ""),
                 "awaiting": s.get("awaiting"), "carry": s.get("carry"), "next_inputs": s.get("next_inputs"),
+                "next_draft": s.get("next_draft"),
                 "done": done, "time": time.strftime("%d/%m %H:%M")}
         self.lib.save()
 
@@ -1772,7 +1789,7 @@ class LearningUI:
             # an exercise opened before: carry on where it stopped
             self.session = {"ex": ex, "i": min(saved["i"], len(steps)), "log": saved.get("log", []),
                             "overview": saved.get("overview", ""), "key": key, "resume": True}
-            for k in ("awaiting", "carry", "next_inputs"):
+            for k in ("awaiting", "carry", "next_inputs", "next_draft"):
                 if saved.get(k):
                     self.session[k] = saved[k]
             k = self.session["i"]
@@ -1863,19 +1880,27 @@ class LearningUI:
             lines.append(f"Mục tiêu bài này: {step['part_goal']}")
         if s.get("carry"):
             lines.append(f"Mang sang từ bước trước: {s['carry']}")
-        if s.get("next_inputs"):                           # Claude said this step needs the learner's information
+        draft = s.get("next_draft")
+        if draft:                       # Claude prepared this input: template + known values, blanks for the rest
+            lines.append("Thông tin của tôi (đã điền sẵn — chỉ cần điền các chỗ [cần điền: ...]):")
+            lines.append(draft)
+        elif s.get("next_inputs"):                         # Claude said this step needs the learner's information
             lines.append("Thông tin của tôi:")
             lines += [f"• {f.strip()}: " for f in s["next_inputs"]]
         label = (f"{self._step_name(i)} · {step['part_title'][:25]}" if step.get("part")
                  else f"Bài tập · {self._step_name(i)} · {ex['title'][:30]}")
-        if s.get("next_inputs"):
-            label += " · điền thông tin"
-            self.mw.status.config(text="🎓 Điền thông tin vào mẫu trong ô nhập rồi gửi.", fg="#ffd479")
+        blanks = len(BLANK.findall(draft or ""))
+        if draft or s.get("next_inputs"):
+            label += f" · còn {blanks} chỗ cần điền" if draft else " · điền thông tin"
+            self.mw.status.config(text=(f"🎓 Bản nháp đã điền sẵn — còn {blanks} chỗ [cần điền] trong ô nhập."
+                                        if draft else "🎓 Điền thông tin vào mẫu trong ô nhập rồi gửi."),
+                                  fg="#ffd479")
         # the documents go again with each new sub-exercise and now and then, so they stay in Claude's recent
         # history (the overview already sent them)
         ids = ex.get("doc_ids", []) if (i > 0 and (i % 6 == 0 or new_part)) or s.get("resume") else []
         self.set_prompt("\n".join(lines), {
-            "kind": "exstep", "step": i, "doc_ids": ids, "label": label, "input": bool(s.get("next_inputs")),
+            "kind": "exstep", "step": i, "doc_ids": ids, "label": label,
+            "input": bool(draft or s.get("next_inputs")),
             "blocks": [{"type": "text", "text": EXERCISE_RULES}, self._next_step_block(i)] + self._resume_blocks()})
 
     def prompt_inputs(self, fields):
@@ -1911,6 +1936,13 @@ class LearningUI:
             return
         w.configure(state="normal")
         count = tk.IntVar()
+        # the draft for the next step goes into the prompt box, not into the answers pane
+        idx = w.search(DRAFT_START_TK, start, stopindex="end", regexp=True, nocase=True, count=count)
+        if idx:
+            end = w.search(DRAFT_END_TK, idx, stopindex="end", regexp=True, nocase=True, count=count)
+            if end:
+                w.delete(idx, f"{end}+{count.get()}c")
+                w.insert(idx, "📝 (bản nháp cho bước sau đã được điền sẵn vào ô nhập)", "file")
         while True:
             idx = w.search(MARKER_TK, start, stopindex="end", regexp=True, nocase=True, count=count)
             if not idx or not count.get():
@@ -1939,7 +1971,7 @@ class LearningUI:
             w.insert(f"{pos}+2c", "[📋 Copy prompt]", tag)
         w.configure(state="disabled")
         if turn:
-            turn["a"] = MARKER.sub("", turn.get("a", "")).strip()
+            turn["a"] = DRAFT_BLOCK.sub("", MARKER.sub("", turn.get("a", ""))).strip()
 
     def copy_text(self, text):
         self.root.clipboard_clear()
@@ -1968,9 +2000,11 @@ class LearningUI:
         if kind == "exstep" and job.get("step") == s["i"] and ok and answer:
             s.pop("resume", None)                           # Claude has the context again from here on
             nxt = NEXT_INPUT.search(raw)
+            dm = DRAFT_BLOCK.search(raw)
             if s["i"] < 0:                                  # the overview
                 s["overview"] = answer
                 s["next_inputs"] = [f for f in nxt.group(1).split("|") if f.strip()] if nxt else None
+                s["next_draft"] = dm.group(1).strip() if dm else None
                 s["i"] = 0
                 self.save_session()
                 self.prompt_step()
@@ -1987,6 +2021,7 @@ class LearningUI:
             carry = CARRY.search(MARKER.sub("", raw))
             s["carry"] = carry.group(1).strip() if carry else None
             s["next_inputs"] = [f for f in nxt.group(1).split("|") if f.strip()] if nxt else None
+            s["next_draft"] = dm.group(1).strip() if dm else None
             s["i"] += 1
             self.save_session()
             if s["i"] < len(steps):
