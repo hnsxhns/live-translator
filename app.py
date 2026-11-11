@@ -24,7 +24,7 @@ import numpy as np
 import learning
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.9.2"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.9.3"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # The login client waits at most 20 s for data (right for live translation). Chat and the Learning menu send
 # whole documents, and Claude can read/think longer than that before the first word: give them more time.
