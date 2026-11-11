@@ -223,6 +223,8 @@ class App {
     this.summarizer = this.summarizer || new Summarizer(() => this.apiKey, (k, v) => this.handle(k, v),
                                                         (a, b) => this.transcriptRange(a, b), () => this.lastSummary);
     if (this.ready) this.setStatus("✓ Sẵn sàng. Nhấn ON để bắt đầu nghe.", "ok");
+    this.summarizer.getTerms = () => this.recognizer.glossary;    // the same course words help the takeaways
+    this.refreshGlossary();
     this.translator.warm();                              // the first translation is then as fast as the others
     this.checkUpdates();
   }

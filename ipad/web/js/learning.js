@@ -276,6 +276,73 @@ const DAYS_SYSTEM = (
   "(1, 2, 3... in course order; 0 for whole-course material such as the agenda or a journal template) and " +
   "its date (YYYY-MM-DD or empty). Use the agenda text, when given, to match days and dates.");
 
+// ---- Source: a web page that lists the course materials (Windows 1.9.3) ----
+const SOURCE_MAX_BYTES = 200 * MB;                    // skip files larger than this
+// documents only (web pages, scripts and data files on the page are not course materials)
+const SOURCE_EXTS = new Set([".pdf", ".docx", ".txt", ".md", ".csv", ".tsv", ".srt", ".vtt", ".png", ".jpg", ".jpeg",
+  ".gif", ".webp"]);
+const MIME_EXT = { "application/pdf": ".pdf", "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+  "image/webp": ".webp", "text/plain": ".txt", "text/markdown": ".md", "text/csv": ".csv",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx" };
+
+/** Links on the page that point to a document the library can use (by file extension, or for links that look
+ *  like downloads, by the type the server reports). [{url, text, ext}]. Throws TypeError when the browser may
+ *  not read the page (CORS) or the network fails. */
+export async function sourceDocLinks(pageUrl, exts) {
+  const res = await fetch(pageUrl, { redirect: "follow" });
+  if (!res.ok) throw new Error(`trang trả lỗi HTTP ${res.status}`);
+  const html = await res.text();
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const base = res.url || pageUrl;
+  const out = [], seen = new Set();
+  let checked = 0;
+  for (const a of doc.querySelectorAll("a[href]")) {
+    const href = (a.getAttribute("href") || "").trim();
+    if (!href || /^(#|javascript:|mailto:)/i.test(href)) continue;
+    let u;
+    try { u = new URL(href, base); } catch { continue; }
+    if (!/^https?:$/.test(u.protocol)) continue;
+    u.hash = "";
+    const key = u.href;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const text = (a.textContent || "").replace(/\s+/g, " ").trim();
+    let ext = extOf(decodeURIComponent(u.pathname));
+    if (exts.has(ext)) { out.push({ url: key, text, ext }); continue; }
+    if (checked < 25 && /download|export|attachment|file|\/d\//i.test(key)) {
+      checked++;                                       // ask the server what it is (a few at most)
+      try {
+        const h = await fetch(key, { method: "HEAD", redirect: "follow" });
+        ext = MIME_EXT[(h.headers.get("content-type") || "").split(";")[0].trim().toLowerCase()];
+        if (ext && exts.has(ext)) out.push({ url: key, text, ext });
+      } catch { /* not readable from here */ }
+    }
+  }
+  return out;
+}
+
+/** Downloads one linked file as a File named like on the server (or after the link). */
+export async function sourceDownload(link, text, extHint) {
+  const res = await fetch(link, { redirect: "follow" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const size = +(res.headers.get("content-length") || 0);
+  if (size > SOURCE_MAX_BYTES) throw new Error(`lớn hơn ${SOURCE_MAX_BYTES / MB} MB`);
+  const blob = await res.blob();
+  if (blob.size > SOURCE_MAX_BYTES) throw new Error(`lớn hơn ${SOURCE_MAX_BYTES / MB} MB`);
+  let name = "";
+  const cd = res.headers.get("content-disposition") || "";       // readable only if the site exposes it
+  const m = /filename\*=(?:UTF-8'')?([^;]+)|filename="?([^";]+)"?/i.exec(cd);
+  if (m) { try { name = decodeURIComponent((m[1] || m[2]).trim()); } catch { name = (m[1] || m[2]).trim(); } }
+  if (!name) {
+    try { name = decodeURIComponent(new URL(res.url || link).pathname.split("/").pop() || ""); } catch { /* */ }
+  }
+  if (!name || !extOf(name)) name = ((text || name || "tai-lieu").replace(/[\\/:*?"<>|]+/g, " ").trim().slice(0, 80) ||
+                                     "tai-lieu") + (extHint || extOf(name) || "");
+  if (!extOf(name) && extHint) name += extHint;
+  name = name.normalize("NFC");
+  return new File([blob], name, { type: mimeOf(name, blob.type), lastModified: Date.now() });
+}
+
 class Syncer {
   constructor(lib, apiKey, progress) {
     this.lib = lib;
@@ -334,7 +401,7 @@ class Syncer {
         fresh.push(doc);
       }
       const top = found[0]?.webkitRelativePath?.split("/")[0];
-      lib.data.folder = top || `${found.length} file đã chọn`;
+      if (!this.keepFolder) lib.data.folder = top || `${found.length} file đã chọn`;   // (Source keeps the folder)
       await lib.save();
     }
 
@@ -1147,6 +1214,13 @@ export class LearningUI {
     };
     item("📁  Folder — " + (this.syncing ? "đang đồng bộ..." : "chọn thư mục học"), () => this.folder(), !this.syncing);
     if (this.lib.data.folder) item("🔄  Refresh — tìm file mới, cập nhật dữ liệu", () => this.refresh(), !this.syncing);
+    // Source: a web page that lists the course materials; new files on it are downloaded and synced (Windows 1.9.3)
+    const src = this.lib.data.source_url;
+    let host = "";
+    try { host = src ? new URL(src).host : ""; } catch { /* */ }
+    item("🌐  Source — " + (src ? `quét ${host} tìm tài liệu mới` : "lấy tài liệu từ trang web khóa học"),
+         () => this.source(), !this.syncing);
+    if (src) item("✎  Đổi link Source", () => this.changeSource(), !this.syncing, "lmItem sub");
     if (this.cachedAgenda()) {
       item("🗓  Agenda — chương trình học (đã lưu, mở ngay)", () => this.agenda(), n > 0);
       item("🔄  Tạo lại Agenda", () => this.agenda(true), n > 0, "lmItem sub");
@@ -1423,19 +1497,125 @@ export class LearningUI {
     this.folder(true, onDone);
   }
 
-  async sync(files, onDone = null) {
+  // ---- Source: a web page with the course materials (Windows 1.9.3) ----
+  // The page is read by the browser, so it works only when the site lets web apps read it (CORS); many course
+  // sites (Moodle, sites that need a login) do not: the app then says so and how else to add the files.
+  async source() {
+    await this.ready;
+    const url = this.lib.data.source_url || await this.askSourceUrl();
+    if (url) this.scanSource(url);
+  }
+
+  async changeSource() {
+    const url = await this.askSourceUrl(this.lib.data.source_url || "");
+    if (url) this.scanSource(url);
+  }
+
+  /** Asks for the link of the page that lists the materials; remembers it. Resolves the link or "". */
+  askSourceUrl(current = "") {
+    return new Promise((resolve) => {
+      const body = el("div", "lform");
+      body.append(el("p", "", "Dán link trang web liệt kê tài liệu khóa học. Mỗi lần bấm 🌐 Source, app quét trang này; " +
+        "tài liệu mới (PDF, Word, ảnh, file chữ...) được tự tải về, thêm vào thư viện và upload cho Claude."));
+      const input = el("input", "search");
+      input.type = "url";
+      input.placeholder = "https://...";
+      input.value = current;
+      input.autocapitalize = "off";
+      input.spellcheck = false;
+      const msg = el("p", "hint", "");
+      const row = el("div", "actions");
+      const cancel = el("button", "", "Huỷ"), ok = el("button", "primary", "Lưu & quét");
+      let done = false;
+      const finish = (v) => { if (!done) { done = true; resolve(v); } };
+      cancel.onclick = () => { this.app.closeSheet(); finish(""); };
+      ok.onclick = async () => {
+        const v = input.value.trim();
+        if (!/^https?:\/\/\S+$/i.test(v)) { msg.textContent = "Hãy nhập một link bắt đầu bằng http:// hoặc https://"; return; }
+        if (this.lib.data.source_url !== v) this.lib.data.source_files = {};    // a new page: compare afresh
+        this.lib.data.source_url = v;
+        await this.lib.save();
+        this.app.closeSheet();
+        finish(v);
+      };
+      input.onkeydown = (e) => { if (e.key === "Enter") ok.onclick(); };
+      row.append(el("span", "spacer"), cancel, ok);
+      body.append(input, msg, row);
+      this.app.sheet("🌐 Source — trang web chứa tài liệu", body);
+      document.getElementById("sheet").addEventListener("close", () => finish(""), { once: true });
+      setTimeout(() => input.focus(), 50);
+    });
+  }
+
+  async scanSource(url) {
+    if (this.syncing) { this.app.setStatus("⏳ Đang đồng bộ — chờ xong rồi bấm Source lại.", "warn"); return; }
+    this.chatNote(`Đang quét ${url} để tìm tài liệu mới...`);
+    this.app.busy("source", "Đang quét trang Source tìm tài liệu mới...");
+    const problems = [], files = [];
+    let links = [];
+    try {
+      try {
+        links = await sourceDocLinks(url, new Set([...SOURCE_EXTS].filter((e) => SUPPORTED.has(e))));
+      } catch (e) {
+        if (e instanceof TypeError) {                      // the browser blocked reading the page (or offline)
+          throw new Error("trang này không cho ứng dụng web đọc (trình duyệt chặn), hoặc mạng đang lỗi. " +
+            "Trên iPad hãy mở trang bằng Safari, tải tài liệu về app Tệp rồi dùng 📁 Folder / 🔄 Refresh; " +
+            "hoặc dùng 🌐 Source trên bản Windows/Mac.");
+        }
+        throw e;
+      }
+      const known = (this.lib.data.source_files ||= {});
+      const todo = links.filter((x) => !known[x.url]);
+      for (let k = 0; k < todo.length; k++) {
+        const { url: link, text, ext } = todo[k];
+        this.app.busy("source", `Đang tải tài liệu mới ${k + 1}/${todo.length} từ Source...`);
+        try {
+          const file = await sourceDownload(link, text, ext);
+          files.push(file);
+          known[link] = { name: file.name, time: stamp() };
+        } catch (e) {
+          problems.push(`${text || link}: ${e instanceof TypeError ? "trang không cho tải file này" : e.message || e}`);
+        }
+      }
+      this.lib.data.source_checked = stamp();
+      await this.lib.save();
+    } catch (e) {
+      problems.push(e.message || String(e));
+    } finally {
+      this.app.done("source");
+    }
+    let msg = links.length || !problems.length
+      ? `Source: ${links.length} link tài liệu trên trang; ` +
+        (files.length ? `${files.length} file mới đã tải về:\n` + files.map((f) => `  • ${f.name}`).join("\n")
+                      : "không có tài liệu mới.")
+      : "Source: không quét được trang.";
+    if (problems.length) msg += "\nLưu ý:\n" + problems.slice(0, 10).map((p) => "• " + p).join("\n");
+    this.chatNote(msg, !links.length && problems.length > 0);
+    if (files.length) {
+      // the usual sync: same content as a document already there is skipped, the rest uploaded and catalogued
+      await this.sync(files, null, { keepFolder: true });
+    } else {
+      this.app.setStatus(problems.length && !links.length ? "🌐 Source: không quét được trang" : "🌐 Source: không có tài liệu mới",
+                         problems.length && !links.length ? "err" : "ok");
+    }
+  }
+
+  async sync(files, onDone = null, { keepFolder = false } = {}) {
     if (this.syncing) return;
     this.syncing = true;
     this.chatNote(files ? `Bắt đầu đồng bộ ${files.length} file` : "Bắt đầu làm mới thư viện");
     const progress = (msg) => { this.app.setStatus("🎓 " + msg); this.app.busy("sync", msg); };
     progress(files ? "Đang đồng bộ thư mục học..." : "Đang làm mới thư viện...");
     try {
-      const r = await new Syncer(this.lib, this.app.apiKey, progress).run(files);
+      const syncer = new Syncer(this.lib, this.app.apiKey, progress);
+      syncer.keepFolder = keepFolder;
+      const r = await syncer.run(files);
       let msg = `Đồng bộ xong: ${r.found} file đã chọn, ${r.new} tài liệu mới đã upload, ${r.known} đã có từ trước, ` +
         `${r.dup} bản trùng nội dung đã bỏ qua. Thư viện có ${r.total} tài liệu.`;
       if (r.problems.length) msg += "\nLưu ý:\n" + r.problems.slice(0, 12).map((p) => "• " + p).join("\n");
       this.chatNote(msg);
       this.app.setStatus(`🎓 Đồng bộ xong: +${r.new} tài liệu mới`, "ok");
+      this.app.refreshGlossary?.();                        // new documents: new words to expect
     } catch (e) {
       this.chatNote(`Đồng bộ lỗi: ${friendlyError(e)}`, true);
       this.app.setStatus(`🎓 Đồng bộ lỗi: ${friendlyError(e)}`, "err");

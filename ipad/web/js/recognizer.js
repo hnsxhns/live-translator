@@ -93,6 +93,72 @@ export function downsampler(rate, out) {
   };
 }
 
+/** Cleans mic audio for Whisper, block by block as it streams in (port of AudioCleaner, Windows 1.9.8).
+ *  1. High-pass filter (~100 Hz): removes hum, fan/air-conditioner rumble and desk knocks, which carry no
+ *     speech but mask it. (4th-order Butterworth as two biquads: same cut as the desktop's long FIR filter,
+ *     ~50x less work for the iPad.)
+ *  2. Level boost: a quiet or far-away speaker is raised towards normal speech loudness (up to 10x), with a
+ *     slow, smooth gain so words don't pump; background noise alone is never boosted more than speech. */
+export class AudioCleaner {
+  static TARGET = 0.08;                // speech loudness (RMS) Whisper sees
+  static MAX_GAIN = 10.0;
+
+  constructor(cutoff = 100, sr = SR) {
+    this.stages = [0.5412, 1.3066].map((q) => {           // Butterworth Q values for 4th order
+      const w = (2 * Math.PI * cutoff) / sr, cos = Math.cos(w), alpha = Math.sin(w) / (2 * q), a0 = 1 + alpha;
+      return { b0: (1 + cos) / 2 / a0, b1: -(1 + cos) / a0, b2: (1 + cos) / 2 / a0,
+               a1: (-2 * cos) / a0, a2: (1 - alpha) / a0, z1: 0, z2: 0 };
+    });
+    this.gain = 1.0;
+    this.level = null;                 // recent speech loudness (after filtering)
+    this.hist = [];                    // recent 30 ms loudness values -> noise floor
+  }
+
+  process(block) {
+    const y = Float32Array.from(block);
+    for (const s of this.stages) {                         // direct form II transposed
+      for (let i = 0; i < y.length; i++) {
+        const x = y[i], v = s.b0 * x + s.z1;
+        s.z1 = s.b1 * x - s.a1 * v + s.z2;
+        s.z2 = s.b2 * x - s.a2 * v;
+        y[i] = v;
+      }
+    }
+    const n = Math.floor(y.length / FRAME);
+    const start = this.gain;
+    if (n) {
+      const rms = [];
+      for (let f = 0; f < n; f++) {
+        let sq = 0;
+        for (let i = f * FRAME; i < (f + 1) * FRAME; i++) sq += y[i] * y[i];
+        rms.push(Math.sqrt(sq / FRAME));
+      }
+      this.hist.push(...rms);
+      if (this.hist.length > 500) this.hist.splice(0, this.hist.length - 500);
+      let floor = 0.003;
+      if (this.hist.length > 30) {
+        const sorted = [...this.hist].sort((a, b) => a - b);
+        floor = sorted[Math.floor(0.2 * (sorted.length - 1))];
+      }
+      const speech = rms.filter((v) => v > Math.max(floor * 3.0, 0.002));
+      if (speech.length) {
+        const v = Math.sqrt(speech.reduce((a, b) => a + b * b, 0) / speech.length);
+        this.level = this.level === null ? v : this.level + (v - this.level) * (v > this.level ? 0.5 : 0.15);
+        let want = Math.min(AudioCleaner.MAX_GAIN, Math.max(1.0, AudioCleaner.TARGET / Math.max(this.level, 1e-5)));
+        want = Math.min(want, Math.max(1.0, 0.02 / Math.max(floor, 1e-5)));   // noise stays quiet (floor x gain <= 0.02)
+        this.gain += (want - this.gain) * (want < this.gain ? 0.6 : 0.2);    // turn down faster than up
+      }
+    }
+    const len = y.length, end = this.gain;
+    for (let i = 0; i < len; i++) {                        // gain ramp across the block: no clicks
+      const g = len > 1 ? start + ((end - start) * i) / (len - 1) : end;
+      const v = y[i] * g;
+      y[i] = v > 1 ? 1 : v < -1 ? -1 : v;
+    }
+    return y;
+  }
+}
+
 class WorkerClient {
   constructor(url) {
     this.worker = new Worker(url, { type: "module" });
@@ -197,7 +263,8 @@ export class Recognizer {
     });
     this.sent = 0;                 // samples sent to Vosk since this recognizer started
     this.cut = 0;                  // sample index where the current utterance starts
-    this.chunks = [];              // [{start, data}] audio not yet given to an utterance
+    this.chunks = [];              // [{start, data, clean}] audio not yet given to an utterance
+    this.cleaner = new AudioCleaner();   // hum/rumble filter + level boost for quiet or far speakers (Whisper only)
     this.rmsHist = [];
     this.quiet = 0;
     this.cutAsked = false;
@@ -374,7 +441,9 @@ export class Recognizer {
     this.blocks += 1;
     if (pk > this.peak) this.peak = pk;
     this.emit("level", Math.sqrt(sq / (block.length || 1)));
-    this.chunks.push({ start: this.sent, data: block });
+    let clean = null;
+    try { clean = this.cleaner?.process(block) || null; } catch { clean = null; }   // never stops the listening
+    this.chunks.push({ start: this.sent, data: block, clean });
     this.sent += block.length;
     this.rec.acceptWaveformFloat(block, SR);
 
@@ -402,14 +471,17 @@ export class Recognizer {
     }
   }
 
+  /** [audio as recorded, cleaned audio] from sample `from` to `to`. */
   _take(from, to) {
-    const out = new Float32Array(Math.max(0, to - from));
+    const raw = new Float32Array(Math.max(0, to - from)), clean = new Float32Array(raw.length);
     for (const c of this.chunks) {
       const a = Math.max(from, c.start), b = Math.min(to, c.start + c.data.length);
-      if (b > a) out.set(c.data.subarray(a - c.start, b - c.start), a - from);
+      if (b <= a) continue;
+      raw.set(c.data.subarray(a - c.start, b - c.start), a - from);
+      clean.set((c.clean || c.data).subarray(a - c.start, b - c.start), a - from);
     }
     this.chunks = this.chunks.filter((c) => c.start + c.data.length > to);
-    return out;
+    return [raw, clean];
   }
 
   _onResult(result) {
@@ -420,13 +492,15 @@ export class Recognizer {
     if (words.length) end = Math.min(this.sent, Math.round((words[words.length - 1].end + 0.25) * SR));
     else end = text ? this.sent : Math.max(this.cut, this.sent - Math.round(0.3 * SR));
     end = Math.max(end, this.cut);
-    const audio = this._take(this.cut, end);
+    const [raw, clean] = this._take(this.cut, end);
     this.cut = end;
     this.lastPartial = "";
-    this._endUtterance(text, audio);
+    this._endUtterance(text, raw, clean);
   }
 
-  _endUtterance(draft, audio) {
+  /** raw: audio as recorded (voiceprints); clean: hum filtered + level boosted (Whisper). */
+  _endUtterance(draft, raw, clean = raw) {
+    const audio = raw;
     if (["", "the", "huh", "uh", "um"].includes(draft)) {    // Vosk heard no real words: skip Whisper
       this.emit("partial", "");
       return;
@@ -448,7 +522,9 @@ export class Recognizer {
       const sid = sp.assign(vec, seconds);
       this.uttSpk[id] = sid;
       this.emit("speaker", [id, sid, { ...sp.talk }, { ...sp.merged }]);
-      this.queue.push({ id, draft, audio });     // Whisper text (and the transcript) use the real speaker
+      // Whisper gets the cleaned audio (far speaker: 9.9% -> 5.8% word errors on Windows); Vosk and the
+      // voiceprints keep the audio as recorded
+      this.queue.push({ id, draft, audio: clean });     // Whisper text (and the transcript) use the real speaker
       this._pumpWhisper();
     });
   }

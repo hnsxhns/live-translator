@@ -245,19 +245,29 @@ export class Chatter {
 /** Running key takeaways. Every round only the speech that is new since the last round is turned into new
  *  bullet points, which are ADDED to the pane (earlier takeaways are never removed). */
 export class Summarizer {
-  static SYSTEM = ("You keep running KEY TAKEAWAYS in Vietnamese for a live talk/conversation. You get the takeaways " +
-    "already written, the end of the earlier transcript for context, and the NEW part of the English " +
-    "transcript (from speech recognition; it may contain errors). Write only takeaways that the NEW " +
-    "part adds and that are not already in the existing takeaways: 1-5 short bullet points starting " +
-    "with '• ', most important first. If the new part adds nothing worth noting, output exactly NONE. " +
-    "Output only the bullets (or NONE).");
+  // The transcript comes from live speech recognition, so some words are misheard (worst for people far from
+  // the mic). Takeaways are notes to learn from: they state what was said, cleanly, and never talk about the
+  // recognition itself (earlier versions put "(chưa rõ do lỗi nhận dạng)" in ~40% of bullets). Windows 1.9.8.
+  static SYSTEM = ("You keep running KEY TAKEAWAYS in Vietnamese for a live talk/conversation (often a course). You " +
+    "get the takeaways already written, the end of the earlier transcript for context, the course's " +
+    "own terms when known, and the NEW part of the English transcript. The transcript comes from live " +
+    "speech recognition: some words are misheard and sentences may be split. Read it as the speaker " +
+    "meant it: silently correct obvious mishearings from context and the course terms. Write only " +
+    "takeaways that the NEW part adds and that are not already in the existing takeaways: 1-5 short " +
+    "bullet points starting with '• ', most important first. Write each bullet as a clean, confident " +
+    "note of the idea. Never mention speech recognition, transcription errors, missing or unclear " +
+    "words, unknown names or results; never add remarks like '(chưa rõ)', '(có thể là ...)' or " +
+    "'(do lỗi nhận dạng)'. If part of the speech is too garbled to understand, leave it out. Small " +
+    "talk, logistics and side chatter are not takeaways. If the new part adds nothing worth " +
+    "noting, output exactly NONE. Output only the bullets (or NONE).");
 
   constructor(getKey, emit, getTranscript, getTakeaways) {
     this.getKey = getKey;
     this.emit = emit;
     this.getTranscript = getTranscript;   // (start, end) -> [end index, transcript text of those entries]
     this.getTakeaways = getTakeaways;
-    this.doneN = 0;                       // transcript entries already covered
+    this.getTerms = () => "";             // course vocabulary (set by the app: the same words Whisper is given)
+    this.doneN = 0;                      // transcript entries already covered
     this.final = false;                   // set when listening stops: cover even a short remainder
     this.busy = false;
     this.timer = setInterval(() => this.kick(), SUMMARY_EVERY);
@@ -272,7 +282,11 @@ export class Summarizer {
     this.busy = true;
     try {
       const [, before] = this.getTranscript(0, this.doneN);
-      const prompt = `<existing_takeaways>\n${this.getTakeaways() || "(none yet)"}\n</existing_takeaways>\n` +
+      const terms = this.getTerms();
+      // the recent takeaways are enough to avoid repeats (the whole history grew to 40k+ characters per round in
+      // a long class: slower, costlier, and the old style got copied)
+      const prompt = (terms ? `<course_terms>\n${terms}\n</course_terms>\n` : "") +
+        `<existing_takeaways>\n${(this.getTakeaways() || "").slice(-6000) || "(none yet)"}\n</existing_takeaways>\n` +
         `<earlier_transcript_end>\n${before.slice(-3000) || "(none)"}\n</earlier_transcript_end>\n` +
         `<new_transcript>\n${fresh}\n</new_transcript>`;
       // short timeout: a stuck request must not stop the takeaways for long
