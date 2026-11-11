@@ -128,13 +128,13 @@
           <div class="ptitle"><span class="picon">✳</span>Claude trả lời</div>
           <div id="chat" class="ptext"></div>
         </section>
-        <div id="divider2" class="divider"></div>
+        <div id="divider2" class="divider" title="Kéo lên/xuống để đổi độ cao · chạm 2 lần: ô prompt to/nhỏ"></div>
         <section class="pane ask">
-          <div class="ptitle"><span class="picon">✎</span>Hỏi Claude <small>Enter: gửi · Shift+Enter: xuống dòng</small></div>
+          <div class="ptitle"><span class="picon">✎</span>Hỏi Claude <small class="askHint">Enter: gửi · Shift+Enter: xuống dòng</small><button id="editPrompt" class="ptbtn" title="Mở khung soạn lớn để đọc, dán và sửa prompt">⤢ Sửa</button></div>
           <div id="attachBar" class="attachBar" hidden></div>
           <div class="promptRow">
             <textarea id="prompt" placeholder="Hỏi về nội dung đang nghe, hoặc bất cứ điều gì..."></textarea>
-            <button id="learn" class="learnBtn" title="Học tập (Ctrl+L)">🎓 Learning</button>
+            <button id="learn" class="learnBtn" title="Học tập (Ctrl+L)" aria-label="Learning">🎓<span class="lbl"> Learning</span></button>
             <button id="attach" class="attach" title="Đính kèm ảnh, PDF, Word, file chữ">📎</button>
             <button id="send" class="primary send">Gửi ➤</button>
           </div>
@@ -155,6 +155,13 @@ g</button>
     </div>
   </div>
 </div>
+
+<dialog id="editor" class="editor" aria-label="Soạn prompt">
+  <div class="edHead"><b>⤢ Soạn prompt</b><span id="edCount" class="edCount"></span><button id="edCancel" class="link">Huỷ</button></div>
+  <textarea id="edText" spellcheck="true" placeholder="Viết hoặc dán nội dung vào đây (chạm giữ → Dán)..."></textarea>
+  <div class="edFoot"><span class="edTip">Sửa xong bấm Đồng ý — nội dung được đưa ngay vào ô Hỏi Claude.</span>
+    <button id="edSend">Đồng ý &amp; Gửi ➤</button><button id="edOk" class="primary">✓ Đồng ý</button></div>
+</dialog>
 
 <dialog id="sheet" class="sheet">
   <div class="sheetHead"><b id="sheetTitle"></b><button id="sheetClose" class="link">Đóng</button></div>

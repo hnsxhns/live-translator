@@ -69,7 +69,7 @@ class App {
     this.attachments = [];         // [[name, block]]
     this.panelSide = null;
     this.unread = false;
-    this.split = 0.75;             // EN/VI share of the height (Key takeaways = the rest)
+    this.split = App.savedSplit(); // EN/VI share of the height (Key takeaways / prompt box = the rest)
 
     const emit = (kind, val) => this.handle(kind, val);
     const key = () => this.apiKey;
@@ -272,6 +272,13 @@ class App {
     }, { passive: true });
     for (const d of [$("divider"), $("divider2")]) this.dragDivider(d);
     this.applySplit();
+    $("editPrompt").onclick = () => this.openEditor();
+    $("edOk").onclick = () => this.closeEditor(true);
+    $("edSend").onclick = () => { this.closeEditor(true); this.sendPrompt(); };
+    $("edCancel").onclick = () => this.closeEditor(false);
+    $("editor").addEventListener("cancel", (e) => { e.preventDefault(); this.closeEditor(false); });
+    $("edText").addEventListener("input", () => this.countEditor());
+    this.applySplit();
     this.refreshPanelBtn();
     document.addEventListener("visibilitychange", () => this.onVisibility());
   }
@@ -307,23 +314,77 @@ class App {
     s.className = "status " + kind;
   }
 
+  static DEFAULT_SPLIT = 0.75;
+
+  static savedSplit() {
+    try { const v = +localStorage.getItem("lt_split"); return v >= 0.08 && v <= 0.92 ? v : App.DEFAULT_SPLIT; } catch { return App.DEFAULT_SPLIT; }
+  }
+
+  /** The bars between the panes: drag with a finger to change the heights (the prompt box can grow upwards);
+   *  a double tap switches the lower box between its usual height and big. The height is remembered. */
   dragDivider(d) {
+    let lastTap = 0;
     d.addEventListener("pointerdown", (e) => {
-      d.setPointerCapture(e.pointerId);
+      e.preventDefault();
+      const now = performance.now();
+      if (now - lastTap < 320) {                                 // double tap
+        lastTap = 0;
+        this.split = this.split > 0.45 ? 0.3 : App.DEFAULT_SPLIT;
+        this.applySplit(true);
+        return;
+      }
+      lastTap = now;
+      try { d.setPointerCapture(e.pointerId); } catch { /* */ }
+      d.classList.add("dragging");
       const box = $("center").getBoundingClientRect();
       const move = (ev) => {
-        this.split = Math.min(0.9, Math.max(0.1, (ev.clientY - box.top) / box.height));
+        this.split = Math.min(0.92, Math.max(0.08, (ev.clientY - box.top) / box.height));
         this.applySplit();
       };
-      const up = () => { d.removeEventListener("pointermove", move); d.removeEventListener("pointerup", up); };
+      const up = () => {
+        d.classList.remove("dragging");
+        for (const [k, f] of [["pointermove", move], ["pointerup", up], ["pointercancel", up], ["lostpointercapture", up]]) d.removeEventListener(k, f);
+        this.applySplit(true);
+      };
       d.addEventListener("pointermove", move);
-      d.addEventListener("pointerup", up);
+      for (const k of ["pointerup", "pointercancel", "lostpointercapture"]) d.addEventListener(k, up);
     });
   }
 
-  applySplit() {
+  applySplit(save = false) {
     $("center").style.setProperty("--split", String(this.split));
     if (this.takeFollow) this.scrollEnd($("summary"));
+    if (save) { try { localStorage.setItem("lt_split", String(this.split.toFixed(3))); } catch { /* private mode */ } }
+  }
+
+  // ---- big editor for the prompt: read, paste and edit comfortably; "Đồng ý" puts it back in the box ----
+  openEditor() {
+    const t = $("edText");
+    t.value = $("prompt").value;
+    this.edStart = t.value;
+    this.countEditor();
+    $("editor").showModal();
+    t.focus({ preventScroll: true });
+    t.setSelectionRange(t.value.length, t.value.length);
+    t.scrollTop = t.scrollHeight;
+  }
+
+  countEditor() {
+    const v = $("edText").value, words = (v.match(/\S+/g) || []).length;
+    $("edCount").textContent = v ? `${words} từ · ${v.length} ký tự` : "";
+  }
+
+  closeEditor(keep) {
+    const t = $("edText");
+    if (!keep && t.value !== this.edStart && !confirm("Bỏ các thay đổi trong khung soạn?")) return;
+    if (keep) {
+      const p = $("prompt");
+      p.value = t.value;
+      p.dispatchEvent(new Event("input", { bubbles: true }));
+      p.scrollTop = p.scrollHeight;
+    }
+    $("editor").close();
+    if (keep) this.setStatus("✓ Đã cập nhật nội dung vào ô Hỏi Claude.", "ok");
   }
 
   // ---- Claude panel (same panel over the left or the right half) ----

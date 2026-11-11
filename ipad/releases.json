@@ -181,6 +181,19 @@
         "Hướng dẫn cấp quyền micro ghi đúng trình duyệt đang dùng (Safari, Chrome...). 🩺 Kiểm tra micro thử thêm cách thu âm mới và tự lưu cách chạy được.",
         "Từ bản 12: đủ tính năng Windows 1.9.1 (restore từng phần, hộp [cần điền], dòng \"đang làm việc\", sửa lỗi micro khi bật/tắt nhanh, gõ tiếng Việt)."
       ]
+    },
+    {
+      "version": "1.9.3",
+      "build": 14,
+      "channel": "beta",
+      "date": "2026-11-11",
+      "notes": [
+        "Mở file trong Learning nhanh hơn: PDF, Word (.docx), ảnh, file chữ, âm thanh/video mở NGAY trong app (không hỏi chọn app), có phóng to/thu nhỏ (nút − + hoặc chụm 2 ngón) và số trang.",
+        "Nút \"Mở bằng Sách / app khác\" trong khung xem; file Excel, PowerPoint, EPUB, Pages... đi thẳng tới danh sách app của iPad. File giờ mang đúng loại nên iPad liệt kê đủ app phù hợp (Sách cho PDF/EPUB, Word/Pages cho Word, Excel/Numbers cho bảng tính...).",
+        "Ô Hỏi Claude: nút ⤢ Sửa mở khung soạn lớn để đọc, dán và sửa; bấm Đồng ý là nội dung vào ngay ô Hỏi Claude (hoặc Đồng ý & Gửi).",
+        "Cạnh giữa khung Claude trả lời và ô Hỏi Claude dễ kéo bằng ngón tay hơn (vùng chạm to, sáng lên khi kéo), ô prompt cao được tới gần hết màn hình; chạm 2 lần vào cạnh: to/nhỏ. Độ cao được ghi nhớ.",
+        "Từ bản 13: micro tự thử 4 cách thu âm và nhớ cách chạy được; app không còn chờ/kẹt vì Whisper."
+      ]
     }
   ]
 }

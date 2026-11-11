@@ -75,7 +75,7 @@ export async function fileToBlock(file) {
 }
 
 // ---- minimal .zip reader (enough for .docx) ----
-async function unzipEntry(buf, wanted) {
+export async function unzipEntry(buf, wanted) {
   const v = new DataView(buf);
   let eocd = -1;
   for (let i = buf.byteLength - 22; i >= Math.max(0, buf.byteLength - 66000); i--) {

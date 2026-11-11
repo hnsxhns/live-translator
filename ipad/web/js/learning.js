@@ -11,6 +11,7 @@
 // Everything is stored on the iPad in IndexedDB "lt-learning" (library + copies of the original files).
 import { askJson, uploadFile, ClaudeError, friendlyError } from "./claude.js";
 import { fileToBlock, docxText } from "./files.js";
+import { openFile, shareFile, mimeOf } from "./viewer.js";
 
 const ROOT = new URL("../../../", import.meta.url).href;
 const PDFJS = ROOT + "lib/pdfjs-4.10.38/";
@@ -155,7 +156,7 @@ export class Library {
   async file(doc) {
     const blob = await idbGet("files", doc.id);
     if (!blob) throw new Error(`thiếu file ${doc.name}`);
-    return new File([blob], doc.name, { type: blob.type });
+    return new File([blob], doc.name, { type: mimeOf(doc.name, blob.type) });
   }
 
   async text(doc) { return (await idbGet("text", doc.id)) || ""; }
@@ -1081,42 +1082,12 @@ export async function solutionPdf(lib, session, summary) {
 }
 
 // ---------------- open / save / share a file on the iPad ----------------
-// Inside the TestFlight app: files go to the iOS share sheet (Save to Files, Mail, WhatsApp, AirDrop...)
-const NATIVE = typeof window !== "undefined" && window.LT_NATIVE && window.webkit?.messageHandlers?.lt;
-async function nativeShare(blob, name, text) {
-  const bytes = new Uint8Array(await blob.arrayBuffer());
-  let s = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-  window.webkit.messageHandlers.lt.postMessage({ type: "share", name, b64: btoa(s), text: text || "" });
-  return true;
-}
+// (viewer.js: the app viewer, and the iPad app list with the file's real type)
+/** Opens a file at once in the app viewer (PDF, Word, pictures, text...), else in the iPad app list. */
+export function openBlob(blob, name) { openFile(blob, name); }
 
-export function openBlob(blob, name) {
-  if (NATIVE) { nativeShare(blob, name); return; }
-  const url = URL.createObjectURL(blob);
-  const w = window.open(url, "_blank");
-  if (!w) shareBlob(blob, name);                         // pop-up blocked (home-screen app): share sheet
-  setTimeout(() => URL.revokeObjectURL(url), 120_000);
-}
-
-export async function shareBlob(blob, name, text) {
-  if (NATIVE) return nativeShare(blob, name, text);
-  const file = new File([blob], name, { type: blob.type || "application/octet-stream" });
-  try {
-    if (navigator.canShare?.({ files: [file] })) {
-      await navigator.share({ files: [file], ...(text ? { text } : {}) });   // "Lưu vào Tệp", Mail, WhatsApp...
-      return true;
-    }
-  } catch (e) {
-    if (e?.name === "AbortError") return false;
-  }
-  const a = el("a");
-  a.href = URL.createObjectURL(file);
-  a.download = name;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 60_000);
-  return true;
-}
+/** The iPad app list for a file (with its real type, so every app that can open it is listed). */
+export function shareBlob(blob, name, text) { return shareFile(blob, name, text); }
 
 // =====================================================================
 // UI
