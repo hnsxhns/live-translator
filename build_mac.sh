@@ -59,6 +59,8 @@ PLIST="$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :NSHighResolutionCapable bool true" "$PLIST" 2>/dev/null || true
 # The colors are designed for light mode: in Dark Mode, Tk turns default text white (on our white panes)
 /usr/libexec/PlistBuddy -c "Add :NSRequiresAquaSystemAppearance bool true" "$PLIST" 2>/dev/null || true
+# App Nap slows the timers of apps in the background: live text would lag while the user watches the lecture
+/usr/libexec/PlistBuddy -c "Add :NSAppSleepDisabled bool true" "$PLIST" 2>/dev/null || true
 # Why the app may ask (shown in macOS's permission prompts)
 setkey() { /usr/libexec/PlistBuddy -c "Add :$1 string '$2'" "$PLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :$1 '$2'" "$PLIST"; }
 setkey NSAppleEventsUsageDescription "Live Translator dùng Finder để chuyển file bạn xoá vào Thùng rác."

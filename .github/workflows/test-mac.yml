@@ -156,6 +156,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -uo pipefail
+          defaults write org.python.python NSAppSleepDisabled -bool YES   # same as the .app's Info.plist key
           .venv-mac/bin/python tests/mac_e2e_test.py shots A:a1.wav B:b1.wav A:a2.wav | tee e2e.log
           CODE=${PIPESTATUS[0]}
           .venv-mac/bin/python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"

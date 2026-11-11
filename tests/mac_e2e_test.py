@@ -112,7 +112,7 @@ class FakeInputStream:
                     block = np.pad(block, (0, self.bs - len(block)))
                 self.cb(block.reshape(-1, 1), self.bs, None, None)
                 pos += self.bs
-                time.sleep(self.bs / SR)
+                time.sleep(max(0.0, PLAY["start"] + pos / SR - time.time()))   # real time, no drift
         threading.Thread(target=play, daemon=True).start()
         return self
 

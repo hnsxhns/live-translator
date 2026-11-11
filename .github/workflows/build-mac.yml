@@ -80,6 +80,8 @@ jobs:
           ls "$A/Contents/Frameworks/pymupdf" >/dev/null && echo "pymupdf bundled" || { echo "pymupdf missing"; exit 1; }
           /usr/libexec/PlistBuddy -c "Print :NSRequiresAquaSystemAppearance" "$A/Contents/Info.plist" | grep -q true \
             && echo "light appearance key set" || { echo "NSRequiresAquaSystemAppearance missing"; exit 1; }
+          /usr/libexec/PlistBuddy -c "Print :NSAppSleepDisabled" "$A/Contents/Info.plist" | grep -q true \
+            && echo "App Nap disabled" || { echo "NSAppSleepDisabled missing"; exit 1; }
           mkdir -p shots
           # open it with the Mac in Dark Mode: the app must still show dark text on its light panes
           defaults write -g AppleInterfaceStyle Dark
