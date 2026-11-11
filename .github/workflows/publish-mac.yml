@@ -1,0 +1,56 @@
+# Publishes a tested Mac build as a public GitHub release, entirely on GitHub's servers
+# (nothing is downloaded to or uploaded from a local PC).
+# Trigger: push a tag like v1.9.2-mac. The .dmg comes from the newest successful "Build Mac app" run on
+# mac-portable whose artifact holds LiveTranslator_v<version>_mac.dmg (that run already installed and
+# opened the app; the "Test Mac app" workflow tested the same code). Release notes: release_notes/<tag>.md
+name: Publish Mac release
+
+on:
+  push:
+    tags: ["v*-mac"]
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find the tested build of this version
+        run: |
+          set -euo pipefail
+          VER="${TAG%-mac}"; VER="${VER#v}"
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          for id in $(gh run list -R "$GITHUB_REPOSITORY" --workflow build-mac.yml --branch mac-portable \
+                        --status success -L 20 --json databaseId -q '.[].databaseId'); do
+            rm -rf art && mkdir art
+            if gh run download "$id" -R "$GITHUB_REPOSITORY" -n LiveTranslator-mac -D art 2>/dev/null \
+               && [ -f "art/LiveTranslator_v${VER}_mac.dmg" ]; then
+              echo "using build run $id"; echo "RUN=$id" >> "$GITHUB_ENV"; break
+            fi
+          done
+          [ -f "art/LiveTranslator_v${VER}_mac.dmg" ] || { echo "no tested build with LiveTranslator_v${VER}_mac.dmg"; exit 1; }
+          ls -l art
+
+      - name: Zip and publish
+        run: |
+          set -euo pipefail
+          cd art
+          zip -0 -q "LiveTranslator_v${VER}_mac.zip" "LiveTranslator_v${VER}_mac.dmg"   # the .dmg is already compressed
+          unzip -tq "LiveTranslator_v${VER}_mac.zip"
+          SHA=$(sha256sum "LiveTranslator_v${VER}_mac.zip" | cut -d' ' -f1)
+          NOTES="../release_notes/${TAG}.md"
+          [ -f "$NOTES" ] || { echo "missing $NOTES"; exit 1; }
+          cp "$NOTES" notes.md
+          printf '\nBuild: GitHub Actions run %s\nSHA-256 (zip): `%s`\n' "$RUN" "$SHA" >> notes.md
+          gh release create "$TAG" "LiveTranslator_v${VER}_mac.zip" -R "$GITHUB_REPOSITORY" \
+            --title "Live Translator v${VER} (macOS)" --notes-file notes.md --latest --verify-tag
+          echo "## Published $TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/LiveTranslator_v${VER}_mac.zip" >> "$GITHUB_STEP_SUMMARY"
