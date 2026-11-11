@@ -673,6 +673,52 @@ def copy_file_to_clipboard(path):
     return True
 
 
+def to_recycle_bin(path):
+    """Move a file to the Recycle Bin (Windows) so a delete can be undone; elsewhere delete it. True if gone."""
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class SHFILEOPSTRUCTW(ctypes.Structure):
+            _fields_ = [("hwnd", wintypes.HWND), ("wFunc", wintypes.UINT), ("pFrom", wintypes.LPCWSTR),
+                        ("pTo", wintypes.LPCWSTR), ("fFlags", ctypes.c_ushort), ("fAnyOperationsAborted", wintypes.BOOL),
+                        ("hNameMappings", ctypes.c_void_p), ("lpszProgressTitle", wintypes.LPCWSTR)]
+        op = SHFILEOPSTRUCTW(None, 3, os.path.abspath(path) + "\0", None, 0x0040 | 0x0010 | 0x0004 | 0x0400,
+                             False, None, None)        # FO_DELETE; ALLOWUNDO | NOCONFIRMATION | SILENT | NOERRORUI
+        ctypes.WinDLL("shell32").SHFileOperationW(ctypes.byref(op))
+        return not os.path.exists(path)
+    if IS_MAC:
+        return _mac_trash(path)
+    try:
+        os.remove(path)
+    except OSError:
+        return False
+    return True
+
+
+def _mac_trash(path):
+    """Mac: move the file into the user's Trash (Finder can put it back). False if not possible;
+    the file is never deleted for good here."""
+    path = os.path.abspath(path)
+    trash = os.path.expanduser("~/.Trash")
+    try:
+        base, ext = os.path.splitext(os.path.basename(path))
+        dst, n = os.path.join(trash, base + ext), 1
+        while os.path.exists(dst):
+            n += 1
+            dst = os.path.join(trash, f"{base} {n}{ext}")
+        shutil.move(path, dst)
+        return not os.path.exists(path)
+    except OSError:
+        pass
+    try:                                                   # ask Finder (may ask once for permission)
+        subprocess.run(["osascript", "-e", f'tell application "Finder" to delete (POSIX file "{_applescript_path(path)}")'],
+                       capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return not os.path.exists(path)
+
+
 def _applescript_path(path):
     return path.replace("\\", "\\\\").replace('"', '\\"')
 
@@ -812,6 +858,23 @@ def known_file_plan(doc):
     if found and all(p.get("steps") for p in found):
         return doc.get("description", ""), parts_to_steps(found)
     return None
+
+
+def file_exercise(doc, goal, steps):
+    """The whole file as one exercise (sub-exercise by sub-exercise)."""
+    return {"title": doc.get("title") or doc["name"], "goal": goal, "day": doc.get("day") or 0,
+            "doc_ids": [doc["id"]], "steps": steps, "whole_file": True}
+
+
+def single_exercise(doc, title, goal, steps):
+    return {"title": title, "goal": goal, "day": doc.get("day") or 0, "doc_ids": [doc["id"]], "steps": steps}
+
+
+def exercise_key(ex):
+    """Identifies an exercise (its files, title and steps): saved progress belongs to it."""
+    raw = json.dumps([ex.get("title"), sorted(ex.get("doc_ids", [])), [s["title"] for s in ex.get("steps", [])]],
+                     ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def plan_file(lib, client, doc, known):
@@ -993,21 +1056,31 @@ def takeaways_pdf(out, history, title="Ý chính / Key takeaways"):
 
 EXERCISE_RULES = (
     "<exercise_rules>\n"
-    "You are guiding the learner through ONE step of a course exercise.\n"
-    "- If the step needs information only the learner can give (their own data, choices or parameters, or the "
-    "blanks of a template from the course book), do not invent it: ask for exactly those items as a short "
-    "numbered list, and end your answer with the line [[CẦN NHẬP: item 1 | item 2]] (item names in Vietnamese). "
-    "Finish the step when the learner answers.\n"
-    "- When the step needs a prompt (for an AI tool), give the complete ready-to-use prompt between a line "
-    "'----- PROMPT -----' and a line '----- HẾT PROMPT -----'. Copy the course book's template when it has one "
-    "and fill in what is known; for template blanks that need the learner's input, ask for them as above "
-    "instead of guessing.\n"
-    "- When the step is complete, end your answer with the line [[XONG BƯỚC]].\n"
-    "- Be concise. Reply in Vietnamese.\n"
+    "You guide the learner through ONE step of a course exercise. Be very brief: no long explanations.\n"
+    "1. If this step needs information only the learner can give (their own data, choices or parameters, or the "
+    "blanks of a template from the course book) and the message does not contain it yet, only ask for those "
+    "items as a short numbered list and end with the line [[CẦN NHẬP: item 1 | item 2]]. Do nothing else.\n"
+    "2. Otherwise do the step and give the result in a few lines. If the step needs a prompt for an AI tool, give "
+    "the complete prompt between a line '----- PROMPT -----' and a line '----- HẾT PROMPT -----' (copy the "
+    "course book's template when it has one, filled in with the learner's information).\n"
+    "3. Then one line: '➡ Mang sang bước sau: ...' with only what the next step needs from this result (very "
+    "short). Skip it at the last step.\n"
+    "4. If the next step (see <next_step>) will need information from the learner, end with the line "
+    "[[CẦN NHẬP TIẾP: item 1 | item 2]] (item names in Vietnamese).\n"
+    "5. Finish with the line [[XONG BƯỚC]].\n"
+    "Reply in Vietnamese.\n"
     "</exercise_rules>")
+OVERVIEW_RULES = (
+    "<overview_rules>\n"
+    "Summarize the exercise in 2-3 short lines (task, goal, expected result) — just enough to understand it. "
+    "Do not start any step. If the first step (see <next_step>) will need information from the learner, end "
+    "with the line [[CẦN NHẬP TIẾP: item 1 | item 2]] (item names in Vietnamese). Reply in Vietnamese.\n"
+    "</overview_rules>")
 MARKER = re.compile(r"\[\[\s*(?:CẦN NHẬP|CAN NHAP|XONG BƯỚC|XONG BUOC)[^\]]*\]\]", re.I)
 MARKER_TK = r"\[\[ *(CẦN NHẬP|CAN NHAP|XONG BƯỚC|XONG BUOC)[^]]*\]\]"      # the same, for Tk's text search
-NEEDS_INPUT = re.compile(r"\[\[\s*(?:CẦN NHẬP|CAN NHAP)\s*:?\s*([^\]]*)\]\]", re.I)
+NEEDS_INPUT = re.compile(r"\[\[\s*(?:CẦN NHẬP|CAN NHAP)(?!\s*TI)\s*:?\s*([^\]]*)\]\]", re.I)
+NEXT_INPUT = re.compile(r"\[\[\s*(?:CẦN NHẬP TIẾP|CAN NHAP TIEP)\s*:?\s*([^\]]*)\]\]", re.I)
+CARRY = re.compile(r"(?:➡\s*)?Mang sang bước sau\s*:\s*(.+)", re.I)
 DONE = re.compile(r"\[\[\s*(?:XONG BƯỚC|XONG BUOC)\s*\]\]", re.I)
 PROMPT_BLOCK = re.compile(r"-{3,} *PROMPT *-{3,} *\n(.*?)\n *-{3,} *HẾT PROMPT *-{3,}", re.S | re.I)
 PROMPT_END_TK = r"-{3,} *HẾT PROMPT *-{3,}"
@@ -1045,8 +1118,11 @@ def solution_pdf(lib, session, summary):
             if st.get("instruction"):
                 parts.append(f"<p class='instr'>{_html.escape(st['instruction'])}</p>")
         if item.get("input"):
+            filled = item["q"]
+            if "thông tin của tôi:" in item["q"].lower():           # only the lines the learner filled in
+                filled = item["q"][item["q"].lower().index("thông tin của tôi:") + len("thông tin của tôi:"):]
             parts.append(f"<p class='instr'><b>Thông tin của học viên:</b><br/>"
-                         f"{_html.escape(item['q']).replace(chr(10), '<br/>')}</p>")
+                         f"{_html.escape(filled.strip()).replace(chr(10), '<br/>')}</p>")
         parts.append(text_html(item["a"]))
     out = os.path.join(out_folder(lib, "solutions"),
                        f"LoiGiai_{safe_name(ex['title'])[:50]}_{time.strftime('%Y%m%d_%H%M')}.pdf")
@@ -1091,7 +1167,11 @@ class LearningUI:
         if self.lib.data.get("folder"):
             m.add_command(label="🔄  Refresh — tìm file mới, cập nhật dữ liệu", command=self.refresh,
                           state="disabled" if self.syncing else "normal")
-        m.add_command(label="🗓  Agenda — chương trình học", command=self.agenda, state=need)
+        if self.cached_agenda():
+            m.add_command(label="🗓  Agenda — chương trình học (đã lưu, mở ngay)", command=self.agenda, state=need)
+            m.add_command(label="      🔄  Tạo lại Agenda", command=lambda: self.agenda(fresh=True), state=need)
+        else:
+            m.add_command(label="🗓  Agenda — chương trình học", command=self.agenda, state=need)
         m.add_command(label="📚  Documents — danh sách tài liệu", command=self.documents, state=need)
         m.add_command(label="📝  Summary — tổng kết buổi học", command=self.summary, state=need)
         m.add_command(label="✏  Exercises — bài tập, giải theo từng bước", command=self.exercises, state=need)
@@ -1106,6 +1186,9 @@ class LearningUI:
         m.add_command(label="📂  Output Folder — " + (f"…{out[-38:]}" if len(out) > 40 else out or
                                                      "chọn nơi lưu backup & kết quả"),
                       command=self.mw.choose_output_folder)
+        n_out = len(self.lib.data.get("outputs", []))
+        m.add_command(label="📋  List output files — các file đã tạo" + (f" ({n_out})" if n_out else ""),
+                      command=self.list_outputs)
         b = anchor or self.button
         m.update_idletasks()
         try:
@@ -1119,6 +1202,7 @@ class LearningUI:
         p = self.mw.prompt
         p.delete("1.0", "end")
         p.insert("end", text)
+        job["prompt"] = text                # to know later whether the user edited it before sending
         self.job = job
         self.mw._refresh_attach_bar()
         if not self.mw.panel_open:
@@ -1200,7 +1284,57 @@ class LearningUI:
         threading.Thread(target=work, daemon=True).start()
 
     # ---- Agenda ----
-    def agenda(self):
+    def agenda_key(self):
+        """Changes when the library's content changes (files added/removed, days/dates/titles re-catalogued):
+        the saved agenda is then out of date. A Refresh that finds nothing new keeps it."""
+        parts = sorted(f"{d['id']}:{d.get('day')}:{d.get('date')}:{d.get('kind')}:{d.get('title')}"
+                       for d in self.lib.docs())
+        return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()[:16]
+
+    # ---- saved answers: Agenda, "ask about this document", book-only summaries ----
+    def saved_answer(self, name, key):
+        """A saved answer if it is still valid for `key` (changes when what the answer depends on changes)."""
+        c = (self.lib.data.get("answers") or {}).get(name)
+        return c if c and c.get("key") == key and c.get("text") else None
+
+    def save_answer(self, name, key, text):
+        with self.lib.lock:
+            self.lib.data.setdefault("answers", {})[name] = {"key": key, "text": text,
+                                                             "time": time.strftime("%d/%m %H:%M")}
+        self.lib.save()
+
+    def show_saved(self, title, c, redo_hint):
+        """Show a saved answer in the answers pane at once (no Claude call); file names stay links."""
+        w = self.mw.chat
+        w.configure(state="normal")
+        if w.index("end-1c") != "1.0":
+            w.insert("end", "\n\n")
+        w.insert("end", f"🎓 {title} ", "who")
+        w.insert("end", f"(đã lưu lúc {c['time']} — {redo_hint})\n", "file")
+        w.mark_set("answer_start", "end-1c")
+        w.mark_gravity("answer_start", "left")
+        w.insert("end", c["text"])
+        w.see("end")
+        w.configure(state="disabled")
+        try:
+            self.linkify()
+        except tk.TclError:
+            pass
+        if not self.mw.panel_open:
+            self.mw.toggle_panel("right")
+        # Claude can still answer follow-up questions about it
+        q = f"{title} (đã lưu)"
+        self.mw.chatter.history += [{"role": "user", "content": q}, {"role": "assistant", "content": c["text"]}]
+        self.mw.chat_log.append({"q": q, "files": [], "a": c["text"]})
+
+    def cached_agenda(self):
+        return self.saved_answer("agenda", self.agenda_key())
+
+    def agenda(self, fresh=False):
+        cached = None if fresh else self.cached_agenda()
+        if cached:
+            self.show_saved("Agenda", cached, "muốn tạo lại: menu Learning → 🔄 Tạo lại Agenda")
+            return
         docs = self.lib.docs()
         ids = [d["id"] for d in docs if d.get("kind") == "agenda"]
         # the first part of every document (cover page: title, teacher, date, session) helps place it in the agenda
@@ -1218,6 +1352,7 @@ class LearningUI:
             "    • Phiên 1 · 08:30–10:00 · Chủ đề — GV: Tên giảng viên\n"
             "        📄 Ten_file.pdf",
             {"kind": "agenda", "doc_ids": ids, "label": f"Agenda chi tiết · {len(docs)} tài liệu",
+             "save_as": ("agenda", self.agenda_key()),
              "blocks": [{"type": "text", "text": f"<document_heads>\n{heads}\n</document_heads>"}] if heads else []})
 
     # ---- file names in Claude's answers become links ----
@@ -1289,6 +1424,9 @@ class LearningUI:
         day_var.trace_add("write", day_changed)
         day_changed()
         result = []
+        fresh = tk.BooleanVar(value=False)
+        tk.Checkbutton(top, text="Tạo mới (không dùng bản tổng kết đã lưu)", variable=fresh, bg="white",
+                       font=(A.UI_FONT, 9)).pack(anchor="w", padx=14)
 
         def ok():
             if not tree.selection():
@@ -1301,6 +1439,13 @@ class LearningUI:
         if not result:
             return
         di, ids, m = result[0]
+        # a book-only summary depends only on the chosen files: reuse it (with the teacher it changes live)
+        name = "summary:" + ",".join(sorted(ids)) + f":{di}"
+        if m == "book" and not fresh.get():
+            saved = self.saved_answer(name, "v1")
+            if saved:
+                self.show_saved("Summary (theo sách)", saved, "muốn tạo mới: Summary → tích \"Tạo mới\"")
+                return
         chosen = [self.lib.get(i) for i in ids]
         names = "; ".join(f"\"{d.get('title') or d['name']}\" ({d['name']})" for d in chosen)
         when = ""
@@ -1316,7 +1461,8 @@ class LearningUI:
                     "mạnh hoặc bổ sung. Gồm: các ý chính, khái niệm quan trọng, ví dụ, bài tập đã giao và những "
                     "điểm cần ghi nhớ.")
         self.set_prompt(text, {"kind": "summary", "doc_ids": ids, "label": (
-            f"Summary · {when + ' · ' if when else ''}{'Sách' if m == 'book' else 'Sách + thầy giảng'} · {len(ids)} file")})
+            f"Summary · {when + ' · ' if when else ''}{'Sách' if m == 'book' else 'Sách + thầy giảng'} · {len(ids)} file"),
+            **({"save_as": (name, "v1")} if m == "book" else {})})
 
     def pick_day(self, title, with_mode=False):
         """Small dialog: choose the course day. Returns (day, date, docs, mode) or None."""
@@ -1430,13 +1576,40 @@ class LearningUI:
             show_status()
             refresh_btn.config(state="disabled" if busy["scan"] else "normal")
 
+        def prepare(it):
+            """Start working out the steps in the background as soon as an item is selected, so that
+            ▶ Bắt đầu shows the first prompt at once (the result is saved for next time too)."""
+            if it["kind"] == "file" and it["exs"] and not known_file_plan(it["doc"]):
+                d = it["doc"]
+                self.prefetch(f"file:{d['id']}",
+                              lambda: plan_file(self.lib, self.mw.client, d, [e["title"] for e in it["exs"]]))
+            elif it["kind"] == "ex" and not it["ex"].get("steps"):
+                d, e = it["doc"], it["ex"]
+                if not (d.get("plans") or {}).get(e["title"]):
+                    self.prefetch(f"ex:{d['id']}:{e['title']}", lambda: plan_steps(self.lib, self.mw.client, {
+                        "title": e["title"], "summary": e.get("goal", ""), "location": e.get("location", ""),
+                        "doc": d}))
+
+        def progress_note(ex):
+            saved = (self.lib.data.get("sessions") or {}).get(exercise_key(ex))
+            if saved and not saved.get("done") and saved.get("i", -1) >= 0:
+                return f"\n\n⏸ Đang làm dở: đã xong {saved['i']}/{len(ex['steps'])} bước — Bắt đầu sẽ làm tiếp."
+            if saved and saved.get("done"):
+                return "\n\n✓ Đã làm xong bài này trước đây (Bắt đầu sẽ làm lại, tóm tắt bài lấy từ bản đã lưu)."
+            return ""
+
         def on_select(*_):
             detail.delete("1.0", "end")
             if not tree.selection():
                 return
             it = items[tree.selection()[0]]
+            if it["kind"] != "big":
+                prepare(it)
             if it["kind"] == "file":
                 d, exs = it["doc"], it["exs"]
+                kp = known_file_plan(d)
+                if kp:
+                    detail.insert("end", progress_note(file_exercise(d, kp[0], kp[1])).strip() + "\n")
                 tree.item(tree.selection()[0], open=True)
                 detail.insert("end", f"{d.get('description', '')}\n\n" + (
                     "Bài tập trong file:\n" + "\n".join(f"  • {e['title']}" for e in exs) if exs else
@@ -1448,8 +1621,11 @@ class LearningUI:
                 if ex.get("steps"):
                     detail.insert("end", "\n\n" + "\n".join(
                         f"{k}. {s['title']} — {s['instruction']}" for k, s in enumerate(ex["steps"], 1)))
+                    full_ex = ex if it["kind"] == "big" else single_exercise(it["doc"], ex["title"],
+                                                                              ex.get("goal", ""), ex["steps"])
+                    detail.insert("end", progress_note(full_ex))
                 else:
-                    detail.insert("end", "\n\n(Claude sẽ chia bài thành các bước khi bắt đầu.)")
+                    detail.insert("end", "\n\n(Đang chuẩn bị các bước ở chế độ nền...)")
 
         def refresh():
             busy["scan"] = True
@@ -1476,54 +1652,56 @@ class LearningUI:
             if not tree.selection():
                 return
             it = items[tree.selection()[0]]
+            redo = restart.get()
             if it["kind"] == "big":
                 top.destroy()
-                self.start_session(it["ex"])
+                self.start_session(it["ex"], restart=redo)
                 return
             d = it["doc"]
             if it["kind"] == "ex" and it["ex"].get("steps"):
                 ex = it["ex"]
                 top.destroy()
-                self.start_session({"title": ex["title"], "goal": ex.get("goal", ""), "day": d.get("day") or 0,
-                                    "doc_ids": [d["id"]], "steps": ex["steps"]})
+                self.start_session(single_exercise(d, ex["title"], ex.get("goal", ""), ex["steps"]), restart=redo)
                 return
             top.destroy()                  # close right away: progress shows in the Claude pane
             if it["kind"] == "file":       # the whole file: one big problem, sub-exercise by sub-exercise
-                title = d.get("title") or d["name"]
+                prep = f"file:{d['id']}"
                 known = known_file_plan(d)
-                if known:                  # steps already known: the first prompt appears at once
-                    self.start_session({"title": title, "goal": known[0], "day": d.get("day") or 0,
-                                        "doc_ids": [d["id"]], "steps": known[1], "whole_file": True})
+                if known:                  # steps already known (saved): the first prompt appears at once
+                    self.start_session(file_exercise(d, known[0], known[1]), restart=redo)
                     return
-                self.chat_note(f"Claude đang đọc file \"{d['name']}\" để lập các bài tập con và các bước... "
+                self.chat_note(f"Đang chuẩn bị các bài tập con và các bước của file \"{d['name']}\"... "
                                "Câu prompt đầu tiên sẽ hiện trong ô nhập khi xong.")
 
                 def plan():
-                    goal, steps = plan_file(self.lib, self.mw.client, d, [e["title"] for e in it["exs"]])
+                    self.wait_prefetch(prep)          # it may already be on its way since the file was selected
+                    known = known_file_plan(d)
+                    goal, steps = known if known else plan_file(self.lib, self.mw.client, d,
+                                                                [e["title"] for e in it["exs"]])
                     if not steps:
                         raise ValueError("Claude không tìm thấy bài tập trong file")
-                    return {"title": title, "goal": goal, "day": d.get("day") or 0, "doc_ids": [d["id"]],
-                            "steps": steps, "whole_file": True}
+                    return file_exercise(d, goal, steps)
             else:
+                prep = f"ex:{d['id']}:{it['ex']['title']}"
                 ex = {"title": it["ex"]["title"], "summary": it["ex"].get("goal", ""),
                       "location": it["ex"].get("location", ""), "doc": d}
                 if not (d.get("plans") or {}).get(ex["title"]):
-                    self.chat_note(f"Claude đang chia bài \"{ex['title']}\" thành các bước... "
+                    self.chat_note(f"Đang chia bài \"{ex['title']}\" thành các bước... "
                                    "Câu prompt đầu tiên sẽ hiện trong ô nhập khi xong.")
 
                 def plan():
-                    steps = plan_steps(self.lib, self.mw.client, ex)
+                    self.wait_prefetch(prep)
+                    steps = plan_steps(self.lib, self.mw.client, ex)      # uses the saved steps if any
                     if not steps:
                         raise ValueError("Claude không trả về các bước")
-                    return {"title": ex["title"], "goal": ex.get("summary", ""), "day": d.get("day") or 0,
-                            "doc_ids": [d["id"]], "steps": steps}
+                    return single_exercise(d, ex["title"], ex.get("summary", ""), steps)
             self.mw.status.config(text="🎓 Đang chuẩn bị bài tập...", fg="#ddd")
 
             def work():
                 try:
                     sess = plan()
                     self.later(lambda: (self.mw.status.config(text="🎓 Bài tập đã sẵn sàng", fg="#7ee2a8"),
-                                        self.start_session(sess)))
+                                        self.start_session(sess, restart=redo)))
                 except Exception as e:  # noqa: BLE001
                     why = A.friendly_error(e) if isinstance(e, anthropic.APIError) or "timed out" in str(e) \
                         else str(e)
@@ -1534,6 +1712,9 @@ class LearningUI:
         refresh_btn = tk.Button(btns, text="🔄 Refresh danh sách", command=refresh, bg="#eee", **st)
         refresh_btn.pack(side="left")
         tk.Checkbutton(btns, text="Đọc lại toàn bộ file", variable=full, bg="white",
+                       font=(A.UI_FONT, 9)).pack(side="left", padx=6)
+        restart = tk.BooleanVar(value=False)
+        tk.Checkbutton(btns, text="Làm lại từ đầu", variable=restart, bg="white",
                        font=(A.UI_FONT, 9)).pack(side="left", padx=6)
         tk.Button(btns, text="Đóng", command=top.destroy, bg="#eee", **st).pack(side="right")
         start_btn = tk.Button(btns, text="▶ Bắt đầu bài tập", command=start, bg="#d97757", fg="white",
@@ -1548,9 +1729,64 @@ class LearningUI:
 
     # ---- guided exercise: short overview, then one prompt per step (asking the learner for inputs when needed,
     # giving ready-to-use prompts), then the solution summary + PDF ----
-    def start_session(self, ex):
-        self.session = {"ex": ex, "i": -1, "log": [], "overview": ""}      # i = -1: the short overview first
+    # background preparation of exercise steps (started when an item is selected in the Exercises list)
+    def prefetch(self, key, fn):
+        jobs = self.__dict__.setdefault("_prep", {})
+        if key in jobs:
+            return
+        done = threading.Event()
+        jobs[key] = done
+
+        def work():
+            try:
+                fn()
+            except Exception:  # noqa: BLE001  (▶ Bắt đầu tries again and shows the error)
+                pass
+            finally:
+                done.set()
+                jobs.pop(key, None)
+        threading.Thread(target=work, daemon=True).start()
+
+    def wait_prefetch(self, key):
+        done = self.__dict__.get("_prep", {}).get(key)
+        if done:
+            done.wait(330)
+
+    def save_session(self, done=False):
+        """Keep the exercise's progress (steps done, answers, overview) so it can be resumed later."""
+        s = self.session
+        if not s:
+            return
+        with self.lib.lock:
+            self.lib.data.setdefault("sessions", {})[s["key"]] = {
+                "ex": s["ex"], "i": s["i"], "log": s["log"], "overview": s.get("overview", ""),
+                "awaiting": s.get("awaiting"), "carry": s.get("carry"), "next_inputs": s.get("next_inputs"),
+                "done": done, "time": time.strftime("%d/%m %H:%M")}
+        self.lib.save()
+
+    def start_session(self, ex, restart=False):
+        key = exercise_key(ex)
+        saved = (self.lib.data.get("sessions") or {}).get(key) or {}
         steps = ex["steps"]
+        if saved and not restart and not saved.get("done") and saved.get("i", -1) >= 0:
+            # an exercise opened before: carry on where it stopped
+            self.session = {"ex": ex, "i": min(saved["i"], len(steps)), "log": saved.get("log", []),
+                            "overview": saved.get("overview", ""), "key": key, "resume": True}
+            for k in ("awaiting", "carry", "next_inputs"):
+                if saved.get(k):
+                    self.session[k] = saved[k]
+            k = self.session["i"]
+            self.chat_note(f"Tiếp tục bài \"{ex['title']}\" (đã lưu lúc {saved.get('time', '')}): đã xong {k}/"
+                           f"{len(steps)} bước. Muốn làm lại từ đầu: Exercises → tích \"Làm lại từ đầu\"."
+                           + (f"\nTóm tắt bài:\n{self.session['overview']}" if self.session["overview"] else ""))
+            if k >= len(steps):
+                self.summary_prompt(send=False)
+            elif self.session.get("awaiting"):
+                self.prompt_inputs(self.session["awaiting"])
+            else:
+                self.prompt_step()
+            return
+        self.session = {"ex": ex, "i": -1, "log": [], "overview": "", "key": key}   # i = -1: the overview first
         if steps and steps[0].get("part"):
             lines = [f"  Bài {st['part']}/{st['parts']}: {st['part_title']} ({st['psteps']} bước)"
                      for st in steps if st["pstep"] == 1]
@@ -1559,12 +1795,32 @@ class LearningUI:
         else:
             self.chat_note(f"Bắt đầu bài tập \"{ex['title']}\" — {len(steps)} bước:\n" + "\n".join(
                 f"  {k}. {s['title']}" for k, s in enumerate(steps, 1)))
+        if saved.get("overview"):                          # the overview was written before: no need to ask again
+            self.session.update(overview=saved["overview"], i=0)
+            self.chat_note(f"Tóm tắt bài (đã lưu):\n{saved['overview']}")
+            self.save_session()
+            self.prompt_step()
+            return
+        self.save_session()
         self.prompt_step()
         self.root.after(300, self.mw.send_prompt)          # the overview is asked for right away
 
+    def _resume_blocks(self):
+        """After a resume Claude has not seen the earlier steps: give it a short recap (with the documents)."""
+        s = self.session
+        if not s.get("resume"):
+            return []
+        recap = [f"Tóm tắt bài: {s.get('overview', '')}"] + [
+            f"[{self._step_name(e['i'])}: {e['step']['title']}]"
+            + (f"\nThông tin của học viên: {e['q']}" if e.get("input") else "") + f"\nKết quả: {e['a'][:1500]}"
+            for e in s["log"]]
+        return [{"type": "text", "text": "<previous_steps>\n" + "\n\n".join(recap) + "\n</previous_steps>"}]
+
     def stop_session(self):
         if self.session:
-            self.chat_note(f"Đã dừng bài tập \"{self.session['ex']['title']}\".")
+            self.save_session()
+            self.chat_note(f"Đã dừng bài tập \"{self.session['ex']['title']}\" — tiến độ đã được lưu, "
+                           "mở lại bài này trong Exercises để làm tiếp.")
         self.session = None
         if self.job and self.job["kind"] in ("exstep", "exsummary"):
             self.job = None
@@ -1578,55 +1834,71 @@ class LearningUI:
             return f"Bài {st['part']}/{st['parts']} · Bước {st['pstep']}/{st['psteps']}"
         return f"Bước {i + 1}/{len(ex['steps'])}"
 
+    def _next_step_block(self, i):
+        """Tells Claude what the next step is, so it can say what to carry over and what to ask the learner."""
+        steps = self.session["ex"]["steps"]
+        if i + 1 >= len(steps):
+            return {"type": "text", "text": "<next_step>(không còn — đây là bước cuối)</next_step>"}
+        st = steps[i + 1]
+        return {"type": "text", "text": f"<next_step>{self._step_name(i + 1)}: {st['title']} — "
+                                        f"{st['instruction']}</next_step>"}
+
     def prompt_step(self):
         s = self.session
         ex, i = s["ex"], s["i"]
-        n = len(ex["steps"])
-        rules = {"type": "text", "text": EXERCISE_RULES}
-        if i < 0:
-            plan = "\n".join(f"{k}. {st['title']}" for k, st in enumerate(ex["steps"], 1))
-            text = (f"Bài tập \"{ex['title']}\": hãy tóm tắt thật ngắn gọn (3-5 dòng) đề bài, mục tiêu, kết quả cần "
-                    f"đạt và các bước chính. Chưa làm bước nào.\nCác bước dự kiến:\n{plan}")
-            self.set_prompt(text, {"kind": "exstep", "step": -1, "doc_ids": ex.get("doc_ids", []),
-                                   "label": f"Bài tập · Tóm tắt · {ex['title'][:30]}"})
+        if i < 0:                                          # a 2-3 line overview first
+            self.set_prompt(
+                f"Bài tập \"{ex['title']}\": tóm tắt rất ngắn (2-3 dòng) đề bài, mục tiêu và kết quả cần có.",
+                {"kind": "exstep", "step": -1, "doc_ids": ex.get("doc_ids", []),
+                 "label": f"Bài tập · Tóm tắt · {ex['title'][:30]}",
+                 "blocks": [{"type": "text", "text": OVERVIEW_RULES}, self._next_step_block(-1)]})
             return
         step = ex["steps"][i]
-        do = ("Hãy cùng tôi thực hiện bước này: nói ngắn gọn cần làm gì, rồi làm/giải chi tiết dựa trên tài liệu; "
-              "nếu cần thông tin của tôi thì hỏi rõ; nếu bước cần một prompt thì đưa luôn prompt hoàn chỉnh. "
-              "Chỉ làm bước này.")
         new_part = bool(step.get("part")) and step["pstep"] == 1
+        head = f"{self._step_name(i)}"
         if step.get("part"):
-            text = (f"Bài toán \"{ex['title']}\" — Bài {step['part']}/{step['parts']}: {step['part_title']} — "
-                    f"Bước {step['pstep']}/{step['psteps']}: {step['title']}.\n"
-                    + (f"Mục tiêu bài này: {step['part_goal']}\n" if new_part and step.get("part_goal") else "")
-                    + f"{step['instruction']}\n{do} Dùng kết quả của các bài/bước trước nếu cần.")
-            label = f"{self._step_name(i)} · {step['part_title'][:25]}"
-        else:
-            text = f"Bài tập \"{ex['title']}\" — Bước {i + 1}/{n}: {step['title']}.\n{step['instruction']}\n{do}"
-            label = f"Bài tập · {self._step_name(i)} · {ex['title'][:30]}"
+            head = f"{step['part_title']} — {head}"
+        lines = [f"{head}: {step['title']}.", step["instruction"]]
+        if new_part and step.get("part_goal"):
+            lines.append(f"Mục tiêu bài này: {step['part_goal']}")
+        if s.get("carry"):
+            lines.append(f"Mang sang từ bước trước: {s['carry']}")
+        if s.get("next_inputs"):                           # Claude said this step needs the learner's information
+            lines.append("Thông tin của tôi:")
+            lines += [f"• {f.strip()}: " for f in s["next_inputs"]]
+        label = (f"{self._step_name(i)} · {step['part_title'][:25]}" if step.get("part")
+                 else f"Bài tập · {self._step_name(i)} · {ex['title'][:30]}")
+        if s.get("next_inputs"):
+            label += " · điền thông tin"
+            self.mw.status.config(text="🎓 Điền thông tin vào mẫu trong ô nhập rồi gửi.", fg="#ffd479")
         # the documents go again with each new sub-exercise and now and then, so they stay in Claude's recent
         # history (the overview already sent them)
-        ids = ex.get("doc_ids", []) if i > 0 and (i % 6 == 0 or new_part) else []
-        self.set_prompt(text, {"kind": "exstep", "step": i, "doc_ids": ids, "label": label, "blocks": [rules]})
+        ids = ex.get("doc_ids", []) if (i > 0 and (i % 6 == 0 or new_part)) or s.get("resume") else []
+        self.set_prompt("\n".join(lines), {
+            "kind": "exstep", "step": i, "doc_ids": ids, "label": label, "input": bool(s.get("next_inputs")),
+            "blocks": [{"type": "text", "text": EXERCISE_RULES}, self._next_step_block(i)] + self._resume_blocks()})
 
     def prompt_inputs(self, fields):
         """Claude asked for the learner's own information: a fill-in form in the prompt box."""
         s = self.session
         i = s["i"]
         text = f"{self._step_name(i)} — thông tin của tôi:\n" + "\n".join(f"• {f.strip()}: " for f in fields)
-        self.set_prompt(text, {"kind": "exstep", "step": i, "input": True, "blocks": [
-            {"type": "text", "text": EXERCISE_RULES}], "label": f"{self._step_name(i)} · nhập thông tin"})
-        self.mw.status.config(text="🎓 Claude cần thông tin của bạn — điền vào ô nhập rồi gửi.", fg="#ffd479")
+        self.set_prompt(text, {"kind": "exstep", "step": i, "input": True,
+                               "doc_ids": s["ex"].get("doc_ids", []) if s.get("resume") else [],
+                               "blocks": [{"type": "text", "text": EXERCISE_RULES}, self._next_step_block(i)]
+                               + self._resume_blocks(),
+                               "label": f"{self._step_name(i)} · điền thông tin"})
+        self.mw.status.config(text="🎓 Claude cần thông tin của bạn — điền vào mẫu trong ô nhập rồi gửi.",
+                              fg="#ffd479")
 
     def summary_prompt(self, send=True):
         ex = self.session["ex"]
         self.set_prompt(
-            f"Đã xong tất cả {len(ex['steps'])} bước của bài tập \"{ex['title']}\". Hãy viết phần tổng kết lời giải: "
-            "đề bài và mục tiêu, kết quả cuối cùng, tóm tắt lời giải theo từng "
-            + ("bài tập con (mỗi bài vài dòng, nêu kết quả và cách các bài nối với nhau)" if ex.get("whole_file")
-               else "bước (mỗi bước 1-3 dòng)") + ", các prompt đã dùng, các kiến thức quan trọng cần nhớ và lỗi "
-            "thường gặp.",
-            {"kind": "exsummary", "label": f"Tổng kết lời giải · {ex['title'][:30]}"})
+            f"Đã xong {len(ex['steps'])} bước của bài tập \"{ex['title']}\". Tổng hợp ngắn gọn (tối đa 8 dòng): kết "
+            "quả cuối cùng, kết quả/prompt chính của từng "
+            + ("bài tập con" if ex.get("whole_file") else "bước") + " (mỗi mục 1 dòng) và 2-3 điều cần nhớ.",
+            {"kind": "exsummary", "label": f"Tổng kết lời giải · {ex['title'][:30]}",
+             "blocks": self._resume_blocks()})
         if send:
             self.root.after(300, self.mw.send_prompt)      # sent right away
 
@@ -1683,6 +1955,10 @@ class LearningUI:
             self.tidy_answer(turn)
         except tk.TclError:
             pass
+        # save the answer of a Learning prompt that can be reused (only if it was sent as the app wrote it)
+        if job and job.get("save_as") and ok and (turn or {}).get("a", "").strip() and \
+                " ".join(turn.get("q", "").split()) == " ".join(job.get("prompt", "").split()):
+            self.save_answer(job["save_as"][0], job["save_as"][1], turn["a"].strip())
         s = self.session
         if not s:
             return
@@ -1690,9 +1966,13 @@ class LearningUI:
         answer = (turn or {}).get("a", "").strip()
         kind = job["kind"] if job else None
         if kind == "exstep" and job.get("step") == s["i"] and ok and answer:
+            s.pop("resume", None)                           # Claude has the context again from here on
+            nxt = NEXT_INPUT.search(raw)
             if s["i"] < 0:                                  # the overview
                 s["overview"] = answer
+                s["next_inputs"] = [f for f in nxt.group(1).split("|") if f.strip()] if nxt else None
                 s["i"] = 0
+                self.save_session()
                 self.prompt_step()
                 return
             s["log"].append({"i": s["i"], "step": steps[s["i"]], "q": turn.get("q", ""), "a": answer,
@@ -1700,10 +1980,15 @@ class LearningUI:
             ask = NEEDS_INPUT.search(raw)
             if ask and not DONE.search(raw):                # Claude needs the learner's information first
                 s["awaiting"] = [f for f in ask.group(1).split("|") if f.strip()] or ["thông tin"]
+                self.save_session()
                 self.prompt_inputs(s["awaiting"])
                 return
             s.pop("awaiting", None)
+            carry = CARRY.search(MARKER.sub("", raw))
+            s["carry"] = carry.group(1).strip() if carry else None
+            s["next_inputs"] = [f for f in nxt.group(1).split("|") if f.strip()] if nxt else None
             s["i"] += 1
+            self.save_session()
             if s["i"] < len(steps):
                 self.prompt_step()                          # next step's prompt, ready to send
             else:
@@ -1711,10 +1996,14 @@ class LearningUI:
         elif kind == "exsummary" and ok and answer:
             try:
                 out = solution_pdf(self.lib, s, answer)
-                self.chat_note(f"Hoàn thành bài tập \"{s['ex']['title']}\". File PDF lời giải:\n")
+                self.add_output("solution", out, f"Lời giải: {s['ex']['title']}", day=s["ex"].get("day", 0),
+                                detail=f"{len(s['ex']['steps'])} bước")
+                self.chat_note(f"Hoàn thành bài tập \"{s['ex']['title']}\". File PDF lời giải (cũng có trong "
+                               "📋 List output files):\n")
                 self.file_links(out, "Lưu lời giải")
             except Exception as e:  # noqa: BLE001
                 self.chat_note(f"Chưa tạo được file PDF lời giải: {e}", "err")
+            self.save_session(done=True)
             self.session = None
         elif s["i"] < 0:
             self.prompt_step()
@@ -1725,6 +2014,196 @@ class LearningUI:
                 self.prompt_step()                          # a side question or an error: same step again
         else:
             self.summary_prompt(send=False)
+
+    # ---- List output files: every file the app created, with clear descriptions, sortable, open/save/delete ----
+    OUT_KINDS = {"takeaways": ("📄", "Ý chính (Key takeaways)"), "journal": ("📓", "Nhật ký buổi học"),
+                 "solution": ("✏", "Lời giải bài tập"), "backup": ("💾", "Backup phiên nghe")}
+    OUT_PREFIX = (("KeyTakeaways_", "takeaways"), ("NhatKy_", "journal"), ("LoiGiai_", "solution"),
+                  ("LiveTranslator_backup_", "backup"))
+    OUT_SORTS = (("new", "Mới nhất trước"), ("old", "Cũ nhất trước"), ("kind", "Theo loại file"),
+                 ("name", "Theo tên (A → Z)"), ("day", "Theo buổi học"), ("size", "Theo dung lượng"))
+
+    def add_output(self, kind, path, title, detail="", day=0):
+        """Record a file the app just created, so it shows in List output files."""
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return
+        key = os.path.normcase(os.path.abspath(path))
+        entry = {"path": os.path.abspath(path), "kind": kind, "title": title, "detail": detail, "day": day or 0,
+                 "created": time.strftime("%Y-%m-%d %H:%M:%S"), "size": size}
+        with self.lib.lock:
+            outs = [o for o in self.lib.data.get("outputs", []) if os.path.normcase(o["path"]) != key]
+            self.lib.data["outputs"] = outs + [entry]
+        self.lib.save()
+
+    def adopt_outputs(self):
+        """Add files made earlier (or before this list existed) from the output folders; drop deleted ones."""
+        folders = [os.path.join(self.lib.dir, "journals"), os.path.join(self.lib.dir, "solutions")]
+        for sub in ("Outputs", "Backup"):
+            d = A.output_dir(sub) if hasattr(A, "output_dir") else None
+            if d:
+                folders.append(d)
+        with self.lib.lock:
+            outs = [o for o in self.lib.data.get("outputs", []) if os.path.exists(o["path"])]
+            known = {os.path.normcase(o["path"]) for o in outs}
+            for folder in folders:
+                try:
+                    names = os.listdir(folder)
+                except OSError:
+                    continue
+                for name in names:
+                    path = os.path.join(folder, name)
+                    kind = next((k for p, k in self.OUT_PREFIX if name.startswith(p)), None)
+                    if not kind or os.path.normcase(path) in known or not os.path.isfile(path):
+                        continue
+                    what = re.sub(r"_\d{8}_\d{4}\.(pdf|json)$", "", name)
+                    what = re.sub(r"^(KeyTakeaways|NhatKy_|LoiGiai_|LiveTranslator_backup)_?", "", what).replace("_", " ")
+                    title = {"takeaways": "Ý chính phiên nghe", "backup": "Backup phiên nghe",
+                             "journal": f"Nhật ký: {what}", "solution": f"Lời giải: {what}"}[kind]
+                    st = os.stat(path)
+                    outs.append({"path": path, "kind": kind, "title": title.strip(": "), "detail": "", "day": 0,
+                                 "created": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)),
+                                 "size": st.st_size})
+                    known.add(os.path.normcase(path))
+            self.lib.data["outputs"] = outs
+        self.lib.save()
+
+    def list_outputs(self):
+        self.adopt_outputs()
+        top = self._dialog("📋 List output files — các file đã tạo", "1000x520", modal=False)
+        bar = tk.Frame(top, bg="white")
+        bar.pack(fill="x", padx=12, pady=(10, 4))
+        sorts = dict(self.OUT_SORTS)
+        kinds = {"": "Tất cả loại file", **{k: f"{i} {t}" for k, (i, t) in self.OUT_KINDS.items()}}
+        sort_var = tk.StringVar(value=sorts.get(self.lib.data.get("out_sort", "new"), sorts["new"]))
+        kind_var = tk.StringVar(value=kinds[""])
+        tk.Label(bar, text="Sắp xếp:", bg="white", font=(A.UI_FONT, 10, "bold")).pack(side="left")
+        ttk.Combobox(bar, textvariable=sort_var, values=list(sorts.values()), state="readonly",
+                     width=20).pack(side="left", padx=(4, 14))
+        tk.Label(bar, text="Lọc:", bg="white", font=(A.UI_FONT, 10, "bold")).pack(side="left")
+        ttk.Combobox(bar, textvariable=kind_var, values=list(kinds.values()), state="readonly",
+                     width=26).pack(side="left", padx=4)
+        info = tk.Label(top, text="", bg="white", fg="#666", font=(A.UI_FONT, 9), anchor="w")
+        info.pack(fill="x", padx=12)
+        cols = (("kind", "Loại", 150), ("title", "Mô tả", 300), ("day", "Buổi", 50), ("when", "Thời gian", 125),
+                ("size", "Dung lượng", 80), ("file", "Tên file", 260))
+        tree = ttk.Treeview(top, columns=[c[0] for c in cols], show="tree headings")
+        tree.column("#0", width=24, stretch=False)
+        for col, txt, w in cols:
+            tree.heading(col, text=txt)
+            tree.column(col, width=w, anchor="w", stretch=col in ("title", "file"))
+        tree.tag_configure("group", font=(A.UI_FONT, 10, "bold"), background="#f3ece7")
+        sb = ttk.Scrollbar(top, command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        btns = tk.Frame(top, bg="white")
+        btns.pack(side="bottom", fill="x", padx=12, pady=8)
+        sb.pack(side="right", fill="y", pady=4, padx=(0, 12))
+        tree.pack(fill="both", expand=True, padx=(12, 0), pady=4)
+        rows = {}
+
+        def when(o):
+            try:
+                return time.strftime("%H:%M · %d/%m/%Y", time.strptime(o["created"], "%Y-%m-%d %H:%M:%S"))
+            except (ValueError, KeyError):
+                return ""
+
+        def size(n):
+            return f"{n / 1e6:.1f} MB" if n > 1e6 else f"{max(1, round(n / 1e3))} KB"
+
+        def fill(*_):
+            tree.delete(*tree.get_children())
+            rows.clear()
+            by = next(k for k, v in sorts.items() if v == sort_var.get())
+            only = next(k for k, v in kinds.items() if v == kind_var.get())
+            with self.lib.lock:
+                self.lib.data["out_sort"] = by
+            allouts = self.lib.data.get("outputs", [])
+            outs = [o for o in allouts if not only or o["kind"] == only]
+            keyf = {"new": lambda o: o["created"], "old": lambda o: o["created"], "kind": lambda o: o["kind"],
+                    "name": lambda o: o["title"].lower(), "day": lambda o: o.get("day") or 999,
+                    "size": lambda o: o["size"]}[by]
+            outs.sort(key=lambda o: o["created"], reverse=True)          # newest first inside groups
+            outs.sort(key=keyf, reverse=by in ("new", "size"))
+            parent, group = "", None
+            for n, o in enumerate(outs):
+                icon, label = self.OUT_KINDS.get(o["kind"], ("📄", "File"))
+                g = label if by == "kind" else (f"Buổi {o['day']}" if o.get("day") else "Không theo buổi") \
+                    if by == "day" else None
+                if g and g != group:
+                    group = g
+                    parent = tree.insert("", "end", text="", open=True, tags=("group",), values=(g, "", "", "", "", ""))
+                iid = f"o{n}"
+                rows[iid] = o
+                tree.insert(parent if g else "", "end", iid=iid, values=(
+                    f"{icon} {label}", o["title"] + (f" — {o['detail']}" if o.get("detail") else ""),
+                    o.get("day") or "-", when(o), size(o["size"]), os.path.basename(o["path"])))
+            info.config(text=f"{len(outs)}/{len(allouts)} file. Nhấn đúp để mở; chọn file rồi dùng các nút bên dưới."
+                        if allouts else "Chưa có file nào. Các file app tạo ra (Xuất PDF ý chính, Backup, nhật ký, "
+                                        "lời giải bài tập) sẽ hiện ở đây.")
+
+        def selected():
+            s = tree.selection()
+            return rows.get(s[0]) if s else None
+
+        def open_out():
+            o = selected()
+            if not o:
+                return
+            if not os.path.exists(o["path"]):
+                messagebox.showinfo("List output files", "Không tìm thấy file này nữa.", parent=top)
+                self.adopt_outputs()
+                fill()
+                return
+            open_path(o["path"])
+
+        def show_in_folder():
+            o = selected()
+            if o and os.path.exists(o["path"]):
+                if sys.platform == "win32":
+                    subprocess.Popen(["explorer", "/select,", os.path.normpath(o["path"])])
+                elif IS_MAC:
+                    subprocess.Popen(["open", "-R", o["path"]])      # Finder, file selected
+                else:
+                    open_path(os.path.dirname(o["path"]))
+
+        def save_copy():
+            o = selected()
+            if not o or not os.path.exists(o["path"]):
+                return
+            ext = os.path.splitext(o["path"])[1]
+            dst = filedialog.asksaveasfilename(parent=top, title="Lưu bản sao", initialfile=os.path.basename(o["path"]),
+                                               defaultextension=ext, filetypes=[(ext.upper().strip("."), "*" + ext)])
+            if dst:
+                shutil.copy2(o["path"], dst)
+                self.mw.status.config(text=f"✓ Đã lưu bản sao: {os.path.basename(dst)}", fg="#7ee2a8")
+
+        def delete():
+            o = selected()
+            if not o:
+                return
+            if not messagebox.askyesno("Xoá file", f"Xoá \"{o['title']}\"?\n\n{o['path']}\n\nFile được chuyển vào "
+                                       "Thùng rác (có thể khôi phục lại).", parent=top):
+                return
+            if os.path.exists(o["path"]) and not to_recycle_bin(o["path"]):
+                messagebox.showerror("Xoá file", "Không xoá được file này.", parent=top)
+                return
+            with self.lib.lock:
+                self.lib.data["outputs"] = [x for x in self.lib.data.get("outputs", []) if x is not o]
+            self.lib.save()
+            fill()
+
+        sort_var.trace_add("write", fill)
+        kind_var.trace_add("write", fill)
+        tree.bind("<Double-1>", lambda e: open_out())
+        st = dict(font=(A.UI_FONT, 10), relief="flat", cursor="hand2", padx=12, pady=3)
+        tk.Button(btns, text="Đóng", command=top.destroy, bg="#eee", **st).pack(side="right")
+        tk.Button(btns, text="🗑 Xoá", command=delete, bg="#eee", **st).pack(side="right", padx=6)
+        tk.Button(btns, text="💾 Lưu bản sao…", command=save_copy, bg="#eee", **st).pack(side="right")
+        tk.Button(btns, text="📁 Mở thư mục chứa file", command=show_in_folder, bg="#eee", **st).pack(side="right", padx=6)
+        tk.Button(btns, text="📄 Mở", command=open_out, bg="#d97757", fg="white", activebackground="#c4643f",
+                  **st).pack(side="right")
+        fill()
 
     # ---- Documents ----
     def documents(self):
@@ -1798,15 +2277,21 @@ class LearningUI:
             + (f"  ·  Bài tập: {len(d['exercises'])}" if d.get("exercises") else "")
             + f"  ·  Gốc: {d['rel']}")(selected()) if selected() else ""))
 
-        def ask():
+        def ask(fresh=False):
             d = selected()
             if not d:
                 return
-            self.set_prompt(f"Hãy giới thiệu tài liệu \"{d.get('title') or d['name']}\": nội dung chính, "
-                            "các ý quan trọng và nó liên quan thế nào đến khóa học.",
-                            {"kind": "doc", "label": f"Tài liệu · {(d.get('title') or d['name'])[:40]}",
-                             "doc_ids": [d["id"]]})
+            title = d.get("title") or d["name"]
+            name = f"doc:{d['id']}"                # the id is the file's content hash: same file, same answer
+            saved = None if fresh else self.saved_answer(name, "v1")
             top.destroy()
+            if saved:
+                self.show_saved(f"Tài liệu \"{title[:50]}\"", saved, "muốn hỏi lại: Documents → 🔄 Hỏi lại")
+                return
+            self.set_prompt(f"Hãy giới thiệu tài liệu \"{title}\": nội dung chính, "
+                            "các ý quan trọng và nó liên quan thế nào đến khóa học.",
+                            {"kind": "doc", "label": f"Tài liệu · {title[:40]}", "doc_ids": [d["id"]],
+                             "save_as": (name, "v1")})
 
         def resync():
             if self.syncing:
@@ -1824,6 +2309,8 @@ class LearningUI:
         sync_btn = tk.Button(btns, text="🔄 Refresh", command=resync, bg="#eee", **bstyle)
         sync_btn.pack(side="left", padx=(0, 6))
         tk.Button(btns, text="Đóng", command=top.destroy, bg="#eee", **bstyle).pack(side="right")
+        tk.Button(btns, text="🔄 Hỏi lại", command=lambda: ask(fresh=True), bg="#eee",
+                  **bstyle).pack(side="right", padx=(6, 0))
         tk.Button(btns, text="💬 Hỏi Claude về tài liệu này", command=ask, bg="#d97757", fg="white",
                   activebackground="#c4643f", **bstyle).pack(side="right", padx=6)
         tk.Button(btns, text="📄 Mở file", command=open_doc, bg="#eee", **bstyle).pack(side="right")
@@ -1849,7 +2336,7 @@ class LearningUI:
             f"Hãy điền nhật ký buổi học cho {when} theo đúng mẫu \"{template['name']}\", dựa trên tài liệu của "
             "buổi này và nội dung thầy giảng trên màn hình. Viết ngắn gọn, cụ thể, đúng từng mục trong mẫu, "
             "rồi trả lại file PDF đã điền để tải về.",
-            {"kind": "journal", "label": f"Journal · {when} · mẫu {template['name'][:30]}",
+            {"kind": "journal", "label": f"Journal · {when} · mẫu {template['name'][:30]}", "when": when, "day": day,
              "doc_ids": [d["id"] for d in docs if d["id"] != template["id"]], "template": template["id"]})
 
     def run_journal(self, instruction, job):
@@ -1866,7 +2353,8 @@ class LearningUI:
             try:
                 out, preview = make_journal(self.mw.client, self.lib, template, day_docs, session, instruction)
                 q.put(("chat_piece", (preview.strip() + "\n") if preview else ""))
-                self.later(lambda: self.file_links(out))
+                self.later(lambda: (self.file_links(out), self.add_output(
+                    "journal", out, "Nhật ký: " + job.get("when", "buổi học"), day=job.get("day", 0))))
             except Exception as e:  # noqa: BLE001
                 why = A.friendly_error(e) if isinstance(e, anthropic.APIError) else str(e)[:200]
                 q.put(("chat_error", f"[Chưa điền được nhật ký: {why}]"))

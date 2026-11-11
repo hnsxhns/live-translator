@@ -24,7 +24,7 @@ import numpy as np
 import learning
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.8.4"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.8.7"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # The login client waits at most 20 s for data (right for live translation). Chat and the Learning menu send
 # whole documents, and Claude can read/think longer than that before the first word: give them more time.
@@ -1576,6 +1576,9 @@ class MainWindow:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(self._session_data(), f, ensure_ascii=False, indent=1)
             self.status.config(text=f"✓ Đã backup: {os.path.basename(path)}", fg="#7ee2a8")
+            n_take = len(re.findall(r"^\[\d\d:\d\d\]$", self.last_summary, re.M))
+            self.learning.add_output("backup", path, f"Backup phiên nghe {time.strftime('%d/%m/%Y %H:%M')}",
+                                     detail=f"{len(self.uid_spk)} dòng, {n_take} mốc Key takeaways")
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("Backup lỗi", str(e), parent=self.root)
 
@@ -1598,12 +1601,19 @@ class MainWindow:
             return
         if self.on:
             self.toggle_onoff()                       # stop listening while loading
-        self.load_session(data)
-        self.status.config(text=f"✓ Đã restore: {os.path.basename(path)} ({len(data.get('rows', []))} dòng)",
-                           fg="#7ee2a8")
+        problems = self.load_session(data)
+        n_take = len(re.findall(r"^\[\d\d:\d\d\]$", self.last_summary, re.M)) or (1 if self.last_summary.strip() else 0)
+        self.status.config(text=f"✓ Đã restore: {os.path.basename(path)} ({len(data.get('rows', []))} dòng, "
+                                f"{n_take} mốc Key takeaways)", fg="#7ee2a8" if not problems else "#ffd479")
+        if problems:
+            messagebox.showwarning("Restore chưa đầy đủ", "Một số phần chưa khôi phục được (các phần khác vẫn "
+                                   "đã được khôi phục):\n\n" + "\n".join("• " + p for p in problems),
+                                   parent=self.root)
 
     def load_session(self, data):
-        """Rebuild every pane from backup data (also restores voices so new speech matches old speakers)."""
+        """Rebuild every pane from backup data (also restores voices so new speech matches old speakers).
+        Each part is restored on its own, Key takeaways first: if one part fails (e.g. low memory) the others
+        are still restored. Returns the list of parts that failed."""
         for w in (self.left, self.right, self.bottom, self.chat):
             w.configure(state="normal")
             w.delete("1.0", "end")
@@ -1611,21 +1621,55 @@ class MainWindow:
                 if t[:1] in ("b", "u", "v") and t[1:].isdigit() or t.startswith(("pad", "vsep")):
                     w.tag_delete(t)
             w.configure(state="disabled")
+        problems = []
+        for name, fn in (("Key takeaways", self._restore_takeaways), ("người nói", self._restore_speakers),
+                         ("bản ghi tiếng Anh/tiếng Việt", self._restore_rows), ("khung Claude", self._restore_chat)):
+            try:
+                fn(data)
+            except Exception as e:  # noqa: BLE001
+                problems.append(f"{name}: {e}")
+        self.summarizer.done_n = len(self.transcript)      # what is restored is not summarized again
+        self._schedule_align_all()
+        self.root.after(200, lambda: (self.left.see("end"), self._sync_from(self.left, self.right),
+                                      self.chat.see("end"), self.bottom.see("end")))
+        return problems
+
+    def _restore_takeaways(self, data):
+        self.last_summary = data.get("takeaways") or ""
+        self.bottom.configure(state="normal")
+        try:
+            for i, part in enumerate(re.split(r"\n\n(?=\[\d\d:\d\d\]\n)", self.last_summary)
+                                     if self.last_summary else []):
+                if i:
+                    self.bottom.insert("end", "\n\n")
+                m = re.match(r"(\[\d\d:\d\d\]\n)", part)
+                if m:
+                    self.bottom.insert("end", m.group(1), "ttime")
+                    part = part[m.end():]
+                self.bottom.insert("end", part)
+        finally:
+            self.bottom.configure(state="disabled")
+        self.take_follow = True
+
+    def _restore_speakers(self, data):
         sp = data.get("speakers", {})
         conv = lambda d: {int(k): v for k, v in (d or {}).items()}
         self.spk_custom = conv(sp.get("custom"))
         self.teachers = [int(t) for t in sp.get("teachers", [])]
         self.spk_talk = {int(k): float(v) for k, v in (sp.get("talk") or {}).items()}
         self.spk_alias = {int(k): int(v) for k, v in (sp.get("alias") or {}).items()}
-        self.spk_shown, self.last_spk = {}, {"en": None, "vi": None}
-        self.uid_spk, self.vi_gen, self.vi_filled = {}, {}, {}
         tr = self.recognizer.speakers
         tr.sums = {int(k): np.asarray(v, dtype=np.float32) for k, v in (sp.get("voices") or {}).items()}
         tr.talk = dict(self.spk_talk)
         tr.merged = dict(self.spk_alias)
         tr.next_id = int(sp.get("next_id", max(tr.sums, default=0) + 1))
         tr.last = None
+
+    def _restore_rows(self, data):
+        self.spk_shown, self.last_spk = {}, {"en": None, "vi": None}
+        self.uid_spk, self.vi_gen, self.vi_filled = {}, {}, {}
         self.translator.en, self.translator.vi, self.translator.gen = {}, {}, {}
+        self.transcript = [tuple(t) for t in data.get("transcript", [])]
         rows = data.get("rows", [])
         for r in rows:
             uid, sid = int(r["uid"]), int(r["speaker"])
@@ -1639,37 +1683,24 @@ class MainWindow:
             self._vi_slot(uid)
             self._vi_piece(uid, 1, r.get("vi", "") or " ")
         self.recognizer.utt_id = max([int(r["uid"]) for r in rows], default=self.recognizer.utt_id)
-        self.transcript = [tuple(t) for t in data.get("transcript", [])]
-        self.last_summary = data.get("takeaways", "")
-        self.bottom.configure(state="normal")
-        for i, part in enumerate(re.split(r"\n\n(?=\[\d\d:\d\d\]\n)", self.last_summary) if self.last_summary else []):
-            if i:
-                self.bottom.insert("end", "\n\n")
-            m = re.match(r"(\[\d\d:\d\d\]\n)", part)
-            if m:
-                self.bottom.insert("end", m.group(1), "ttime")
-                part = part[m.end():]
-            self.bottom.insert("end", part)
-        self.bottom.configure(state="disabled")
-        self.take_follow = True
-        self.summarizer.done_n = len(self.transcript)
+
+    def _restore_chat(self, data):
         self.chat_log = list(data.get("chat", []))
         w = self.chat
         w.configure(state="normal")
-        for i, turn in enumerate(self.chat_log):
-            if i:
-                w.insert("end", "\n\n")
-            w.insert("end", "Bạn: ", "you")
-            w.insert("end", turn.get("q", "") + "\n")
-            if turn.get("files"):
-                w.insert("end", "📎 " + ", ".join(turn["files"]) + "\n", "file")
-            w.insert("end", "Claude: ", "who")
-            w.insert("end", turn.get("a", ""))
-        w.configure(state="disabled")
+        try:
+            for i, turn in enumerate(self.chat_log):
+                if i:
+                    w.insert("end", "\n\n")
+                w.insert("end", "Bạn: ", "you")
+                w.insert("end", turn.get("q", "") + "\n")
+                if turn.get("files"):
+                    w.insert("end", "📎 " + ", ".join(turn["files"]) + "\n", "file")
+                w.insert("end", "Claude: ", "who")
+                w.insert("end", turn.get("a", ""))
+        finally:
+            w.configure(state="disabled")
         self.chatter.history = list(data.get("chat_history", []))
-        self._schedule_align_all()
-        self.root.after(200, lambda: (self.left.see("end"), self._sync_from(self.left, self.right),
-                                      self.chat.see("end"), self.bottom.see("end")))
 
     def choose_output_folder(self):
         """Output Folder: backups go to its Backup folder, exported files to its Outputs folder."""
@@ -1708,7 +1739,11 @@ class MainWindow:
                 return
         try:
             learning.takeaways_pdf(path, self.last_summary)
-            self.status.config(text=f"✓ Đã xuất PDF: {os.path.basename(path)}", fg="#7ee2a8")
+            self.status.config(text=f"✓ Đã xuất PDF: {os.path.basename(path)} (cũng có trong 📋 List output files)",
+                               fg="#7ee2a8")
+            n_take = len(re.findall(r"^\[\d\d:\d\d\]$", self.last_summary, re.M))
+            self.learning.add_output("takeaways", path, f"Ý chính phiên nghe {time.strftime('%d/%m/%Y %H:%M')}",
+                                     detail=f"{n_take} mốc giờ")
             learning.open_path(path)
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("Không xuất được PDF", str(e), parent=self.root)

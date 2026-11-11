@@ -485,6 +485,51 @@ with pymupdf.open(pdf) as d:
     fonts = [f[3] for f in d[0].get_fonts()]
 check("learning_pdf_vietnamese", viet in " ".join(text.split()), f"fonts {fonts}; text {text.strip()[:100]}")
 
+# --- v1.8.6: List output files; 🗑 Xoá moves the file to the Trash (the dialog promises it can be restored) ---
+if hasattr(mw.learning, "list_outputs"):
+    import shutil as _sh
+    errors = []
+    messagebox.showerror = lambda *a, **k: errors.append(a) or "ok"
+    victim = os.path.join(OUT, f"output_delete_test_{int(time.time())}.pdf")
+    _sh.copy(pdf, victim)
+    kind = next(iter(getattr(mw.learning, "OUT_KINDS", {"takeaways": None})))
+    mw.learning.add_output(kind, victim, "Test output for delete", "test")
+    n0 = len(toplevels())
+    mw.learning.list_outputs()
+    pump(1)
+    top = toplevels()[-1] if len(toplevels()) > n0 else None
+    check("list_output_files_window", top is not None)
+    shot("10_list_output_files")
+    tree = None
+    if top:
+        stack = [top]
+        while stack and tree is None:
+            w = stack.pop()
+            if w.winfo_class() == "Treeview":
+                tree = w
+            stack.extend(w.winfo_children())
+    target = None
+    if tree is not None:
+        items = list(tree.get_children())
+        for it in list(items):
+            items += list(tree.get_children(it))
+        target = next((it for it in items if any("Test output for delete" in str(v) for v in tree.item(it, "values"))), None)
+    if target:
+        tree.selection_set(target)
+        tree.focus(target)
+        pump(0.3)
+        delb = find_button(top, "Xoá") or find_button(top, "Xóa")
+        if delb:
+            delb.invoke()
+            pump(1.5)
+    in_trash = os.path.exists(os.path.expanduser(f"~/.Trash/{os.path.basename(victim)}")) if getattr(app, "IS_MAC", False) else None
+    check("list_output_delete_goes_to_trash",
+          target is not None and not os.path.exists(victim) and not errors and in_trash is not False,
+          f"found in list={target is not None}; file still there={os.path.exists(victim)}; in ~/.Trash={in_trash}; errors={errors}")
+    if top:
+        top.destroy()
+        pump(0.3)
+
 # --- clean exit: no extra processes, no hang ---
 save_results()
 print(json.dumps(results, ensure_ascii=False, indent=2), flush=True)
