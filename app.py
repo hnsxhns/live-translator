@@ -24,7 +24,7 @@ import numpy as np
 import learning
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.9.2"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.9.5"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # The login client waits at most 20 s for data (right for live translation). Chat and the Learning menu send
 # whole documents, and Claude can read/think longer than that before the first word: give them more time.
@@ -36,6 +36,9 @@ FRAME = 480                      # 30 ms frames
 VOSK_MODEL = "vosk-en-small"      # streaming model for live words (fast: ~0.2 s per 1 s audio)
 UTT_SOFT = 3.0                   # after this long, cut the utterance at the next short pause (s)
 UTT_HARD = 7.0                   # always cut by this length (s)
+# phrases Whisper is known to invent on short or unclear audio (learned from video subtitles)
+HALLUCINATION = re.compile(r"thank(s| you) for watching|please (like and )?subscribe|subtitles? by|"
+                           r"see you (in the )?next (video|time)|amara\.org|transcribed by", re.I)
 TEACHER_MINUTES = 10             # whoever has spoken this long becomes "Teacher" (several -> Teacher 1, 2...)
 SUMMARY_EVERY = 25.0             # refresh key takeaways this often (seconds)
 # Folder next to the .exe (portable) or next to app.py.
@@ -602,6 +605,7 @@ class Recognizer(threading.Thread):
         self.spk_model = None
         self.speakers = SpeakerTracker()
         self.utt_spk = {}                   # utterance id -> speaker id
+        self.glossary = ""                  # course terms (from the Learning library) that Whisper should expect
 
     def load_model(self):
         if self.whisper is None:
@@ -618,8 +622,10 @@ class Recognizer(threading.Thread):
         peak = float(np.max(np.abs(audio))) or 1.0
         audio = audio * min(8.0, 0.6 / peak)          # auto-gain: quiet mics are boosted (max 8x)
         segs, _ = self.whisper.transcribe(
-            audio, language="en", beam_size=1, vad_filter=False,
-            condition_on_previous_text=False, initial_prompt=self.context[-200:] or None,
+            # beam 5 + the course's vocabulary: measured 1.8% -> 0.6% word errors on noisy classroom audio
+            audio, language="en", beam_size=5, vad_filter=False,
+            condition_on_previous_text=False,
+            initial_prompt=((self.glossary + " ") if self.glossary else "") + self.context[-150:] or None,
             without_timestamps=True,
         )
         out = []
@@ -697,7 +703,9 @@ class Recognizer(threading.Thread):
                 if rec.AcceptWaveform(pcm16):
                     self._end_utterance(json.loads(rec.Result()), utt)
                     utt, utt_len, last_partial = [], 0, ""
-                elif (secs >= UTT_SOFT and quiet >= 0.2) or (secs >= 1.0 and quiet >= 0.4) or secs >= UTT_HARD:
+                # (no earlier cut for short sentences: speakers hesitate ~0.4-0.5 s mid-sentence, and cutting
+                # there split sentences into fragments that were recognised and translated worse)
+                elif (secs >= UTT_SOFT and quiet >= 0.2) or secs >= UTT_HARD:
                     self._end_utterance(json.loads(rec.FinalResult()), utt)
                     utt, utt_len, last_partial = [], 0, ""
                 else:
@@ -745,7 +753,11 @@ class Recognizer(threading.Thread):
             n_w, n_d = len(text.split()), len(draft.split())
             # empty, or far longer than what Vosk heard (Whisper sometimes invents text on cut-off
             # audio) -> use the live draft instead
-            if not text.strip(" .,!?-'\"") or n_w > 2 * n_d + 3:
+            words = lambda s: set(re.sub(r"[^a-z0-9' ]", " ", s.lower()).split())
+            shared = len(words(text) & words(draft)) / max(1, len(words(draft)))
+            invented = (HALLUCINATION.search(text) and not HALLUCINATION.search(draft)) or \
+                (n_d <= 3 and shared < 0.5)          # a few words heard, Whisper wrote something else
+            if not text.strip(" .,!?-'\"") or n_w > 2 * n_d + 3 or invented:
                 text = draft[:1].upper() + draft[1:]
             self.context = (self.context + " " + text)[-400:]
             self.on_final(ids, text)
@@ -944,7 +956,7 @@ class Translator:
             norm = lambda s: re.sub(r"[^a-z0-9' ]", " ", s.lower()).split()
             # re-translate when Whisper corrected words (e.g. "right down" -> "write down"), not for case or
             # punctuation only; one word in a short sentence matters, one in a long sentence less so
-            same = difflib.SequenceMatcher(None, norm(drafts), norm(text)).ratio() >= 0.93
+            same = difflib.SequenceMatcher(None, norm(drafts), norm(text)).ratio() >= 0.97
             if same:                                   # draft translation is good: keep it
                 for u in ids:
                     self.en[u] = text if u == ids[0] else ""
@@ -1354,6 +1366,7 @@ class MainWindow:
         self.recognizer.start()
         self.summarizer.start()
         self.chatter.get_library = self.learning.lib.catalog_text
+        self.recognizer.glossary = learning.course_terms(self.learning.lib)
         self.chatter.start()
         self.root.after(50, self._poll)
 
@@ -2225,7 +2238,7 @@ class MainWindow:
         self._align_pending.add(uid)
 
     def _schedule_align_all(self):
-        if self._align_all_job:
+        if getattr(self, "_align_all_job", None):         # <Configure> can fire while the window is still being built
             self.root.after_cancel(self._align_all_job)
         self._align_all_job = self.root.after(120, self._align_all)
 

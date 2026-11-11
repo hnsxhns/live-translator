@@ -695,6 +695,60 @@ if hasattr(mw.learning, "fill_prompt_blanks"):
     mw.learning.job = None
     pump(0.3)
 
+# --- v1.9.3: Source menu - find documents on a web page and download the new ones ---
+if hasattr(learning, "doc_links") and hasattr(learning, "download"):
+    import http.server
+    import socketserver
+    site = os.path.join(OUT, "site")
+    os.makedirs(site, exist_ok=True)
+    _sh2 = __import__("shutil")
+    _sh2.copy(pdf, os.path.join(site, "Bai giang 1.pdf"))
+    with open(os.path.join(site, "notes.txt"), "w", encoding="utf-8") as f:
+        f.write("Ghi chú buổi học: tiếng Việt có dấu.\n")
+    _sh2.copy(cert, os.path.join(site, "slide.png"))
+    with open(os.path.join(site, "index.html"), "w", encoding="utf-8") as f:
+        f.write('<html><body><a href="Bai%20giang%201.pdf">Bài giảng 1</a> <a href="notes.txt">Notes</a> '
+                '<a href="slide.png">Slide</a> <a href="#top">top</a> <a href="mailto:x@y.z">mail</a></body></html>')
+
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **k):
+            super().__init__(*a, directory=site, **k)
+
+        def log_message(self, *a):
+            pass
+    srv = socketserver.TCPServer(("127.0.0.1", 0), Quiet)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    page = f"http://127.0.0.1:{srv.server_address[1]}/index.html"
+    try:
+        links = learning.doc_links(page, learning.SOURCE_EXTS & learning.supported_exts())
+        dest = os.path.join(OUT, "SourceDownloads")
+        saved = [learning.download(u, dest, ext) for u, _t, ext in links]
+        names = sorted(os.path.basename(p) for p, _s, _n in saved)
+        again = [learning.download(u, dest, ext)[2] for u, _t, ext in links]     # second time: nothing new saved
+        check("source_finds_and_downloads_documents",
+              len(links) == 3 and len(names) == 3 and not any(again)
+              and all(os.path.getsize(os.path.join(dest, n)) > 0 for n in names),
+              f"links {[t for _u, t, _e in links]}, saved {names}, re-saved {again}")
+    except Exception as e:  # noqa: BLE001
+        check("source_finds_and_downloads_documents", False, repr(e)[:200])
+    finally:
+        srv.shutdown()
+    # real https (Mac: python.org Python has no system certificates unless the app supplies them)
+    try:
+        with learning._http("https://www.python.org/") as r:
+            code = r.status
+        check("source_https_download_works", code == 200, f"HTTP {code}")
+    except Exception as e:  # noqa: BLE001
+        check("source_https_download_works", False, repr(e)[:200])
+
+# --- v1.9.5: Whisper hallucination filter and course glossary ---
+if hasattr(app, "HALLUCINATION"):
+    check("whisper_hallucination_pattern",
+          bool(app.HALLUCINATION.search("Thank you for watching!")) and not app.HALLUCINATION.search(
+              "Thank you teacher, I have a question"), "pattern matches only the invented phrases")
+    terms = learning.course_terms(mw.learning.lib) if hasattr(learning, "course_terms") else None
+    check("course_glossary_builds", isinstance(terms, str) and len(terms) <= 261, f"{terms!r}"[:120])
+
 # --- clean exit: no extra processes, no hang ---
 save_results()
 print(json.dumps(results, ensure_ascii=False, indent=2), flush=True)

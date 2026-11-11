@@ -277,6 +277,31 @@ def out_folder(lib, fallback):
     return d
 
 
+def course_terms(lib, max_chars=260):
+    """Words of this course Whisper should expect: acronyms and capitalised terms that keep coming back in the
+    library's documents, and the document titles. A short comma list (Whisper reads ~200 tokens of prompt)."""
+    from collections import Counter
+    counts = Counter()
+    for d in lib.docs():
+        text = lib.text(d)[:200_000]
+        for m in re.finditer(r"\b[A-Z]{2,6}s?\b", text):                   # ABT, KPI, KPIs, LLM...
+            counts[m.group(0)] += 1
+        for m in re.finditer(r"\b(?:[A-Z][a-z]+(?:[- ](?:of |and |to |the )?[A-Z][a-z]+){1,3})\b", text):
+            counts[m.group(0)] += 2                                        # multi-word Capitalised Terms
+    common = {"the", "this", "that", "part", "prompt", "table", "day", "and", "for", "with", "you", "your", "in",
+              "on", "at", "to", "of", "a", "an", "is", "it", "we", "our", "step", "note", "use", "all", "each", "not"}
+    def ok(t):
+        first = t.split()[0].lower()
+        return first not in common and not (t.isupper() and t.lower() in common | {"our", "are", "can", "will", "how"})
+    terms = [t for t, n in counts.most_common(80) if n >= 3 and ok(t)]
+    out = ""
+    for t in terms:
+        if len(out) + len(t) + 2 > max_chars:
+            break
+        out += (", " if out else "") + t
+    return (out + ".") if out else ""
+
+
 def fmt_date(iso):
     try:
         return time.strftime("%d/%m/%Y", time.strptime(iso, "%Y-%m-%d"))
@@ -1211,6 +1236,140 @@ def solution_pdf(lib, session, summary):
 
 
 # =====================================================================
+# Source: a web page that lists the course materials; new files on it are downloaded into the study folder
+# =====================================================================
+SOURCE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LiveTranslator"
+SOURCE_MAX_BYTES = 200 * 2**20                       # skip files larger than this
+# documents only (web pages, scripts and data files on the page are not course materials)
+SOURCE_EXTS = {".pdf", ".docx", ".txt", ".md", ".csv", ".tsv", ".srt", ".vtt", ".png", ".jpg", ".jpeg", ".gif",
+               ".webp"}
+MIME_EXT = {"application/pdf": ".pdf", "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+            "image/webp": ".webp", "text/plain": ".txt", "text/markdown": ".md", "text/csv": ".csv",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx"}
+
+
+def _http(url, method="GET", timeout=30):
+    import urllib.request
+    req = urllib.request.Request(url, method=method, headers={"User-Agent": SOURCE_UA, "Accept": "*/*"})
+    ctx = None
+    if IS_MAC:
+        # python.org Python on macOS does not use the system's certificates: without this every https
+        # download fails with CERTIFICATE_VERIFY_FAILED (certifi is bundled with the Claude SDK)
+        try:
+            import ssl
+            import certifi
+            ctx = ssl.create_default_context(cafile=certifi.where())
+        except Exception:  # noqa: BLE001
+            ctx = None
+    return urllib.request.urlopen(req, timeout=timeout, context=ctx)   # noqa: S310  (http/https only, checked by callers)
+
+
+def page_links(url):
+    """[(absolute url, link text)] of every link on the page."""
+    from html.parser import HTMLParser
+    from urllib.parse import urljoin
+
+    class Links(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.out, self._href, self._text = [], None, []
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "a":
+                self._href, self._text = dict(attrs).get("href"), []
+
+        def handle_data(self, data):
+            if self._href is not None:
+                self._text.append(data)
+
+        def handle_endtag(self, tag):
+            if tag == "a" and self._href:
+                self.out.append((self._href, " ".join("".join(self._text).split())))
+                self._href = None
+    with _http(url) as r:
+        base = r.geturl()
+        raw = r.read(10 * 2**20)
+        charset = r.headers.get_content_charset() or "utf-8"
+    p = Links()
+    p.feed(raw.decode(charset, errors="replace"))
+    return [(urljoin(base, h.strip()), t) for h, t in p.out if h and not h.strip().startswith(("#", "javascript:",
+                                                                                              "mailto:"))]
+
+
+def doc_links(url, exts):
+    """Links on the page that point to a document the library can use (by file extension, or for links that
+    look like downloads, by the type the server reports). Returns [(url, link text, extension)]."""
+    from urllib.parse import unquote, urlparse
+    out, seen, checked = [], set(), 0
+    for link, text in page_links(url):
+        p = urlparse(link)
+        if p.scheme not in ("http", "https"):
+            continue
+        key = link.split("#")[0]
+        if key in seen:
+            continue
+        seen.add(key)
+        ext = os.path.splitext(unquote(p.path))[1].lower()
+        if ext in exts:
+            out.append((key, text, ext))
+        elif checked < 25 and re.search(r"download|export|attachment|file|/d/", link, re.I):
+            checked += 1                                    # ask the server what it is (a few at most)
+            try:
+                with _http(key, "HEAD", timeout=15) as r:
+                    ext = MIME_EXT.get((r.headers.get_content_type() or "").lower())
+                if ext and ext in exts:
+                    out.append((key, text, ext))
+            except Exception:  # noqa: BLE001
+                pass
+    return out
+
+
+def download(url, folder, ext_hint=""):
+    """Download a file into folder (never overwriting a different file). Returns (path, sha256, newly saved)."""
+    import email.message
+    from urllib.parse import unquote, urlparse
+    os.makedirs(folder, exist_ok=True)
+    with _http(url, timeout=120) as r:
+        name = ""
+        cd = r.headers.get("Content-Disposition")
+        if cd:
+            msg = email.message.Message()
+            msg["content-disposition"] = cd
+            name = msg.get_filename() or ""
+        if not name:
+            name = os.path.basename(unquote(urlparse(r.geturl()).path)) or "tai_lieu"
+        if not os.path.splitext(name)[1]:
+            name += ext_hint or MIME_EXT.get((r.headers.get_content_type() or "").lower(), "")
+        name = safe_name(name)
+        tmp = os.path.join(folder, f".dl_{os.getpid()}_{threading.get_ident()}.part")
+        h, size = hashlib.sha256(), 0
+        with open(tmp, "wb") as f:
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > SOURCE_MAX_BYTES:
+                    f.close()
+                    os.remove(tmp)
+                    raise ValueError(f"file lớn hơn {SOURCE_MAX_BYTES // 2**20} MB")
+                h.update(chunk)
+                f.write(chunk)
+    sha = h.hexdigest()
+    path = os.path.join(folder, name)
+    stem, ext = os.path.splitext(name)
+    k = 1
+    while os.path.exists(path):
+        if file_sha(path) == sha:                           # the same file is already there
+            os.remove(tmp)
+            return path, sha, False
+        k += 1
+        path = os.path.join(folder, f"{stem} ({k}){ext}")
+    os.replace(tmp, path)
+    return path, sha, True
+
+
+# =====================================================================
 # UI
 # =====================================================================
 class LearningUI:
@@ -1246,6 +1405,14 @@ class LearningUI:
                       command=self.folder, state="disabled" if self.syncing else "normal")
         if self.lib.data.get("folder"):
             m.add_command(label="🔄  Refresh — tìm file mới, cập nhật dữ liệu", command=self.refresh,
+                          state="disabled" if self.syncing else "normal")
+        src = self.lib.data.get("source_url") or ""
+        host = re.sub(r"^https?://(www\.)?", "", src).split("/")[0]
+        m.add_command(label="🌐  Source — " + (f"quét {host} tìm tài liệu mới" if src else
+                                               "link trang web chứa tài liệu"),
+                      command=self.source, state="disabled" if self.syncing else "normal")
+        if src:
+            m.add_command(label="      ✎  Đổi link Source", command=self.change_source,
                           state="disabled" if self.syncing else "normal")
         if self.cached_agenda():
             m.add_command(label="🗓  Agenda — chương trình học (đã lưu, mở ngay)", command=self.agenda, state=need)
@@ -1357,6 +1524,8 @@ class LearningUI:
                 if r["problems"]:
                     msg += "\nLưu ý:\n" + "\n".join("• " + p for p in r["problems"][:12])
                 self.later(lambda: self.chat_note(msg))
+                terms = course_terms(self.lib)                     # new documents: new words to expect
+                self.later(lambda: setattr(self.mw.recognizer, "glossary", terms))
                 self.mw.ui_q.put(("status", f"🎓 Đồng bộ xong: +{r['new']} tài liệu mới"))
             except Exception as e:  # noqa: BLE001
                 self.later(lambda: self.chat_note(f"Đồng bộ lỗi: {A.friendly_error(e)}", "err"))
@@ -1366,6 +1535,112 @@ class LearningUI:
                 self.later(lambda: self.mw.done("sync"))
                 if on_done:
                     self.later(on_done)
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---- Source: a web page with the course materials ----
+    def source(self):
+        """First time: ask for the page's link. Then (and every time after): scan it for new documents."""
+        if not self.lib.data.get("source_url") and not self.ask_source_url():
+            return
+        self.scan_source()
+
+    def change_source(self):
+        if self.ask_source_url(self.lib.data.get("source_url", "")):
+            self.scan_source()
+
+    def ask_source_url(self, current=""):
+        top = self._dialog("Source — trang web chứa tài liệu", "660x230")
+        tk.Label(top, text="Link trang web chứa tài liệu khóa học:", font=(A.UI_FONT, 10, "bold"),
+                 bg="white").pack(anchor="w", padx=14, pady=(14, 2))
+        tk.Label(top, text="Mỗi lần bấm 🌐 Source, app quét trang này; tài liệu mới (PDF, Word, ảnh, file chữ...) "
+                           "được tự tải về thư mục học (thư mục con Source) và upload cho Claude.",
+                 bg="white", fg="#666", font=(A.UI_FONT, 9), wraplength=620, justify="left").pack(anchor="w", padx=14)
+        var = tk.StringVar(value=current)
+        entry = tk.Entry(top, textvariable=var, font=(A.UI_FONT, 10))
+        entry.pack(fill="x", padx=14, pady=10)
+        entry.focus_set()
+        result = []
+
+        def ok():
+            url = var.get().strip()
+            if not re.match(r"https?://", url, re.I):
+                messagebox.showinfo("Source", "Hãy nhập một link bắt đầu bằng http:// hoặc https://", parent=top)
+                return
+            result.append(url)
+            top.destroy()
+        self._buttons(top, ok, ok="Lưu và quét")
+        top.wait_window()
+        if not result:
+            return None
+        with self.lib.lock:
+            if self.lib.data.get("source_url") != result[0]:
+                self.lib.data["source_files"] = {}               # a new page: start the comparison afresh
+            self.lib.data["source_url"] = result[0]
+        self.lib.save()
+        return result[0]
+
+    def scan_source(self):
+        if self.syncing:
+            self.mw.status.config(text="⏳ Đang đồng bộ — chờ xong rồi bấm Source lại.", fg="#ffd479")
+            return
+        folder = self.lib.data.get("folder") or ""
+        if not os.path.isdir(folder):
+            folder = filedialog.askdirectory(parent=self.root, title="Chọn thư mục học để lưu tài liệu tải về")
+            if not folder:
+                return
+        url = self.lib.data["source_url"]
+        dest = os.path.join(folder, "Source")
+        self.syncing = True
+        self.chat_note(f"Đang quét {url} để tìm tài liệu mới...")
+        self.mw.busy("source", "Đang quét trang Source tìm tài liệu mới...")
+
+        def progress(msg):
+            self.later(lambda: self.mw.busy("source", msg))
+
+        def work():
+            got, dup, problems, links, r = [], 0, [], [], None
+            try:
+                links = doc_links(url, SOURCE_EXTS & supported_exts())
+                known = self.lib.data.setdefault("source_files", {})
+                todo = [x for x in links if x[0] not in known]
+                have = {d.get("sha") for d in self.lib.docs()}
+                for k, (link, text, ext) in enumerate(todo, 1):
+                    progress(f"Đang tải tài liệu mới {k}/{len(todo)} từ Source...")
+                    try:
+                        path, sha, created = download(link, dest, ext)
+                    except Exception as e:  # noqa: BLE001
+                        problems.append(f"{text or link}: {e}")
+                        continue
+                    with self.lib.lock:
+                        known[link] = {"name": os.path.basename(path), "sha": sha, "time": time.strftime("%Y-%m-%d %H:%M")}
+                    if sha in have:
+                        dup += 1                                 # same content as a document already there
+                        if created:
+                            try:
+                                os.remove(path)                  # no second copy in the folder
+                            except OSError:
+                                pass
+                    else:
+                        have.add(sha)
+                        got.append(os.path.basename(path))
+                with self.lib.lock:
+                    self.lib.data["source_checked"] = time.strftime("%Y-%m-%d %H:%M")
+                self.lib.save()
+                if got:                                          # upload the new files to Claude and catalogue them
+                    r = Syncer(self.lib, self.mw.client, progress).run(folder)
+                    problems += r["problems"]
+            except Exception as e:  # noqa: BLE001
+                problems.append(A.friendly_error(e) if isinstance(e, anthropic.APIError) else f"{type(e).__name__}: {e}")
+            finally:
+                self.syncing = False
+            msg = (f"Source: {len(links)} link tài liệu trên trang; "
+                   + (f"{len(got)} tài liệu mới đã tải về {dest} và upload cho Claude:\n" +
+                      "\n".join(f"  • {n}" for n in got) if got else "không có tài liệu mới.")
+                   + (f"\n{dup} file trùng nội dung với tài liệu đã có (bỏ qua)." if dup else ""))
+            if problems:
+                msg += "\nLưu ý:\n" + "\n".join("• " + p for p in problems[:10])
+            self.later(lambda: (self.mw.done("source"), self.chat_note(msg),
+                                self.mw.status.config(text=f"🌐 Source: +{len(got)} tài liệu mới", fg="#7ee2a8")))
         threading.Thread(target=work, daemon=True).start()
 
     # ---- Agenda ----
