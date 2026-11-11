@@ -642,7 +642,14 @@ class App {
         break;
       case "status": this.setStatus(val); break;
       case "error": logError(val); this.setStatus(val, "err"); break;
-      case "mic_lost": this.onVisibility(); break;
+      case "mic_lost": this.micLost(); break;
+      case "mic_silent":
+        this.setStatus("⚠ Micro không thu được tiếng. Kiểm tra: Cài đặt → Quyền riêng tư → Micro (bật cho Safari/app), " +
+                       "không có app khác đang dùng micro; rồi tắt và bật ON lại.", "err");
+        break;
+      case "mic_resume_failed": this.waitTap(val); break;
+      case "ctx": this.audioCtx = val; break;
+      case "level": this.showLevel(val); break;
       case "force_off": if (this.on) this.toggleOnOff(); break;
     }
   }
@@ -696,8 +703,9 @@ class App {
     b.className = "onoff " + (this.on ? "on" : "off");
     if (this.on) {
       // iPad only allows audio that starts during a tap: create/resume it now
-      this.audioCtx = this.audioCtx || new AudioContext();
-      this.audioCtx.resume();
+      if (!this.audioCtx || this.audioCtx.state === "closed") this.audioCtx = new AudioContext();
+      this.audioCtx.resume().catch(() => {});
+      $("micLevel").hidden = false;
       this.keepAwake(true);
       if (this.ready) this.startListening();
       else {
@@ -706,6 +714,9 @@ class App {
       }
     } else {
       this.wantOn = false;
+      this.micPaused = false;
+      this.hideTap();
+      $("micLevel").hidden = true;
       this.keepAwake(false);
       if (this.summarizer) this.summarizer.final = true;
       this.recognizer.stop().then(() => setTimeout(() => this.summarizer?.kick(), 1500));   // takeaways for the last words
@@ -717,7 +728,9 @@ class App {
     if (!this.on) return;
     try {
       await this.recognizer.start(this.audioCtx);
+      this.audioCtx = this.recognizer.ctx;
     } catch (e) {
+      if (e?.code === "needTap") { this.recognizer.paused = false; this.waitTap(e, true); return; }
       logError(e.message || e);
       const denied = e?.name === "NotAllowedError";
       this.handle("error", denied ? "Chưa cho phép dùng micro. Vào Cài đặt → Safari (hoặc app) → Micro, rồi bật ON lại."
@@ -738,20 +751,89 @@ class App {
     } catch { /* not supported */ }
   }
 
+  /** Leaving the screen (another app, Home, lock): the mic is released. Coming back: it is opened again
+   *  by itself; if iPad wants a tap first, a big "tap to turn the mic on" button shows. */
   async onVisibility() {
-    if (document.visibilityState !== "visible") return;
-    this.checkUpdates();
-    if (!this.on || !this.recognizer.running) return;
-    this.keepAwake(true);
-    const live = this.recognizer.stream?.getAudioTracks().some((t) => t.readyState === "live");
-    if (live && this.audioCtx.state === "running") return;
-    try {
-      await this.recognizer.restart();
-      this.setStatus("Đang nghe tiếp... (nói tiếng Anh)");
-    } catch {
-      this.handle("force_off", null);
-      this.setStatus("iPad đã tạm dừng micro khi bạn rời app. Nhấn ON để nghe tiếp.", "err");
+    if (document.visibilityState !== "visible") {
+      if (this.on && this.recognizer.running) {
+        this.micPaused = true;
+        await this.recognizer.pause();
+        $("micLevel").classList.add("paused");
+        this.setStatus("⏸ Micro tạm dừng vì bạn rời màn hình — sẽ tự bật lại khi quay lại.", "warn");
+        if (this.wake) { try { await this.wake.release(); } catch { /* */ } this.wake = null; }
+      }
+      return;
     }
+    this.checkUpdates();
+    if (this.on && this.micPaused) await this.resumeMic();
+  }
+
+  async resumeMic(ctx = null) {
+    if (!this.on) return;
+    try {
+      await this.recognizer.resume(ctx);
+      this.audioCtx = this.recognizer.ctx;
+      this.micPaused = false;
+      this.hideTap();
+      $("micLevel").classList.remove("paused");
+      this.keepAwake(true);
+      this.setStatus("🎙 Đã bật lại micro — đang nghe tiếp (nói tiếng Anh)", "ok");
+    } catch (e) {
+      this.waitTap(e);
+    }
+  }
+
+  /** The mic stopped while on screen (a call, Siri, another app took it). */
+  async micLost() {
+    if (!this.on || document.visibilityState !== "visible" || this.micBusy) return;
+    this.micBusy = true;
+    try {
+      this.micPaused = true;
+      await this.recognizer.pause();
+      await this.resumeMic();
+    } finally {
+      this.micBusy = false;
+    }
+  }
+
+  /** iPad only lets audio start again after a tap: a big button; any tap on the screen also works. */
+  waitTap(err, fresh = false) {
+    if (!this.on) return;
+    logError("mic: " + (err?.message || err));
+    if (err?.name === "NotAllowedError") {
+      this.handle("force_off", null);
+      this.setStatus("Chưa cho phép dùng micro. Vào Cài đặt → Safari (hoặc app) → Micro, rồi bật ON lại.", "err");
+      return;
+    }
+    this.micPaused = !fresh;
+    $("micTap").hidden = false;
+    this.setStatus("🎙 Chạm vào màn hình để bật lại micro.", "warn");
+    if (this.tapHandler) return;
+    this.tapHandler = (ev) => {
+      if (ev.target?.id === "toggle") return;              // ON/OFF does its own thing
+      this.hideTap();
+      const ctx = new AudioContext();                       // made during the tap: iPad lets it run
+      ctx.resume().catch(() => {});
+      if (fresh) { this.audioCtx = ctx; this.startListening(); }
+      else this.resumeMic(ctx);
+    };
+    document.addEventListener("pointerdown", this.tapHandler, true);
+  }
+
+  hideTap() {
+    $("micTap").hidden = true;
+    if (this.tapHandler) document.removeEventListener("pointerdown", this.tapHandler, true);
+    this.tapHandler = null;
+  }
+
+  /** 5 bars next to ON: how loud the sound coming from the mic is. */
+  showLevel(rms) {
+    const now = performance.now();
+    if (rms && now - (this.levelAt || 0) < 90) return;
+    this.levelAt = now;
+    const db = rms > 0 ? 20 * Math.log10(rms) : -100;       // about -60 dB (quiet room) .. -10 dB (loud)
+    const lit = Math.max(0, Math.min(5, Math.round((db + 62) / 9)));
+    $("micLevel").querySelectorAll("i").forEach((b, k) => b.classList.toggle("lit", k < lit));
   }
 
   // ---------------- Backup / Restore (same file format as the desktop app) ----------------
@@ -808,58 +890,95 @@ class App {
     }
     if (this.order.length && !confirm("Nội dung hiện tại sẽ được thay bằng nội dung trong file backup. Tiếp tục?")) return;
     if (this.on) this.toggleOnOff();                     // stop listening while loading
-    this.loadSession(data);
-    this.setStatus(`✓ Đã restore: ${file.name} (${(data.rows || []).length} dòng)`, "ok");
+    const t0 = performance.now();
+    const failed = this.loadSession(data);
+    const blocks = (this.lastSummary.match(/^\[\d\d:\d\d\]$/gm) || []).length;
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    const msg = `Đã restore: ${file.name} — ${this.order.length} dòng, ${blocks} khối ý chính (${secs} s)`;
+    if (failed.length) {
+      this.setStatus(`⚠ ${msg}. Không khôi phục được: ${failed.join(", ")}`, "warn");
+      alert(`Một phần của backup không khôi phục được: ${failed.join(", ")}.\nCác phần khác đã được khôi phục.`);
+    } else {
+      this.setStatus(`✓ ${msg}`, "ok");
+    }
   }
 
-  /** Rebuild every pane from backup data (also restores voices so new speech matches old speakers). */
+  /** Rebuild every pane from backup data (also restores voices so new speech matches old speakers).
+   *  Key takeaways come first and each part on its own, so one failing part does not drop the rest
+   *  (Windows 1.8.6). Rows are built off-screen and scrolled once at the end (Windows 1.8.8).
+   *  Returns the names of the parts that failed. */
   loadSession(data) {
-    for (const r of this.rows.values()) { r.enEl.remove(); r.viEl.remove(); }
-    this.rows.clear();
-    this.order = [];
+    const failed = [];
+    const part = (name, fn) => {
+      try { fn(); } catch (e) { console.error("restore", name, e); logError(`restore ${name}: ${e.message || e}`); failed.push(name); }
+    };
+    part("Ý chính", () => {
+      this.lastSummary = String(data.takeaways || "");
+      this.renderTakeaways(this.lastSummary);
+      this.takeFollow = true;
+    });
     const sp = data.speakers || {};
     const conv = (d, f = (v) => v) => Object.fromEntries(Object.entries(d || {}).map(([k, v]) => [+k, f(v)]));
-    this.spkCustom = conv(sp.custom);
-    this.teachers = (sp.teachers || []).map(Number);
-    this.spkTalk = conv(sp.talk, Number);
-    this.spkAlias = conv(sp.alias, Number);
-    this.uidSpk = {};
-    const tr = this.recognizer.speakers;
-    tr.sums = new Map(Object.entries(sp.voices || {}).map(([k, v]) => [+k, Float32Array.from(v)]));
-    tr.talk = { ...this.spkTalk };
-    tr.merged = { ...this.spkAlias };
-    tr.nextId = +(sp.next_id ?? (Math.max(0, ...tr.sums.keys()) + 1));
-    tr.last = null;
-    this.translator.en = {};
-    this.translator.vi = {};
-    this.translator.gen = {};
-    const rows = data.rows || [];
-    for (const r of rows) {
-      const uid = +r.uid, sid = +r.speaker;
-      this.uidSpk[uid] = sid;
-      this.recognizer.uttSpk[uid] = sid;
-      this.translator.en[uid] = r.en || "";
-      this.translator.vi[uid] = r.vi || "";
-      this.translator.gen[uid] = 1;
-      this.addDraft(uid, r.en || "");
-      this.finalize([uid], r.en || "");
-      this.viSlot(uid);
-      this.viPiece(uid, 1, r.vi || " ");
-    }
-    this.recognizer.uttId = Math.max(this.recognizer.uttId, ...rows.map((r) => +r.uid));
-    this.relabel();
-    this.transcript = (data.transcript || []).map((t) => [+t[0], t[1]]);
-    this.lastSummary = data.takeaways || "";
-    this.renderTakeaways(this.lastSummary);
-    this.takeFollow = true;
-    if (this.summarizer) this.summarizer.doneN = this.transcript.length;
-    this.chatLog = [...(data.chat || [])];
-    $("chat").replaceChildren();
-    for (const t of this.chatLog) this.chatTurn(t.q || "", t.files || [], t.a || "");
-    this.chatter.history = [...(data.chat_history || [])];
+    part("người nói", () => {
+      this.spkCustom = conv(sp.custom);
+      this.teachers = (sp.teachers || []).map(Number);
+      this.spkTalk = conv(sp.talk, Number);
+      this.spkAlias = conv(sp.alias, Number);
+      const tr = this.recognizer.speakers;
+      tr.sums = new Map(Object.entries(sp.voices || {}).map(([k, v]) => [+k, Float32Array.from(v)]));
+      tr.talk = { ...this.spkTalk };
+      tr.merged = { ...this.spkAlias };
+      tr.nextId = +(sp.next_id ?? (Math.max(0, ...tr.sums.keys()) + 1));
+      tr.last = null;
+    });
+    part("các dòng Anh | Việt", () => {
+      for (const r of this.rows.values()) { r.enEl.remove(); r.viEl.remove(); }
+      this.rows.clear();
+      this.order = [];
+      this.uidSpk = {};
+      this.translator.en = {};
+      this.translator.vi = {};
+      this.translator.gen = {};
+      this.setPartial("");
+      const rows = data.rows || [];
+      const frag = document.createDocumentFragment();
+      let maxUid = this.recognizer.uttId;
+      for (const r of rows) {
+        const uid = +r.uid, sid = +r.speaker;
+        if (!Number.isFinite(uid) || this.rows.has(uid)) continue;
+        const en = String(r.en || ""), vi = String(r.vi || "");
+        this.uidSpk[uid] = sid;
+        this.recognizer.uttSpk[uid] = sid;
+        this.translator.en[uid] = en;
+        this.translator.vi[uid] = vi;
+        this.translator.gen[uid] = 1;
+        const row = { uid, sid, en, draft: false, vi, viGen: 1, viFilled: true,
+                      enEl: this.cell("en", uid), viEl: this.cell("vi", uid) };
+        row.enEl.lastChild.textContent = splitSentences(en.trim());
+        row.viEl.lastChild.textContent = splitSentences(vi.trim() || " ");
+        this.rows.set(uid, row);
+        this.order.push(uid);
+        frag.append(row.enEl, row.viEl);
+        maxUid = Math.max(maxUid, uid);
+      }
+      $("rows").insertBefore(frag, $("partialEn"));     // one DOM change for all rows
+      this.recognizer.uttId = maxUid;
+      this.relabel();
+    });
+    part("bản ghi lời giảng", () => {
+      this.transcript = (data.transcript || []).map((t) => [+t[0], t[1]]);
+      if (this.summarizer) this.summarizer.doneN = this.transcript.length;
+    });
+    part("khung Claude", () => {
+      this.chatLog = [...(data.chat || [])];
+      $("chat").replaceChildren();
+      for (const t of this.chatLog) this.chatTurn(t.q || "", t.files || [], t.a || "");
+      this.chatter.history = [...(data.chat_history || [])];
+    });
     this.follow = true;
     this.followNow();
     this.scrollEnd($("summary"));
+    return failed;
   }
 
   // ---------------- TestFlight-style updates ----------------

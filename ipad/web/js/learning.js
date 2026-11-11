@@ -791,7 +791,14 @@ export async function planSteps(lib, key, ex) {
   return steps;
 }
 
-// ---- guided exercises: rules for Claude and the markers it writes (v1.8.5) ----
+// ---- guided exercises: rules for Claude and the markers it writes (v1.8.5, drafts v1.8.9) ----
+// how Claude prepares the learner's next input: as complete as possible, blanks only for what is unknown
+const DRAFT_RULE = (
+  "prepare that input for them as completely as possible, between a line '----- MẪU BƯỚC SAU -----' and a " +
+  "line '----- HẾT MẪU -----': copy the course book's template for that step when there is one; fill in " +
+  "everything already known — from the book, from the results of earlier steps in this conversation, and " +
+  "from what the learner already gave; leave ONLY what is truly unknown as [cần điền: short description]. " +
+  "Then end with the line [[CẦN NHẬP TIẾP: item 1 | item 2]] listing just those unknown items (in Vietnamese).");
 export const EXERCISE_RULES = (
   "<exercise_rules>\n" +
   "You guide the learner through ONE step of a course exercise. Be very brief: no long explanations.\n" +
@@ -803,24 +810,28 @@ export const EXERCISE_RULES = (
   "course book's template when it has one, filled in with the learner's information).\n" +
   "3. Then one line: '➡ Mang sang bước sau: ...' with only what the next step needs from this result (very " +
   "short). Skip it at the last step.\n" +
-  "4. If the next step (see <next_step>) will need information from the learner, end with the line " +
-  "[[CẦN NHẬP TIẾP: item 1 | item 2]] (item names in Vietnamese).\n" +
+  "4. If the next step (see <next_step>) will need input from the learner (information, a plan, a prompt to " +
+  "write...), {draft}\n" +
   "5. Finish with the line [[XONG BƯỚC]].\n" +
   "Reply in Vietnamese.\n" +
-  "</exercise_rules>");
+  "</exercise_rules>").replace("{draft}", DRAFT_RULE);
 export const OVERVIEW_RULES = (
   "<overview_rules>\n" +
   "Summarize the exercise in 2-3 short lines (task, goal, expected result) — just enough to understand it. " +
-  "Do not start any step. If the first step (see <next_step>) will need information from the learner, end " +
-  "with the line [[CẦN NHẬP TIẾP: item 1 | item 2]] (item names in Vietnamese). Reply in Vietnamese.\n" +
+  "Do not start any step. If the first step (see <next_step>) will need input from the learner, " +
+  DRAFT_RULE + " Reply in Vietnamese.\n" +
   "</overview_rules>");
 const MARKER = /\[\[\s*(?:CẦN NHẬP|CAN NHAP|XONG BƯỚC|XONG BUOC)[^\]]*\]\]/gi;
 const NEEDS_INPUT = /\[\[\s*(?:CẦN NHẬP|CAN NHAP)(?!\s*TI)\s*:?\s*([^\]]*)\]\]/i;
 const NEXT_INPUT = /\[\[\s*(?:CẦN NHẬP TIẾP|CAN NHAP TIEP)\s*:?\s*([^\]]*)\]\]/i;
 const CARRY = /(?:➡\s*)?Mang sang bước sau\s*:\s*(.+)/i;
 const DONE = /\[\[\s*(?:XONG BƯỚC|XONG BUOC)\s*\]\]/i;
+const DRAFT_BLOCK = /-{3,} *MẪU BƯỚC SAU *-{3,} *\n([\s\S]*?)\n *-{3,} *HẾT MẪU *-{3,}/i;
+const DRAFT_ANY = /-{3,} *MẪU BƯỚC SAU *-{3,} *\n[\s\S]*?(?:\n *-{3,} *HẾT MẪU *-{3,}|$)/gi;
+const BLANK = /\[cần điền[^\]]*\]/gi;
+const draftOf = (raw) => { const m = DRAFT_BLOCK.exec(raw || ""); return m ? m[1].trim() : null; };
 const PROMPT_BLOCK = /-{3,} *PROMPT *-{3,} *\n([\s\S]*?)\n *-{3,} *HẾT PROMPT *-{3,}/gi;
-export const stripMarkers = (t) => String(t || "").replace(MARKER, "").replace(/[ \t]+\n/g, "\n").trim();
+export const stripMarkers = (t) => String(t || "").replace(DRAFT_ANY, "").replace(MARKER, "").replace(/[ \t]+\n/g, "\n").trim();
 const NO_EMOJI = /[\u{10000}-\u{10FFFF}☀-➿️‍]/gu;    // the PDF font has no emoji
 const fields = (m) => (m ? m[1].split("|").map((f) => f.trim()).filter(Boolean) : null);
 
@@ -1006,8 +1017,8 @@ export async function solutionPdf(lib, session, summary) {
     }
     if (item.input) {
       let filled = item.q;
-      const at = filled.toLowerCase().indexOf("thông tin của tôi:");      // only the lines the learner filled in
-      if (at >= 0) filled = filled.slice(at + "thông tin của tôi:".length);
+      const m = /thông tin của tôi[^\n]*\n/i.exec(filled);                // only what the learner sent
+      if (m) filled = filled.slice(m.index + m[0].length);
       blocks.push({ type: "instr", runs: [["Thông tin của học viên:", true], ["\n", false],
         ...filled.trim().split("\n").flatMap((ln, k) => (k ? [["\n", false], [ln, false]] : [[ln, false]]))] });
     }
@@ -1526,7 +1537,7 @@ export class LearningUI {
     if (this.session) this.saveSession();
     this.session = null;
     const body = el("div", "lform");
-    let mode = "big";
+    let mode = this.lib.data.ex_mode === "doc" ? "doc" : "big";       // the mode used last time
     const modes = el("div", "actions");
     for (const [val, txt] of [["big", "Bài tập lớn (đọc toàn bộ thư mục, theo các bước)"],
                               ["doc", "Theo file bài tập (chọn file cụ thể)"]]) {
@@ -1535,7 +1546,7 @@ export class LearningUI {
       r.type = "radio";
       r.name = "xmode";
       r.checked = val === mode;
-      r.onchange = () => { mode = val; fill(); };
+      r.onchange = () => { mode = val; this.lib.data.ex_mode = val; this.lib.save(); fill(); };
       lab.append(r, " " + txt);
       modes.append(lab);
     }
@@ -1575,7 +1586,7 @@ export class LearningUI {
         const n = (this.lib.data.big_exercises || []).length;
         status.textContent = upd ? `${n} bài tập lớn · cập nhật ${upd}` : "Chưa có danh sách — nhấn 🔄 Refresh để Claude đọc toàn bộ thư mục.";
       } else {
-        status.textContent = "Chọn một file bài tập: bấm ▶ để làm lần lượt toàn bộ bài trong file, hoặc mở file và chọn một bài cụ thể.";
+        status.textContent = "Chọn dòng 📄 (cả file: làm lần lượt mọi bài con) hoặc một dòng ✏ (một bài con), rồi bấm ▶ Bắt đầu.";
       }
     };
     // start working out the steps in the background as soon as an item is selected, so that ▶ Bắt đầu shows
@@ -1605,7 +1616,6 @@ export class LearningUI {
       detail.textContent = "";
       if (it.kind !== "big") prepare(it);
       if (it.kind === "file") {
-        rowEl.nextSibling?.classList?.contains("exchildren") && rowEl.nextSibling.classList.add("open");
         const kp = knownFilePlan(it.doc);
         detail.textContent = (kp ? progressNote(fileExercise(it.doc, kp[0], kp[1])).trim() + "\n" : "") +
           `${it.doc.description || ""}\n\n` + (it.exs.length
@@ -1648,11 +1658,11 @@ export class LearningUI {
         for (const d of this.lib.docs()) {
           if (["journal_template", "certificate", "agenda"].includes(d.kind)) continue;
           const exs = fileExercises(d);
-          list.append(rowOf([String(d.day || "-"), "📄 " + clean(d.title || d.name), exs.length ? `${exs.length} bài` : "-", d.name],
+          list.append(rowOf([String(d.day || "-"), "📄 " + clean(d.title || d.name), exs.length ? `${exs.length} bài con` : "-", d.name],
                             { kind: "file", doc: d, exs }, "exrow file"));
-          const kids = el("div", "exchildren");
-          for (const ex of exs) {
-            kids.append(rowOf([String(d.day || "-"), "✏ " + ex.title, String(ex.steps.length || "-"), d.name],
+          const kids = el("div", "exchildren open");          // shown open: the file or one sub-exercise
+          for (const [j, ex] of exs.entries()) {
+            kids.append(rowOf([String(d.day || "-"), `✏ ${j + 1}. ${ex.title}`, ex.steps.length ? `${ex.steps.length} bước` : "-", d.name],
                               { kind: "ex", doc: d, ex }, "exrow child"));
           }
           list.append(kids);
@@ -1755,7 +1765,7 @@ export class LearningUI {
     const d = new Date();
     (this.lib.data.sessions = this.lib.data.sessions || {})[s.key] = {
       ex: s.ex, i: s.i, log: s.log, overview: s.overview || "", awaiting: s.awaiting || null, carry: s.carry || null,
-      next_inputs: s.next_inputs || null, done,
+      next_inputs: s.next_inputs || null, next_draft: s.next_draft || null, done,
       time: `${pad(d.getDate())}/${pad(d.getMonth() + 1)} ${pad(d.getHours())}:${pad(d.getMinutes())}` };
     await this.lib.save();
   }
@@ -1770,7 +1780,7 @@ export class LearningUI {
       // an exercise opened before: carry on where it stopped
       this.session = { ex, i: Math.min(saved.i, steps.length), log: saved.log || [], overview: saved.overview || "",
                        key, resume: true };
-      for (const k of ["awaiting", "carry", "next_inputs"]) if (saved[k]) this.session[k] = saved[k];
+      for (const k of ["awaiting", "carry", "next_inputs", "next_draft"]) if (saved[k]) this.session[k] = saved[k];
       const k = this.session.i;
       this.chatNote(`Tiếp tục bài "${ex.title}" (đã lưu lúc ${saved.time || ""}): đã xong ${k}/${steps.length} bước. ` +
                     "Muốn làm lại từ đầu: Exercises → tích \"Làm lại từ đầu\"." +
@@ -1849,19 +1859,25 @@ export class LearningUI {
     const lines = [`${head}: ${step.title}.`, step.instruction];
     if (newPart && step.part_goal) lines.push(`Mục tiêu bài này: ${step.part_goal}`);
     if (s.carry) lines.push(`Mang sang từ bước trước: ${s.carry}`);
-    if (s.next_inputs) {                                       // Claude said this step needs the learner's information
+    const draft = s.next_draft;
+    if (draft) {                     // Claude prepared this input: template + known values, blanks for the rest
+      lines.push("Thông tin của tôi (đã điền sẵn — chỉ cần điền các chỗ [cần điền: ...]):");
+      lines.push(draft);
+    } else if (s.next_inputs) {                                // Claude said this step needs the learner's information
       lines.push("Thông tin của tôi:");
       lines.push(...s.next_inputs.map((f) => `• ${f}: `));
     }
     let label = step.part ? `${this.stepName(i)} · ${step.part_title.slice(0, 25)}` : `Bài tập · ${this.stepName(i)} · ${ex.title.slice(0, 30)}`;
-    if (s.next_inputs) {
-      label += " · điền thông tin";
-      this.app.setStatus("🎓 Điền thông tin vào mẫu trong ô nhập rồi gửi.", "warn");
+    const blanks = (draft || "").match(BLANK)?.length || 0;
+    if (draft || s.next_inputs) {
+      label += draft ? ` · còn ${blanks} chỗ cần điền` : " · điền thông tin";
+      this.app.setStatus(draft ? `🎓 Bản nháp đã điền sẵn — còn ${blanks} chỗ [cần điền] trong ô nhập.`
+                               : "🎓 Điền thông tin vào mẫu trong ô nhập rồi gửi.", "warn");
     }
     // the documents go again with each new sub-exercise and now and then, so they stay in Claude's recent
     // history (the overview already sent them)
     const ids = (i > 0 && (i % 6 === 0 || newPart)) || s.resume ? ex.doc_ids || [] : [];
-    this.setPrompt(lines.join("\n"), { kind: "exstep", step: i, doc_ids: ids, label, input: !!s.next_inputs,
+    this.setPrompt(lines.join("\n"), { kind: "exstep", step: i, doc_ids: ids, label, input: !!(draft || s.next_inputs),
       blocks: [{ type: "text", text: EXERCISE_RULES }, this.nextStepBlock(i), ...this.resumeBlocks()] });
   }
 
@@ -1890,6 +1906,7 @@ export class LearningUI {
     const marker = [...document.querySelectorAll("#chat .ansStart")].pop();
     if (!marker) return;
     document.getElementById("chat").normalize();
+    this.hideDraft(marker);
     const nodes = [];
     for (let n = marker.nextSibling; n; n = n.nextSibling) if (n.nodeType === Node.TEXT_NODE) nodes.push(n);
     for (const n of nodes) {
@@ -1915,6 +1932,33 @@ export class LearningUI {
       n.replaceWith(frag);
     }
     if (turn) turn.a = stripMarkers(turn.a);
+  }
+
+  /** The draft for the next step goes into the prompt box, not into the answers pane (it may span links). */
+  hideDraft(marker) {
+    let inDraft = false;
+    for (let n = marker.nextSibling; n;) {
+      const next = n.nextSibling;
+      if (n.nodeType === Node.TEXT_NODE) {
+        let t = n.data, out = "";
+        while (t) {
+          if (!inDraft) {
+            const m = /-{3,} *MẪU BƯỚC SAU *-{3,}/i.exec(t);
+            if (!m) { out += t; break; }
+            out += t.slice(0, m.index) + "📝 (bản nháp cho bước sau đã được điền sẵn vào ô nhập)";
+            t = t.slice(m.index + m[0].length);
+            inDraft = true;
+          } else {
+            const m = /-{3,} *HẾT MẪU *-{3,}/i.exec(t);
+            if (!m) break;
+            t = t.slice(m.index + m[0].length);
+            inDraft = false;
+          }
+        }
+        if (out !== n.data) n.data = out;
+      } else if (inDraft) n.remove();
+      n = next;
+    }
   }
 
   async copyText(text) {
@@ -1945,9 +1989,11 @@ export class LearningUI {
     if (kind === "exstep" && job.step === s.i && ok && answer) {
       delete s.resume;                                         // Claude has the context again from here on
       const nxt = fields(NEXT_INPUT.exec(raw));
+      const draft = draftOf(raw);
       if (s.i < 0) {                                           // the overview
         s.overview = answer;
         s.next_inputs = nxt;
+        s.next_draft = draft;
         s.i = 0;
         this.saveSession();
         this.promptStep();
@@ -1966,6 +2012,7 @@ export class LearningUI {
       const carry = CARRY.exec(raw.replace(MARKER, ""));
       s.carry = carry ? carry[1].trim() : null;
       s.next_inputs = nxt;
+      s.next_draft = draft;
       s.i += 1;
       this.saveSession();
       if (s.i < steps.length) this.promptStep();               // next step's prompt, ready to send

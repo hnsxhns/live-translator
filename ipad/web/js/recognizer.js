@@ -14,6 +14,43 @@ const UTT_HARD = 7.0;           // always cut by this length (s)
 const WHISPER_BACKLOG = 3;      // if Whisper falls further behind, older utterances keep their draft text
 
 const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+const within = (p, ms) => Promise.race([Promise.resolve(p).catch(() => {}), new Promise((r) => setTimeout(r, ms))]);
+
+/** A running AudioContext: the given one if it can run, else a new one (iPad allows that while the mic is
+ *  open). resume() is never awaited without a time limit: it can hang while iPad has the audio "interrupted". */
+async function runningContext(ctx) {
+  if (ctx && ctx.state !== "closed") {
+    if (ctx.state !== "running") await within(ctx.resume(), 1500);
+    if (ctx.state === "running") return ctx;
+    within(ctx.close(), 500);
+  }
+  const fresh = new AudioContext();
+  if (fresh.state !== "running") await within(fresh.resume(), 1500);
+  if (fresh.state === "running") return fresh;
+  within(fresh.close(), 500);
+  const e = new Error("iPad cần chạm vào màn hình để bật âm thanh");
+  e.code = "needTap";
+  throw e;
+}
+
+/** Main-thread version of capture-worklet.js (for the ScriptProcessor fallback): -> 16 kHz blocks of 100 ms. */
+function downsampler(rate, out) {
+  const ratio = rate / SR;
+  let acc = [], pos = 0, buf = new Float32Array(1600), n = 0;
+  return (ch) => {
+    for (let i = 0; i < ch.length; i++) acc.push(ch[i]);
+    while (pos + ratio <= acc.length) {
+      const a = Math.floor(pos), b = Math.max(a + 1, Math.floor(pos + ratio));
+      let s = 0;
+      for (let k = a; k < b; k++) s += acc[k];
+      buf[n++] = s / (b - a);
+      pos += ratio;
+      if (n === buf.length) { out(buf); buf = new Float32Array(1600); n = 0; }
+    }
+    const drop = Math.floor(pos);
+    if (drop > 0) { acc = acc.slice(drop); pos -= drop; }
+  };
+}
 
 class WorkerClient {
   constructor(url) {
@@ -88,26 +125,21 @@ export class Recognizer {
     await Promise.all([spkReady, whisperReady]);
   }
 
+  // ---------------- microphone ----------------
+  // iPad pitfalls handled here (the cause of "nothing is heard"):
+  //  - ctx.resume() can hang for ever while the context is "interrupted" (after the mic permission prompt,
+  //    a call, another app): never wait on it without a time limit, make a new context instead;
+  //  - a context made before the mic was opened sometimes gets only zeros from the mic: checked after
+  //    start (watchdog) and fixed by opening the mic and the context again, then by the older
+  //    ScriptProcessor capture;
+  //  - an AudioWorklet module belongs to one context: added again for each new context.
+
   /** ctx: an AudioContext created during the user's tap (iPad only allows audio started by a tap). */
   async start(ctx) {
-    this.emit("status", "Đang nghe... (nói tiếng Anh)");
-    this.ctx = ctx;
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: true },
-    });
-    if (!this.workletAdded) {
-      await this.ctx.audioWorklet.addModule(new URL("capture-worklet.js", import.meta.url));
-      this.workletAdded = true;
-    }
-    this.src = this.ctx.createMediaStreamSource(this.stream);
-    this.node = new AudioWorkletNode(this.ctx, "lt-capture");
-    this.src.connect(this.node);
-    // iOS only runs a worklet that is connected to the output; keep it silent
-    this.mute = this.ctx.createGain();
-    this.mute.gain.value = 0;
-    this.node.connect(this.mute).connect(this.ctx.destination);
-    await this.ctx.resume();
-
+    this.emit("status", "Đang mở micro...");
+    this.fixes = 0;
+    this.useScript = false;
+    await this._open(ctx);
     this.rec = new this.vosk.KaldiRecognizer(SR);
     this.rec.setWords(true);
     this.rec.on("result", (m) => this._onResult(m.result));
@@ -125,40 +157,154 @@ export class Recognizer {
     this.quiet = 0;
     this.cutAsked = false;
     this.lastPartial = "";
+    this.paused = false;
     this.running = true;
-    this.node.port.onmessage = (ev) => this._onAudio(ev.data);
+    this.emit("status", "Đang nghe... (nói tiếng Anh)");
+    this._watch();
+  }
+
+  /** Mic + a running context + the capture graph. Throws an error with code "needTap" if iPad wants a tap. */
+  async _open(ctx) {
+    this.stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: true },
+    });
+    try {
+      this.ctx = await runningContext(ctx);
+      await this._graph();
+    } catch (e) {
+      this._close();
+      throw e;
+    }
     for (const t of this.stream.getAudioTracks()) {
       t.onended = () => { if (this.running) this.emit("mic_lost", null); };
     }
+    this.ctx.onstatechange = () => {             // a call, Siri, another app took the audio
+      if (this.running && this.ctx.state !== "running") this.emit("mic_lost", null);
+    };
+  }
+
+  async _graph() {
+    const ctx = this.ctx;
+    this.src = ctx.createMediaStreamSource(this.stream);
+    // iOS only runs a capture node that is connected to the output; keep it silent
+    this.mute = ctx.createGain();
+    this.mute.gain.value = 0;
+    if (ctx.audioWorklet && typeof AudioWorkletNode !== "undefined" && !this.useScript) {
+      if (this.workletCtx !== ctx) {
+        await ctx.audioWorklet.addModule(new URL("capture-worklet.js", import.meta.url));
+        this.workletCtx = ctx;
+      }
+      this.node = new AudioWorkletNode(ctx, "lt-capture");
+      this.node.port.onmessage = (ev) => this._onAudio(ev.data);
+      this.mode = "worklet";
+    } else {
+      this.node = ctx.createScriptProcessor(4096, 1, 1);
+      const down = downsampler(ctx.sampleRate, (block) => this._onAudio(block));
+      this.node.onaudioprocess = (ev) => down(ev.inputBuffer.getChannelData(0));
+      this.mode = "script";
+    }
+    this.src.connect(this.node);
+    this.node.connect(this.mute).connect(ctx.destination);
+  }
+
+  /** Disconnect the graph and release the mic (the context and the recognizer stay). */
+  _close() {
+    clearTimeout(this.watchTimer);
+    try { if (this.node?.port) this.node.port.onmessage = null; } catch { /* */ }
+    try { if (this.node) this.node.onaudioprocess = null; } catch { /* */ }
+    for (const n of [this.src, this.node, this.mute]) { try { n?.disconnect(); } catch { /* */ } }
+    this.src = this.node = this.mute = null;
+    if (this.ctx) this.ctx.onstatechange = null;
+    for (const t of this.stream?.getTracks() || []) { t.onended = null; t.stop(); }
+    this.stream = null;
+  }
+
+  /** After start: is sound really coming in? Real mic noise is never exactly 0. Fixes itself if not. */
+  _watch() {
+    this.blocks = 0;
+    this.peak = 0;
+    clearTimeout(this.watchTimer);
+    this.watchTimer = setTimeout(async () => {
+      if (!this.running || (this.blocks > 0 && this.peak > 0)) return;
+      const why = this.blocks ? "chỉ nhận được im lặng" : "không nhận được âm thanh";
+      this.fixes += 1;
+      console.warn(`mic: ${why} (${this.mode}, ctx ${this.ctx?.state}, ${this.ctx?.sampleRate} Hz) -> fix ${this.fixes}`);
+      if (this.fixes > 2) {
+        this.emit("mic_silent", why);
+        return;
+      }
+      this.emit("status", "Micro chưa thu được tiếng — đang mở lại micro...");
+      this.running = false;
+      this._close();
+      if (this.fixes === 2) this.useScript = true;          // the older capture way
+      const old = this.ctx;
+      this.ctx = null;
+      try { await old?.close(); } catch { /* */ }
+      this.workletCtx = null;
+      try {
+        await this._open(null);                              // the mic first, then a new context
+        this.running = true;
+        this.emit("ctx", this.ctx);
+        this.emit("status", "Đang nghe... (nói tiếng Anh)");
+        this._watch();
+      } catch (e) {
+        this.paused = true;
+        this.emit("mic_resume_failed", e);
+      }
+    }, 3000);
   }
 
   async stop() {
-    if (!this.running) return;
+    if (!this.running && !this.paused) return;
     this.running = false;
+    this.paused = false;
     try {
       this.rec.retrieveFinalResult();          // the last words still become an utterance
       await new Promise((r) => setTimeout(r, 600));
       this.rec.remove();
     } catch { /* recognizer already gone */ }
-    try { this.node.port.onmessage = null; this.src.disconnect(); this.node.disconnect(); } catch { /* */ }
-    for (const t of this.stream?.getTracks() || []) t.stop();
-    try { this.mute.disconnect(); await this.ctx.suspend(); } catch { /* */ }
+    this.rec = null;
+    this._close();
+    try { await this.ctx?.suspend(); } catch { /* */ }
+    this.emit("level", 0);
     this.emit("status", "Đã tắt.");
   }
 
-  /** iPad stopped the mic (app went to background, call...): start it again. */
-  async restart() {
+  /** Leaving the screen: the words so far become an utterance, the mic is released (iOS shows it off). */
+  async pause() {
+    if (!this.running) return;
     this.running = false;
-    try { this.rec?.remove(); } catch { /* */ }
-    try { this.node.port.onmessage = null; this.src.disconnect(); this.node.disconnect(); this.mute.disconnect(); } catch { /* */ }
-    for (const t of this.stream?.getTracks() || []) t.stop();
-    await this.ctx.resume();
-    if (this.ctx.state !== "running") throw new Error("audio suspended");
-    await this.start(this.ctx);
+    this.paused = true;
+    try { this.rec.retrieveFinalResult(); } catch { /* */ }
+    this._close();
+    try { await this.ctx?.suspend(); } catch { /* */ }
+    this.emit("level", 0);
+  }
+
+  /** Back on the screen: open the mic again and carry on with the same recognizer.
+   *  ctx: a context made during a tap, if there was one. Throws (code "needTap") when iPad wants a tap. */
+  async resume(ctx = null) {
+    if (this.running || !this.paused || !this.rec) return;
+    this.fixes = 0;
+    await this._open(ctx || this.ctx);
+    this.paused = false;
+    this.running = true;
+    this._watch();
+  }
+
+  /** iPad stopped the mic while on screen (call, Siri, another app): open it again. */
+  async restart() {
+    if (this.running) await this.pause();
+    await this.resume();
   }
 
   _onAudio(block) {
     if (!this.running) return;
+    let sq = 0, pk = 0;
+    for (let i = 0; i < block.length; i++) { const v = block[i]; sq += v * v; if (v > pk) pk = v; else if (-v > pk) pk = -v; }
+    this.blocks += 1;
+    if (pk > this.peak) this.peak = pk;
+    this.emit("level", Math.sqrt(sq / (block.length || 1)));
     this.chunks.push({ start: this.sent, data: block });
     this.sent += block.length;
     this.rec.acceptWaveformFloat(block, SR);

@@ -136,6 +136,19 @@ small { font-size: .82em; }
   font-size: 15px; letter-spacing: .03em; display: inline-flex; align-items: center; justify-content: center; gap: 8px;
   transition: background .2s, box-shadow .2s; }
 .onoff::before { content: ""; width: 10px; height: 10px; border-radius: 50%; background: currentColor; opacity: .8; }
+/* mic level: 5 bars next to ON (shows the mic is really hearing sound) */
+.miclevel { display: inline-flex; align-items: flex-end; gap: 2px; height: 22px; padding: 0 2px; }
+.miclevel[hidden] { display: none; }
+.miclevel i { width: 4px; border-radius: 2px; background: rgba(255,255,255,.22); transition: background .12s; }
+.miclevel i:nth-child(1) { height: 6px; } .miclevel i:nth-child(2) { height: 10px; } .miclevel i:nth-child(3) { height: 14px; }
+.miclevel i:nth-child(4) { height: 18px; } .miclevel i:nth-child(5) { height: 22px; }
+.miclevel i.lit { background: #5fd38d; }
+.miclevel.paused i { background: rgba(255,255,255,.12); }
+.mictap { position: fixed; left: 50%; top: 84px; transform: translateX(-50%); z-index: 60; border: 0; border-radius: 99px;
+  padding: 14px 26px; font-size: 17px; font-weight: 700; color: #fff; background: var(--accent);
+  box-shadow: 0 10px 30px rgba(0,0,0,.25); animation: tapglow 1.6s ease-in-out infinite; }
+@keyframes tapglow { 0%, 100% { box-shadow: 0 10px 30px rgba(0,0,0,.25), 0 0 0 0 rgba(201,100,66,.5); } 50% { box-shadow: 0 10px 30px rgba(0,0,0,.25), 0 0 0 12px rgba(201,100,66,0); } }
+.mictap[hidden] { display: none; }
 .onoff.off { background: #4b4945; color: #e2ddd5; }
 .onoff.on { background: var(--ok); box-shadow: 0 0 0 4px rgba(46, 158, 99, .25); }
 .onoff.on::before { background: #fff; opacity: 1; animation: pulse 1.4s ease-in-out infinite; }
