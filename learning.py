@@ -269,6 +269,31 @@ def out_folder(lib, fallback):
     return d
 
 
+def course_terms(lib, max_chars=260):
+    """Words of this course Whisper should expect: acronyms and capitalised terms that keep coming back in the
+    library's documents, and the document titles. A short comma list (Whisper reads ~200 tokens of prompt)."""
+    from collections import Counter
+    counts = Counter()
+    for d in lib.docs():
+        text = lib.text(d)[:200_000]
+        for m in re.finditer(r"\b[A-Z]{2,6}s?\b", text):                   # ABT, KPI, KPIs, LLM...
+            counts[m.group(0)] += 1
+        for m in re.finditer(r"\b(?:[A-Z][a-z]+(?:[- ](?:of |and |to |the )?[A-Z][a-z]+){1,3})\b", text):
+            counts[m.group(0)] += 2                                        # multi-word Capitalised Terms
+    common = {"the", "this", "that", "part", "prompt", "table", "day", "and", "for", "with", "you", "your", "in",
+              "on", "at", "to", "of", "a", "an", "is", "it", "we", "our", "step", "note", "use", "all", "each", "not"}
+    def ok(t):
+        first = t.split()[0].lower()
+        return first not in common and not (t.isupper() and t.lower() in common | {"our", "are", "can", "will", "how"})
+    terms = [t for t, n in counts.most_common(80) if n >= 3 and ok(t)]
+    out = ""
+    for t in terms:
+        if len(out) + len(t) + 2 > max_chars:
+            break
+        out += (", " if out else "") + t
+    return (out + ".") if out else ""
+
+
 def fmt_date(iso):
     try:
         return time.strftime("%d/%m/%Y", time.strptime(iso, "%Y-%m-%d"))
@@ -1162,9 +1187,10 @@ MIME_EXT = {"application/pdf": ".pdf", "image/png": ".png", "image/jpeg": ".jpg"
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx"}
 
 
-def _http(url, method="GET", timeout=30):
+def _http(url, method="GET", timeout=30, headers=None):
     import urllib.request
-    req = urllib.request.Request(url, method=method, headers={"User-Agent": SOURCE_UA, "Accept": "*/*"})
+    req = urllib.request.Request(url, method=method, headers={"User-Agent": SOURCE_UA, "Accept": "*/*",
+                                                              **(headers or {})})
     return urllib.request.urlopen(req, timeout=timeout)       # noqa: S310  (http/https only, checked by callers)
 
 
@@ -1228,14 +1254,167 @@ def doc_links(url, exts):
     return out
 
 
-def download(url, folder, ext_hint=""):
-    """Download a file into folder (never overwriting a different file). Returns (path, sha256, newly saved)."""
+def cookie_header(cookies, url):
+    """'Cookie' header value for url from the login browser's cookies (domain and path must match)."""
+    from urllib.parse import urlparse
+    p = urlparse(url)
+    host, path = (p.hostname or "").lower(), p.path or "/"
+    out = []
+    for c in cookies or []:
+        dom = (c.get("domain") or "").lower().lstrip(".")
+        if dom and not (host == dom or host.endswith("." + dom)):
+            continue
+        if not path.startswith(c.get("path") or "/"):
+            continue
+        out.append(f"{c['name']}={c['value']}")
+    return "; ".join(out)
+
+
+def login_headers(page, url):
+    """Headers that make a download look like it comes from the signed-in browser window."""
+    h = {"Referer": page.get("url") or url}
+    if page.get("ua"):
+        h["User-Agent"] = page["ua"]
+    ck = cookie_header(page.get("cookies"), url)
+    if ck:
+        h["Cookie"] = ck
+    return h
+
+
+def probe_doc(url, headers):
+    """For a link without a file extension: what does the server send? Returns (ext, file name) for a document,
+    None for a web page. Reads only the headers."""
+    import email.message
+    with _http(url, timeout=20, headers=headers) as r:
+        ctype = (r.headers.get_content_type() or "").lower()
+        name = ""
+        cd = r.headers.get("Content-Disposition")
+        if cd:
+            msg = email.message.Message()
+            msg["content-disposition"] = cd
+            name = msg.get_filename() or ""
+    ext = os.path.splitext(name)[1].lower() or MIME_EXT.get(ctype, "")
+    if ctype == "text/html" and not name:
+        return None
+    return (ext, name) if ext else None
+
+
+def source_profile():
+    """Browser profile of the Source window (keeps the site login). One folder for every app version, so an
+    update does not ask for the login again."""
+    if os.environ.get("LT_SOURCE_PROFILE"):              # tests: never share the user's own login
+        return os.path.normpath(os.environ["LT_SOURCE_PROFILE"])
+    base = os.environ.get("LOCALAPPDATA") if sys.platform == "win32" else ""
+    if base:
+        return os.path.join(base, "LiveTranslator", "source_browser")
+    return os.path.join(A.DATA_DIR, "learning", "source_browser")
+
+
+LOGIN_PATH = re.compile(r"/(s/)?login\b|sign-?in|/sso\b|saml|oauth|/auth\b|/idp/", re.I)
+
+
+def is_login_url(url):
+    from urllib.parse import urlparse
+    return bool(LOGIN_PATH.search(urlparse(url).path or ""))
+
+
+def fix_source_url(url):
+    """A sign-in page saved as the Source page -> the page it leads to (its startURL/return parameter)."""
+    from urllib.parse import parse_qs, unquote, urljoin, urlparse
+    if not is_login_url(url):
+        return url
+    q = parse_qs(urlparse(url).query)
+    for k in ("startURL", "starturl", "returnUrl", "return_to", "redirect", "next", "RelayState"):
+        if q.get(k):
+            return urljoin(url, unquote(q[k][0]))
+    return url
+
+
+def save_source_debug(page):
+    """What the Source window saw (tabs, panel, links; never cookies) -> learning/source_debug.json, so a wrong
+    scan on a real site can be checked."""
+    try:
+        d = {k: page.get(k) for k in ("url", "title", "scope", "tab", "tabs", "panels", "clicks", "error")}
+        d["links"] = [{"href": l.get("href"), "text": l.get("text")} for l in (page.get("links") or [])[:200]]
+        d["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(os.path.join(A.DATA_DIR, "learning", "source_debug.json"), "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=1)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def wait_profile_free(profile, timeout=15.0):
+    """Wait until the previous Source window's browser has let go of the profile (it keeps it locked a few
+    seconds after closing; a new window on a locked profile never opens)."""
+    if sys.platform != "win32":
+        return True
+    ps = ("(Get-CimInstance Win32_Process -Filter \"name='msedgewebview2.exe'\" | Where-Object { $_.CommandLine "
+          "-like '*" + os.path.normpath(profile).replace("'", "''") + "*' }).Count")
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            r = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True,
+                               timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if (r.stdout.strip() or "0") == "0":
+                return True
+        except Exception:  # noqa: BLE001
+            return True
+        time.sleep(0.5)
+    return False                                    # still in use: an earlier Source window is open
+
+
+def salesforce_download(link):
+    """Salesforce sites (e.g. exec.mit.edu) link files to a preview page (/s/contentdocument/069...); the file
+    itself is at /sfc/servlet.shepherd/document/download/069.... Other links are returned unchanged."""
+    m = re.match(r"(https?://[^/]+)(/[^?#]*?)?/s/(contentdocument|contentversion)/((?:069|068)\w{12,15})", link)
+    if not m:
+        return link
+    kind = "document" if m.group(3) == "contentdocument" else "version"
+    return f"{m.group(1)}{m.group(2) or ''}/sfc/servlet.shepherd/{kind}/download/{m.group(4)}?operationContext=S1"
+
+
+def browser_doc_links(page, exts):
+    """Documents among the links the login window collected: by file extension, by a download attribute, or
+    (for links that look like downloads) by what the server sends. Returns [(url, link text, ext, file name)]."""
+    from urllib.parse import unquote, urlparse
+    out, seen, probed = [], set(), 0
+    for l in page.get("links") or []:
+        link = salesforce_download((l.get("href") or "").split("#")[0])
+        p = urlparse(link)
+        if p.scheme not in ("http", "https") or link in seen:
+            continue
+        seen.add(link)
+        text = l.get("text") or ""
+        dl = l.get("download") or ""
+        ext = os.path.splitext(unquote(p.path))[1].lower()
+        if ext in exts:
+            out.append((link, text, ext, os.path.basename(unquote(p.path))))
+        elif os.path.splitext(dl)[1].lower() in exts:
+            out.append((link, text, os.path.splitext(dl)[1].lower(), dl))
+        elif probed < 80 and (dl or re.search(r"download|export|attachment|file|resource|material|document|"
+                                              r"/d/|pluginfile|forcedownload|servlet\.shepherd", link, re.I)):
+            probed += 1
+            try:
+                got = probe_doc(link, login_headers(page, link))
+            except Exception:  # noqa: BLE001
+                got = None
+            if got and got[0] in exts:
+                out.append((link, text, got[0], got[1]))
+    return out
+
+
+def download(url, folder, ext_hint="", headers=None):
+    """Download a file into folder (never overwriting a different file). Returns (path, sha256, newly saved).
+    `headers` carries the login (cookies) for sites that need one."""
     import email.message
     from urllib.parse import unquote, urlparse
     os.makedirs(folder, exist_ok=True)
-    with _http(url, timeout=120) as r:
+    with _http(url, timeout=120, headers=headers) as r:
         name = ""
         cd = r.headers.get("Content-Disposition")
+        if (r.headers.get_content_type() or "").lower() == "text/html" and not cd:
+            # a web page instead of the file: usually the site's login page (login expired)
+            raise ValueError("trang web trả về một trang thay vì file (có thể cần đăng nhập lại trong cửa sổ Source)")
         if cd:
             msg = email.message.Message()
             msg["content-disposition"] = cd
@@ -1428,6 +1607,8 @@ class LearningUI:
                 if r["problems"]:
                     msg += "\nLưu ý:\n" + "\n".join("• " + p for p in r["problems"][:12])
                 self.later(lambda: self.chat_note(msg))
+                terms = course_terms(self.lib)                     # new documents: new words to expect
+                self.later(lambda: setattr(self.mw.recognizer, "glossary", terms))
                 self.mw.ui_q.put(("status", f"🎓 Đồng bộ xong: +{r['new']} tài liệu mới"))
             except Exception as e:  # noqa: BLE001
                 self.later(lambda: self.chat_note(f"Đồng bộ lỗi: {A.friendly_error(e)}", "err"))
@@ -1454,8 +1635,9 @@ class LearningUI:
         top = self._dialog("Source — trang web chứa tài liệu", "660x230")
         tk.Label(top, text="Link trang web chứa tài liệu khóa học:", font=(A.UI_FONT, 10, "bold"),
                  bg="white").pack(anchor="w", padx=14, pady=(14, 2))
-        tk.Label(top, text="Mỗi lần bấm 🌐 Source, app quét trang này; tài liệu mới (PDF, Word, ảnh, file chữ...) "
-                           "được tự tải về thư mục học (thư mục con Source) và upload cho Claude.",
+        tk.Label(top, text="Mỗi lần bấm 🌐 Source, trang này mở trong một cửa sổ trình duyệt của app: đăng nhập "
+                           "(chỉ lần đầu, app nhớ phiên), mở mục tài liệu (Materials) rồi bấm nút xanh 📥. Tài liệu "
+                           "chưa có trong thư mục học được tải về đó và upload cho Claude.",
                  bg="white", fg="#666", font=(A.UI_FONT, 9), wraplength=620, justify="left").pack(anchor="w", padx=14)
         var = tk.StringVar(value=current)
         entry = tk.Entry(top, textvariable=var, font=(A.UI_FONT, 10))
@@ -1470,7 +1652,7 @@ class LearningUI:
                 return
             result.append(url)
             top.destroy()
-        self._buttons(top, ok, ok="Lưu và quét")
+        self._buttons(top, ok, ok="Lưu và mở")
         top.wait_window()
         if not result:
             return None
@@ -1482,6 +1664,9 @@ class LearningUI:
         return result[0]
 
     def scan_source(self):
+        """Open the Source page in the login window (the login is remembered, so usually it opens signed in);
+        the user goes to the materials page and presses the button; documents not yet in the study folder are
+        downloaded into it, with the login, and uploaded for Claude."""
         if self.syncing:
             self.mw.status.config(text="⏳ Đang đồng bộ — chờ xong rồi bấm Source lại.", fg="#ffd479")
             return
@@ -1490,32 +1675,105 @@ class LearningUI:
             folder = filedialog.askdirectory(parent=self.root, title="Chọn thư mục học để lưu tài liệu tải về")
             if not folder:
                 return
-        url = self.lib.data["source_url"]
-        dest = os.path.join(folder, "Source")
+        url = fix_source_url(self.lib.data["source_url"])
+        if url != self.lib.data["source_url"]:               # a sign-in page was saved by v1.9.10: repair it
+            with self.lib.lock:
+                self.lib.data["source_url"] = url
+            self.lib.save()
+        out = os.path.join(A.DATA_DIR, "learning", f"source_page_{os.getpid()}.json")
+        profile = source_profile()                                       # keeps the site login
+        clicks = json.dumps(self.lib.data.get("source_clicks") or [], ensure_ascii=False)
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "--source-browser", url, out, profile, clicks]
+        else:
+            cmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(A.__file__)), "app.py"),
+                   "--source-browser", url, out, profile, clicks]
         self.syncing = True
-        self.chat_note(f"Đang quét {url} để tìm tài liệu mới...")
-        self.mw.busy("source", "Đang quét trang Source tìm tài liệu mới...")
+        self.chat_note(f"Đã mở {url} trong cửa sổ Source. Nếu đã đăng nhập từ lần trước, app tự tải sau vài giây "
+                       f"và tự đóng cửa sổ. Lần đầu: đăng nhập, mở trang chứa tài liệu (Materials), rồi bấm nút xanh "
+                       f"“📥 Tải tài liệu mới từ trang này” ở góc dưới — lần sau app nhớ trang đó và làm tự động.")
+        self.mw.busy("source", "Đang chờ bạn mở trang tài liệu trong cửa sổ Source...")
 
         def progress(msg):
             self.later(lambda: self.mw.busy("source", msg))
 
         def work():
-            got, dup, problems, links, r = [], 0, [], [], None
+            got, have_n, dup, problems, links, r = [], 0, 0, [], [], None
+            page = None
             try:
-                links = doc_links(url, SOURCE_EXTS & supported_exts())
+                if not wait_profile_free(profile):       # the last Source window may still be closing
+                    problems.append("cửa sổ Source trước vẫn đang mở — hãy đóng nó rồi bấm Source lại")
+                    return
+                try:
+                    proc = subprocess.Popen(cmd)
+                except Exception as e:  # noqa: BLE001
+                    problems.append(f"không mở được cửa sổ Source: {e}")
+                    return
+                proc.wait()
+                if os.path.exists(out):
+                    with open(out, encoding="utf-8") as f:
+                        page = json.load(f)
+                    os.remove(out)
+                if page is None:
+                    self.later(lambda: (self.mw.done("source"),
+                                        self.chat_note("Đã đóng cửa sổ Source mà chưa bấm “Tải tài liệu mới” — "
+                                                       "không tải gì.")))
+                    return
+                if page.get("error"):
+                    problems.append(page["error"])
+                    return
+                save_source_debug(page)
+                new_url = page.get("url") or url
+                if is_login_url(new_url):                    # never keep or scan a sign-in page
+                    problems.append("đó là trang đăng nhập — hãy đăng nhập, bấm tab Materials rồi bấm nút")
+                    return
+                with self.lib.lock:                          # next time: open this page, replay the clicks
+                    if page.get("clicks"):
+                        self.lib.data["source_clicks"] = page["clicks"]   # e.g. the "Materials" tab
+                    elif page.get("scope") == "panel" and page.get("tab"):
+                        self.lib.data["source_clicks"] = [{"text": page["tab"], "role": "tab", "tag": "A"}]
+                    elif page.get("scope") == "page":         # no tabs: the files are on the page itself
+                        self.lib.data["source_clicks"] = [{"text": "__page__"}]
+                    elif new_url != url:
+                        self.lib.data["source_clicks"] = []
+                    self.lib.data["source_url"] = new_url
+                progress("Đang tìm tài liệu trên trang...")
+                if page.get("scope") != "panel":             # no open tab: keep only this site's links
+                    from urllib.parse import urlparse
+                    host = (urlparse(new_url).hostname or "").lower()
+                    page["links"] = [l for l in page.get("links") or []
+                                     if (urlparse(l.get("href") or "").hostname or "").lower() == host]
+                links = browser_doc_links(page, SOURCE_EXTS & supported_exts())
                 known = self.lib.data.setdefault("source_files", {})
-                todo = [x for x in links if x[0] not in known]
+                # what is already in the study folder (any sub-folder): by file name and by content
+                names = set()
+                for base, dirs, files in os.walk(folder):
+                    dirs[:] = [d for d in dirs if not d.startswith(".")]
+                    names.update(n.lower() for n in files)
                 have = {d.get("sha") for d in self.lib.docs()}
+                todo = []
+                for link, text, ext, name in links:
+                    k = known.get(link)
+                    if (k and (k.get("name", "").lower() in names or k.get("sha") in have)) or \
+                            (name and safe_name(name).lower() in names):    # in the folder, or a known duplicate
+                        have_n += 1
+                    else:
+                        todo.append((link, text, ext))
                 for k, (link, text, ext) in enumerate(todo, 1):
                     progress(f"Đang tải tài liệu mới {k}/{len(todo)} từ Source...")
                     try:
-                        path, sha, created = download(link, dest, ext)
+                        path, sha, created = download(link, folder, ext, login_headers(page, link))
                     except Exception as e:  # noqa: BLE001
                         problems.append(f"{text or link}: {e}")
                         continue
                     with self.lib.lock:
-                        known[link] = {"name": os.path.basename(path), "sha": sha, "time": time.strftime("%Y-%m-%d %H:%M")}
-                    if sha in have:
+                        known[link] = {"name": os.path.basename(path), "sha": sha,
+                                       "time": time.strftime("%Y-%m-%d %H:%M")}
+                    if sha in have or not created:
                         dup += 1                                 # same content as a document already there
                         if created:
                             try:
@@ -1535,8 +1793,12 @@ class LearningUI:
                 problems.append(A.friendly_error(e) if isinstance(e, anthropic.APIError) else f"{type(e).__name__}: {e}")
             finally:
                 self.syncing = False
-            msg = (f"Source: {len(links)} link tài liệu trên trang; "
-                   + (f"{len(got)} tài liệu mới đã tải về {dest} và upload cho Claude:\n" +
+                if page is None and not problems:
+                    return
+            where = (page or {}).get("title") or (page or {}).get("url") or url
+            msg = (f"Source ({where}): {len(links)} tài liệu trên trang"
+                   + (f", {have_n} đã có trong thư mục học" if have_n else "") + "; "
+                   + (f"{len(got)} tài liệu mới đã tải về {folder} và upload cho Claude:\n" +
                       "\n".join(f"  • {n}" for n in got) if got else "không có tài liệu mới.")
                    + (f"\n{dup} file trùng nội dung với tài liệu đã có (bỏ qua)." if dup else ""))
             if problems:
@@ -2808,9 +3070,10 @@ class LearningUI:
         """Called by the app when the Journal prompt is sent: fill the PDF in the background."""
         template = self.lib.get(job["template"])
         day_docs = [self.lib.get(i) for i in job.get("doc_ids", []) if self.lib.get(i)]
-        en, vi, summary = self.mw._chat_context()
-        session = (f"<key_takeaways>\n{summary}\n</key_takeaways>\n<transcript_english>\n{en}\n</transcript_english>\n"
-                   f"<translation_vietnamese>\n{vi}\n</translation_vietnamese>") if (en or vi or summary) else ""
+        # the English transcript and the takeaways (the Vietnamese translation would repeat it at the same cost)
+        en, summary = self.mw.transcript_text()[-40000:], self.mw.last_summary[-30000:]
+        session = (f"<key_takeaways>\n{summary}\n</key_takeaways>\n<transcript_english>\n{en}\n</transcript_english>"
+                   if (en or summary) else "")
         q = self.mw.ui_q
         q.put(("chat_piece", "đang đọc mẫu nhật ký và điền thông tin...\n"))
         self.mw.busy("chat", "Claude đang điền nhật ký theo mẫu PDF...")      # cleared when it ends

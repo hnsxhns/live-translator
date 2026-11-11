@@ -13,3 +13,7 @@ vendor/
 # Local settings / logins
 config.json
 selftest.txt
+# Session saved on close (reopened at the next start) and its backups
+session_autosave.json
+backups/
+learning/
