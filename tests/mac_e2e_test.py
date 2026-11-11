@@ -54,8 +54,8 @@ def save_results():
 
 
 def watchdog():                                       # never hang the CI job
-    time.sleep(900)
-    check("finished_in_time", False, "test still running after 15 min")
+    time.sleep(1500)
+    check("finished_in_time", False, "test still running after 25 min")
     save_results()
     os._exit(3)
 
@@ -748,6 +748,49 @@ if hasattr(app, "HALLUCINATION"):
               "Thank you teacher, I have a question"), "pattern matches only the invented phrases")
     terms = learning.course_terms(mw.learning.lib) if hasattr(learning, "course_terms") else None
     check("course_glossary_builds", isinstance(terms, str) and len(terms) <= 261, f"{terms!r}"[:120])
+
+# --- v1.9.8: audio cleaner (hum filter + level boost for quiet/far speakers) ---
+if hasattr(app, "AudioCleaner"):
+    tt = np.arange(SR * 3) / SR
+    hum = 0.05 * np.sin(2 * np.pi * 50 * tt)                                   # mains hum
+    voice = 0.008 * np.sin(2 * np.pi * 700 * tt) * (np.sin(2 * np.pi * 2 * tt) > 0)   # quiet "speech" bursts
+    cl = app.AudioCleaner()
+    out = np.concatenate([cl.process(b.astype(np.float32)) for b in np.split(hum + voice, 30)])
+
+    def band(x, f):                                                            # amplitude at frequency f
+        spec = np.abs(np.fft.rfft(x[SR:])) / (len(x) - SR) * 2
+        return float(spec[int(f * (len(x) - SR) / SR)])
+    hum_cut = band(out, 50) / max(band(hum + voice, 50), 1e-9)
+    voice_gain = band(out, 700) / max(band(hum + voice, 700), 1e-9)
+    check("audio_cleaner_cuts_hum_boosts_quiet_voice", hum_cut < 0.2 and voice_gain > 1.5,
+          f"50 Hz hum kept {hum_cut:.0%}, quiet voice x{voice_gain:.1f}")
+
+# --- v1.9.8: listening quality "Cao" (Whisper small.en, downloaded once over https) ---
+if hasattr(app, "download_quality_model") and hasattr(mw, "_set_quality"):
+    t0 = time.time()
+    try:
+        if not app.quality_model_path():
+            app.download_quality_model(lambda d, t: None)
+        dl = f"model at {app.quality_model_path()} ({time.time() - t0:.0f}s)"
+        mw._set_quality(app.QUALITY_HIGH)                  # what choosing "Cao" in the top bar does
+        t1 = time.time()
+        while mw.recognizer.quality != app.QUALITY_HIGH and time.time() - t1 < 180:
+            pump(0.2)
+        hq_on = mw.recognizer.quality == app.QUALITY_HIGH and mw.quality_var.get() == app.QUALITY_HIGH
+        with wave.open(SEGMENTS[0][1]) as w:
+            a = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768
+        t2 = time.time()
+        txt = mw.recognizer.transcribe(a, mw.recognizer.whisper_hq) if hq_on else ""
+        hq_s = time.time() - t2
+        hits = [w for w in ("morning", "machine", "learning", "notebooks") if w in txt.lower()]
+        check("quality_high_downloads_loads_and_listens", hq_on and len(hits) >= 3,
+              f"{dl}; menu shows {mw.quality_var.get()!r}; small.en heard {hits} in {hq_s:.1f}s: {txt[:80]!r}")
+        results["timings"]["small_en_sentence_s"] = round(hq_s, 1)
+    except Exception as e:  # noqa: BLE001
+        check("quality_high_downloads_loads_and_listens", False, repr(e)[:200])
+    finally:
+        mw._set_quality(app.QUALITY_FAST)
+        pump(0.3)
 
 # --- clean exit: no extra processes, no hang ---
 save_results()

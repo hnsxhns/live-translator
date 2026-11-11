@@ -18,13 +18,20 @@ import time
 import tkinter as tk
 from tkinter import font as tkfont
 
+# The portable .exe has no console: sys.stdout/stderr are None there, and libraries that print progress
+# (the model download's progress bar) crash with "'NoneType' object has no attribute 'write'".
+for _name in ("stdout", "stderr"):
+    if getattr(sys, _name) is None:
+        setattr(sys, _name, open(os.devnull, "w", encoding="utf-8"))
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
 import anthropic
 import numpy as np
 
 import learning
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.9.5"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.9.8"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # The login client waits at most 20 s for data (right for live translation). Chat and the Learning menu send
 # whole documents, and Claude can read/think longer than that before the first word: give them more time.
@@ -40,6 +47,7 @@ UTT_HARD = 7.0                   # always cut by this length (s)
 HALLUCINATION = re.compile(r"thank(s| you) for watching|please (like and )?subscribe|subtitles? by|"
                            r"see you (in the )?next (video|time)|amara\.org|transcribed by", re.I)
 TEACHER_MINUTES = 10             # whoever has spoken this long becomes "Teacher" (several -> Teacher 1, 2...)
+TEACHER_EARLY_MINUTES = 3        # ...or sooner: the main speaker (half of all speech so far) after this long
 SUMMARY_EVERY = 25.0             # refresh key takeaways this often (seconds)
 # Folder next to the .exe (portable) or next to app.py.
 APP_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
@@ -118,6 +126,124 @@ def whisper_model_path():
             if os.path.isdir(p):
                 return p
     return WHISPER_MODEL
+
+
+# Listening quality (top bar). "Cao" adds Whisper small.en (3x bigger, more accurate on hard voices, slower);
+# it is downloaded once into the app folder the first time it is chosen.
+QUALITY_FAST, QUALITY_HIGH = "Nhanh", "Cao"
+QUALITY_MODEL = "small.en"
+QUALITY_REPO = "Systran/faster-whisper-small.en"
+
+
+QUALITY_FILES = ["config.json", "tokenizer.json", "vocabulary.txt", "model.bin"]   # model.bin last: marks done
+
+
+def quality_download_dir():
+    """Where the high-quality model is downloaded: next to the .exe on Windows (portable); on Mac in
+    Application Support, because the .app bundle must not be written to."""
+    base = DATA_DIR if (IS_MAC and getattr(sys, "frozen", False)) else APP_DIR
+    return os.path.join(base, "models", QUALITY_MODEL)
+
+
+def https_context():
+    """python.org Python on macOS has no system certificates: give https downloads certifi's bundle."""
+    if not IS_MAC:
+        return None
+    try:
+        import ssl
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def download_quality_model(progress):
+    """Download Whisper small.en into <app folder>/models/small.en, calling progress(done_bytes, total_bytes)
+    as it goes. Each file is written as .part and renamed when complete, so a cut download is never used."""
+    import urllib.request
+    dst = quality_download_dir()
+    os.makedirs(dst, exist_ok=True)
+    url = "https://huggingface.co/" + QUALITY_REPO + "/resolve/main/"
+    head = lambda f: urllib.request.Request(url + f, method="HEAD", headers={"User-Agent": "LiveTranslator"})
+    sizes = {}
+    for f in QUALITY_FILES:
+        with urllib.request.urlopen(head(f), timeout=30, context=https_context()) as r:
+            sizes[f] = int(r.headers.get("Content-Length") or 0)
+    total, done = sum(sizes.values()), 0
+    progress(0, total)
+    for f in QUALITY_FILES:
+        final = os.path.join(dst, f)
+        if os.path.isfile(final) and os.path.getsize(final) == sizes[f]:
+            done += sizes[f]
+            continue
+        req = urllib.request.Request(url + f, headers={"User-Agent": "LiveTranslator"})
+        with urllib.request.urlopen(req, timeout=60, context=https_context()) as r, \
+                open(final + ".part", "wb") as out:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                progress(done, total)
+        os.replace(final + ".part", final)
+    progress(total, total)
+
+
+def quality_model_path():
+    """Folder of the high-quality Whisper model if it is already on this PC, else None."""
+    for base in (getattr(sys, "_MEIPASS", None), APP_DIR, DATA_DIR):
+        if base:
+            p = os.path.join(base, "models", QUALITY_MODEL)
+            if os.path.isfile(os.path.join(p, "model.bin")):
+                return p
+    return None
+
+
+class AudioCleaner:
+    """Cleans mic audio for Whisper, block by block as it streams in.
+
+    1. High-pass filter (~100 Hz): removes hum, fan/air-conditioner rumble and desk knocks, which carry no
+       speech but mask it.
+    2. Level boost: a quiet or far-away speaker is raised towards normal speech loudness (up to 10x), with
+       a slow, smooth gain so words don't pump; background noise alone is never boosted more than speech.
+    """
+    TAPS = 513                         # FIR length: 32 ms, steep enough to cut 50/60 Hz hum, keeps voices
+    TARGET = 0.08                      # speech loudness (RMS) the recognisers see
+    MAX_GAIN = 10.0
+
+    def __init__(self, cutoff=100.0, sr=SAMPLE_RATE):
+        n = np.arange(self.TAPS) - (self.TAPS - 1) / 2
+        low = np.sinc(2 * cutoff / sr * n) * np.hamming(self.TAPS)
+        low /= low.sum()
+        self.fir = -low
+        self.fir[(self.TAPS - 1) // 2] += 1.0          # high-pass = all-pass minus low-pass
+        self.tail = np.zeros(self.TAPS - 1, np.float32)
+        self.gain = 1.0
+        self.level = None                              # recent speech loudness (after filtering)
+        self.hist = []                                 # recent 30 ms loudness values -> noise floor
+
+    def process(self, block):
+        x = np.concatenate([self.tail, block.astype(np.float32)])
+        self.tail = x[-(self.TAPS - 1):]
+        y = np.convolve(x, self.fir, mode="valid").astype(np.float32)
+        n = len(y) // FRAME
+        if not n:
+            return y * self.gain
+        rms = np.sqrt((y[: n * FRAME].reshape(n, FRAME) ** 2).mean(axis=1))
+        self.hist.extend(rms.tolist())
+        del self.hist[:-500]
+        floor = float(np.percentile(self.hist, 20)) if len(self.hist) > 30 else 0.003
+        speech = rms[rms > max(floor * 3.0, 0.002)]
+        start = self.gain
+        if len(speech):
+            v = float(np.sqrt((speech ** 2).mean()))
+            self.level = v if self.level is None else self.level + (v - self.level) * (0.5 if v > self.level else 0.15)
+            want = min(self.MAX_GAIN, max(1.0, self.TARGET / max(self.level, 1e-5)))
+            want = min(want, max(1.0, 0.02 / max(floor, 1e-5)))  # noise stays quiet (floor x gain <= 0.02)
+            self.gain += (want - self.gain) * (0.6 if want < self.gain else 0.2)   # turn down faster than up
+        ramp = np.linspace(start, self.gain, len(y), dtype=np.float32)              # no clicks
+        return np.clip(y * ramp, -1.0, 1.0)
 
 # Server-side refusal fallback (routes to another model instead of failing).
 FALLBACK_HEADERS = {"anthropic-beta": "server-side-fallback-2026-07-01"}
@@ -606,6 +732,8 @@ class Recognizer(threading.Thread):
         self.speakers = SpeakerTracker()
         self.utt_spk = {}                   # utterance id -> speaker id
         self.glossary = ""                  # course terms (from the Learning library) that Whisper should expect
+        self.quality = QUALITY_FAST         # top-bar choice; "Cao" uses whisper_hq when it is loaded
+        self.whisper_hq = None
 
     def load_model(self):
         if self.whisper is None:
@@ -618,12 +746,34 @@ class Recognizer(threading.Thread):
     def _mic_cb(self, indata, frames, t, status):
         self.audio_q.put(indata[:, 0].copy())
 
-    def transcribe(self, audio):
+    def load_hq(self):
+        """Load the high-quality Whisper model (call from a worker thread). Returns True when ready."""
+        if self.whisper_hq is None:
+            path = quality_model_path()
+            if not path:
+                return False
+            from faster_whisper import WhisperModel
+            m = WhisperModel(path, device="cpu", compute_type="int8",
+                             cpu_threads=max(2, min(6, (os.cpu_count() or 4) - 2)))
+            list(m.transcribe(np.zeros(SAMPLE_RATE // 2, dtype=np.float32), language="en")[0])
+            self.whisper_hq = m
+        return True
+
+    def pick_model(self):
+        """High quality when chosen and loaded, unless utterances are piling up (then the fast model catches
+        up, so captions never fall far behind the speaker)."""
+        if self.quality == QUALITY_HIGH and self.whisper_hq is not None and self.whisper_q.qsize() < 2:
+            return self.whisper_hq
+        return self.whisper
+
+    def transcribe(self, audio, model=None):
+        model = model or self.pick_model()
         peak = float(np.max(np.abs(audio))) or 1.0
         audio = audio * min(8.0, 0.6 / peak)          # auto-gain: quiet mics are boosted (max 8x)
-        segs, _ = self.whisper.transcribe(
-            # beam 5 + the course's vocabulary: measured 1.8% -> 0.6% word errors on noisy classroom audio
-            audio, language="en", beam_size=5, vad_filter=False,
+        segs, _ = model.transcribe(
+            # base.en: beam 5 + the course's vocabulary (noisy room 1.8% -> 0.6% word errors);
+            # small.en: beam 1 was as accurate as beam 5 in tests, and faster
+            audio, language="en", beam_size=1 if model is self.whisper_hq else 5, vad_filter=False,
             condition_on_previous_text=False,
             initial_prompt=((self.glossary + " ") if self.glossary else "") + self.context[-150:] or None,
             without_timestamps=True,
@@ -662,6 +812,7 @@ class Recognizer(threading.Thread):
         utt_len = 0
         last_partial = ""
         rms_hist = []                  # recent 30 ms loudness values -> background-noise floor
+        cleaner = AudioCleaner()       # hum/rumble filter + level boost for quiet or far speakers (Whisper only)
         quiet = 0.0                    # how long it has been quiet (s)
         zero_s, warned_zero = 0.0, False     # seconds of exact-zero audio (no microphone access)
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
@@ -685,7 +836,9 @@ class Recognizer(threading.Thread):
                                        if IS_MAC else "Micro không gửi âm thanh. Kiểm tra micro trong cài đặt máy."))
                 else:
                     zero_s = self.zero_seconds = 0.0
-                utt.append(block)
+                # Whisper gets the cleaned audio (far speaker: 9.9% -> 5.8% word errors); Vosk keeps the raw
+                # audio it was trained on (cleaning made its live words slightly worse in noise)
+                utt.append((block, cleaner.process(block)))
                 utt_len += len(block)
 
                 # breath pauses: Vosk only ends an utterance after a long silence, so we also cut
@@ -722,19 +875,20 @@ class Recognizer(threading.Thread):
         if draft in ("", "the", "huh", "uh", "um"):    # Vosk heard no real words: skip Whisper
             self.ui_q.put(("partial", ""))
             return
-        audio = np.concatenate(utt)
+        raw = np.concatenate([u[0] for u in utt])       # as recorded: voiceprints, Whisper small.en
+        audio = np.concatenate([u[1] for u in utt])     # cleaned: Whisper base.en
         self.utt_id += 1
         vec = None
-        if self.spk_model is not None and len(audio) > SAMPLE_RATE // 2:
+        if self.spk_model is not None and len(raw) > SAMPLE_RATE // 2:
             try:
-                vec = self.spk_model(audio)
+                vec = self.spk_model(raw)
             except Exception:  # noqa: BLE001
                 vec = None
         sid = self.speakers.assign(vec, len(audio) / SAMPLE_RATE)
         self.utt_spk[self.utt_id] = sid
         self.ui_q.put(("speaker", (self.utt_id, sid, dict(self.speakers.talk), dict(self.speakers.merged))))
         self.ui_q.put(("draft", (self.utt_id, draft)))
-        self.whisper_q.put((self.utt_id, draft, audio, sid))
+        self.whisper_q.put((self.utt_id, draft, audio, sid, raw))
 
     def _whisper_worker(self):
         while True:
@@ -744,9 +898,12 @@ class Recognizer(threading.Thread):
                 continue
             items = [item]          # one segment per call, so English and Vietnamese rows stay 1:1
             ids = [x[0] for x in items]
-            audio = np.concatenate([x[2] for x in items])
+            model = self.pick_model()
+            # the cleaned audio helps base.en (far speaker 9.9% -> 5.8% word errors) but not small.en, which
+            # did slightly better on the audio as recorded
+            audio = np.concatenate([x[4] if model is self.whisper_hq else x[2] for x in items])
             try:
-                text = self.transcribe(audio)
+                text = self.transcribe(audio, model)
             except Exception:  # noqa: BLE001
                 text = ""
             draft = " ".join(x[1] for x in items)
@@ -1090,12 +1247,21 @@ class Chatter(threading.Thread):
 class Summarizer(threading.Thread):
     """Running key takeaways. Every round only the speech that is new since the last round is turned into
     new bullet points, which are ADDED to the pane (earlier takeaways are never removed)."""
-    SYSTEM = ("You keep running KEY TAKEAWAYS in Vietnamese for a live talk/conversation. You get the takeaways "
-              "already written, the end of the earlier transcript for context, and the NEW part of the English "
-              "transcript (from speech recognition; it may contain errors). Write only takeaways that the NEW "
-              "part adds and that are not already in the existing takeaways: 1-5 short bullet points starting "
-              "with '• ', most important first. If the new part adds nothing worth noting, output exactly NONE. "
-              "Output only the bullets (or NONE).")
+    # The transcript comes from live speech recognition, so some words are misheard (worst for people far
+    # from the mic). Takeaways are notes to learn from: they state what was said, cleanly, and never talk
+    # about the recognition itself (earlier versions put "(chưa rõ do lỗi nhận dạng)" in ~40% of bullets).
+    SYSTEM = ("You keep running KEY TAKEAWAYS in Vietnamese for a live talk/conversation (often a course). You "
+              "get the takeaways already written, the end of the earlier transcript for context, the course's "
+              "own terms when known, and the NEW part of the English transcript. The transcript comes from live "
+              "speech recognition: some words are misheard and sentences may be split. Read it as the speaker "
+              "meant it: silently correct obvious mishearings from context and the course terms. Write only "
+              "takeaways that the NEW part adds and that are not already in the existing takeaways: 1-5 short "
+              "bullet points starting with '• ', most important first. Write each bullet as a clean, confident "
+              "note of the idea. Never mention speech recognition, transcription errors, missing or unclear "
+              "words, unknown names or results; never add remarks like '(chưa rõ)', '(có thể là ...)' or "
+              "'(do lỗi nhận dạng)'. If part of the speech is too garbled to understand, leave it out. Small "
+              "talk, logistics and side chatter are not takeaways. If the new part adds nothing worth "
+              "noting, output exactly NONE. Output only the bullets (or NONE).")
 
     def __init__(self, client, ui_q, get_transcript, get_takeaways):
         super().__init__(daemon=True)
@@ -1107,6 +1273,7 @@ class Summarizer(threading.Thread):
         self.kick = threading.Event()
         self.done_n = 0                           # transcript entries already covered
         self.final = False                        # set when listening stops: cover even a short remainder
+        self.get_terms = lambda: ""               # course vocabulary (set by the main window)
 
     def run(self):
         while True:
@@ -1118,7 +1285,12 @@ class Summarizer(threading.Thread):
                 if len(new.split()) < (4 if final else 15):
                     continue
                 _, before = self.get_transcript(0, self.done_n)
-                prompt = (f"<existing_takeaways>\n{self.get_takeaways() or '(none yet)'}\n</existing_takeaways>\n"
+                terms = self.get_terms()
+                prompt = ((f"<course_terms>\n{terms}\n</course_terms>\n" if terms else "") +
+                          # the recent takeaways are enough to avoid repeats (the whole history grew to 40k+
+                          # characters per round in a long class: slower, costlier, and old style got copied)
+                          f"<existing_takeaways>\n{(self.get_takeaways() or '')[-6000:] or '(none yet)'}\n"
+                          f"</existing_takeaways>\n"
                           f"<earlier_transcript_end>\n{before[-3000:] or '(none)'}\n</earlier_transcript_end>\n"
                           f"<new_transcript>\n{new}\n</new_transcript>")
                 out = claude_stream(self.client, self.SYSTEM, prompt, "medium").strip()
@@ -1191,6 +1363,18 @@ class MainWindow:
             om.config(fg="black")
         om.pack(side="right", padx=(0, 10), pady=5)
         tk.Label(top, text="Dịch:", bg="#2b2b2b", fg="#aaa", font=(UI_FONT, 9)).pack(side="right")
+        # listening quality: Nhanh = Whisper base.en, Cao = Whisper small.en (downloaded once, slower)
+        self.quality_var = tk.StringVar(value=load_config().get("listen_quality", QUALITY_FAST))
+        if self.quality_var.get() not in (QUALITY_FAST, QUALITY_HIGH):
+            self.quality_var.set(QUALITY_FAST)
+        qm = tk.OptionMenu(top, self.quality_var, QUALITY_FAST, QUALITY_HIGH, command=self._set_quality)
+        qm.config(font=(UI_FONT, 9), bg="#3a3a3a", fg="#ddd", activebackground="#4a4a4a",
+                  activeforeground="white", relief="flat", highlightthickness=0, bd=0)
+        qm["menu"].config(font=(UI_FONT, 9))
+        if IS_MAC:
+            qm.config(fg="black")
+        qm.pack(side="right", padx=(0, 10), pady=5)
+        tk.Label(top, text="Chất lượng nghe:", bg="#2b2b2b", fg="#aaa", font=(UI_FONT, 9)).pack(side="right")
         bstyle = dict(font=(UI_FONT, 9), relief="flat", bg="#3a3a3a", fg="#ddd", activebackground="#4a4a4a",
                       activeforeground="white", cursor="hand2", padx=8)
         tk.Button(top, text="📂 Restore", command=self.restore_session, **bstyle).pack(side="right", padx=(0, 12), pady=5)
@@ -1367,6 +1551,9 @@ class MainWindow:
         self.summarizer.start()
         self.chatter.get_library = self.learning.lib.catalog_text
         self.recognizer.glossary = learning.course_terms(self.learning.lib)
+        self.summarizer.get_terms = lambda: self.recognizer.glossary      # same words help the takeaways
+        if self.quality_var.get() == QUALITY_HIGH:
+            self._set_quality(QUALITY_HIGH, startup=True)
         self.chatter.start()
         self.root.after(50, self._poll)
 
@@ -2266,6 +2453,90 @@ class MainWindow:
         cfg["translate_preset"] = name
         save_config(cfg)
 
+    def _set_quality(self, name, startup=False):
+        """Listening quality from the top bar. "Cao" downloads Whisper small.en once (~480 MB, asks first) and
+        loads it in the background. The menu always shows the mode that is really running: while Cao is being
+        prepared it reads "Cao: 37%" / "Cao: đang nạp" and listening stays on Nhanh until Cao is ready."""
+        cfg = load_config()
+        cfg["listen_quality"] = name
+        save_config(cfg)
+        rec = self.recognizer
+        self._quality_wanted = name
+        if name == QUALITY_FAST:
+            rec.quality = QUALITY_FAST
+            self.quality_var.set(QUALITY_FAST)
+            self.ui_q.put(("status", "Chất lượng nghe: Nhanh (đang dùng)"))
+            return
+        if rec.whisper_hq is not None:
+            rec.quality = QUALITY_HIGH
+            self.quality_var.set(QUALITY_HIGH)
+            self.ui_q.put(("status", "Chất lượng nghe: Cao (đang dùng)"))
+            return
+        if getattr(self, "_quality_job", False):         # already downloading/loading: just keep showing progress
+            self.quality_var.set(self._quality_label)
+            return
+        need_download = quality_model_path() is None
+        if need_download:
+            from tkinter import messagebox
+            if startup or not messagebox.askyesno(
+                    "Chất lượng nghe: Cao",
+                    "Chế độ Cao dùng mô hình nhận diện lớn hơn (Whisper small.en): nghe chính xác hơn với giọng "
+                    "khó, người nói xa, phòng ồn, nhưng chậm hơn vài giây mỗi câu.\n\n"
+                    "Cần tải mô hình một lần (khoảng 480 MB) vào thư mục của ứng dụng. Tải ngay?",
+                    parent=self.root):
+                self._quality_back()
+                return
+        self._quality_job = True
+
+        def show(label, busy_text):                      # UI thread: menu label + busy line together
+            self._quality_label = label
+            if self._quality_wanted == QUALITY_HIGH:
+                self.quality_var.set(label)
+            self.busy("quality", busy_text + " Trong lúc chờ vẫn nghe ở chế độ Nhanh.")
+        show("Cao: 0%" if need_download else "Cao: đang nạp",
+             "Đang tải mô hình nghe chất lượng cao... 0%." if need_download
+             else "Đang nạp mô hình nghe chất lượng cao...")
+
+        def work():
+            try:
+                if need_download:
+                    shown = [-1]
+
+                    def progress(done, total):          # "37% (180/486 MB)", updated each 1%
+                        pct = int(done * 100 / total) if total else 0
+                        if pct != shown[0]:
+                            shown[0] = pct
+                            text = (f"Đang tải mô hình nghe chất lượng cao... {pct}% "
+                                    f"({done / 1e6:.0f}/{total / 1e6:.0f} MB).")
+                            self.ui_q.put(("call", lambda t=text, l=f"Cao: {pct}%": show(l, t)))
+                    download_quality_model(progress)
+                    self.ui_q.put(("call", lambda: show("Cao: đang nạp", "Đang nạp mô hình nghe chất lượng cao...")))
+                ok = rec.load_hq()
+                err = None if ok else "không tìm thấy mô hình sau khi tải"
+            except Exception as e:  # noqa: BLE001
+                err = str(e)
+
+            def finish():
+                self._quality_job = False
+                self.done("quality")
+                if err:
+                    self.ui_q.put(("error", f"Không bật được chất lượng nghe Cao (vẫn dùng Nhanh): {err}"))
+                    self._quality_back()
+                elif self._quality_wanted == QUALITY_HIGH:     # still chosen -> switch now
+                    rec.quality = QUALITY_HIGH
+                    self.quality_var.set(QUALITY_HIGH)
+                    self.ui_q.put(("status", "Chất lượng nghe: Cao (đã sẵn sàng, đang dùng)"))
+            self.ui_q.put(("call", finish))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _quality_back(self):
+        self._quality_wanted = QUALITY_FAST
+        self.quality_var.set(QUALITY_FAST)
+        self.recognizer.quality = QUALITY_FAST
+        cfg = load_config()
+        cfg["listen_quality"] = QUALITY_FAST
+        save_config(cfg)
+
     def logout(self):
         """Forget the saved login and restart at the login screen."""
         cfg = load_config()
@@ -2326,9 +2597,13 @@ class MainWindow:
                     self.spk_talk = talk
                     if merged != self.spk_alias:
                         self._apply_merges(merged)
+                    total = sum(talk.values()) or 1.0
                     for s, secs in talk.items():
-                        if secs >= TEACHER_MINUTES * 60 and s not in self.teachers:
-                            self.teachers.append(s)      # becomes Teacher (or Teacher 2, 3...)
+                        # Teacher (or Teacher 2, 3...): spoke 10 min, or is clearly the main speaker after 3 min
+                        # (half of all speech) so the label shows early in a new class
+                        main = secs >= TEACHER_EARLY_MINUTES * 60 and secs >= 0.5 * total
+                        if (secs >= TEACHER_MINUTES * 60 or main) and s not in self.teachers:
+                            self.teachers.append(s)
                     self._relabel()
                 elif kind == "draft":
                     self._add_draft(*val)
