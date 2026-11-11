@@ -1,5 +1,5 @@
 // Claude workers: live translation, chat answers and key takeaways (same prompts as the desktop app).
-import { claudeStream, friendlyError, LONG_TIMEOUT } from "./claude.js";
+import { claudeStream, friendlyError, LONG_TIMEOUT, warmUp } from "./claude.js";
 
 export const SUMMARY_EVERY = 25_000;      // refresh key takeaways this often (ms)
 
@@ -77,6 +77,13 @@ export class Translator {
       .filter((u) => u in this.en).map((u) => [this.en[u], this.vi[u]]);
   }
 
+  /** Warm the connection (start, and listening again after more than 2 minutes). */
+  warm() {
+    this.warmedAt = Date.now();
+    const key = this.getKey();
+    if (key) warmUp(key, this.model);
+  }
+
   draft(uid, text) {
     this.en[uid] = text;
     this.gen[uid] = 1;
@@ -87,12 +94,20 @@ export class Translator {
   final(ids, text) {
     const norm = (s) => s.toLowerCase().replace(/[^a-z0-9' ]/g, " ").split(/\s+/).filter(Boolean);
     const drafts = ids.map((u) => this.en[u] || "").join(" ");
-    if (ratio(norm(drafts), norm(text)) >= 0.85) {          // draft translation is good: keep it
+    // re-translate when Whisper corrected words (e.g. "right down" -> "write down"), not for case or
+    // punctuation only; one word in a short sentence matters, one in a long sentence less so (Windows 1.9.5)
+    if (ratio(norm(drafts), norm(text)) >= 0.97) {          // draft translation is good: keep it
       ids.forEach((u, i) => { this.en[u] = i === 0 ? text : ""; });
       return;
     }
     const first = ids[0];
     for (const u of ids) this.gen[u] = (this.gen[u] || 0) + 1;
+    if (ids.length === 1) {
+      // the draft's translation stays on screen until the corrected one is ready, then it is swapped in
+      this.en[first] = text;
+      this._submit(first, this.gen[first], text, false);
+      return;
+    }
     for (const u of ids.slice(1)) {                          // merged segments: translate into the first slot
       delete this.en[u];
       delete this.vi[u];
@@ -105,16 +120,16 @@ export class Translator {
     this._submit(first, g, text);
   }
 
-  _submit(uid, g, text) {
-    this.waiting.push([uid, g, text]);
+  _submit(uid, g, text, stream = true) {
+    this.waiting.push([uid, g, text, stream]);
     this._next();
   }
 
   _next() {
     while (this.active < 4 && this.waiting.length) {
-      const [uid, g, text] = this.waiting.shift();
+      const [uid, g, text, stream] = this.waiting.shift();
       this.active++;
-      this._translate(uid, g, text).finally(() => { this.active--; this._next(); });
+      this._translate(uid, g, text, stream).finally(() => { this.active--; this._next(); });
     }
   }
 
@@ -125,7 +140,7 @@ export class Translator {
     return [earlier, lastVi];
   }
 
-  async _translate(uid, g, text) {
+  async _translate(uid, g, text, stream = true) {
     const [ctx, lastVi] = this._context(uid);
     let prompt = ctx ? `Earlier speech (context only, already translated):\n${ctx}\n\n` : "";
     if (lastVi) prompt += `Its Vietnamese translation ended with:\n...${lastVi.slice(-200)}\n\n`;
@@ -135,13 +150,15 @@ export class Translator {
       out = await claudeStream(this.getKey(), {
         system: Translator.SYSTEM, prompt, effort: "low", model: this.model, thinking: this.thinking, maxTokens: 1500,
         timeoutMs: 20_000,
-        onPiece: (p) => this.emit("vi_piece", [uid, g, p]),
+        onPiece: stream ? (p) => this.emit("vi_piece", [uid, g, p]) : undefined,
       });
     } catch (e) {
-      this.emit("vi_piece", [uid, g, "[chưa dịch được đoạn này]"]);
-      this.emit("error", friendlyError(e));
+      if (stream) this.emit("vi_piece", [uid, g, "[chưa dịch được đoạn này]"]);
+      this.emit("error", friendlyError(e));      // (a failed correction keeps the draft's translation)
     }
-    if (this.gen[uid] === g) this.vi[uid] = out.trim();
+    if (this.gen[uid] !== g) return;
+    if (!stream && out.trim()) this.emit("vi_replace", [uid, g, out.trim()]);   // swapped in at once, no flicker
+    if (stream || out.trim()) this.vi[uid] = out.trim();
   }
 }
 

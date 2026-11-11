@@ -43,6 +43,32 @@ export function fmtDate(iso) {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || "");
   return m ? `${m[3]}/${m[2]}/${m[1]}` : iso || "";
 }
+
+/** Words of this course Whisper should expect: acronyms and capitalised terms that keep coming back in the
+ *  library's documents. A short comma list (Whisper reads ~200 tokens of prompt). Port of course_terms
+ *  (Windows 1.9.5). */
+export async function courseTerms(lib, maxChars = 260) {
+  const counts = new Map();
+  const add = (t, n) => counts.set(t, (counts.get(t) || 0) + n);
+  for (const d of lib.docs()) {
+    const text = String((await lib.text(d)) || "").slice(0, 200_000);
+    for (const m of text.matchAll(/\b[A-Z]{2,6}s?\b/g)) add(m[0], 1);                    // ABT, KPI, KPIs, LLM...
+    for (const m of text.matchAll(/\b(?:[A-Z][a-z]+(?:[- ](?:of |and |to |the )?[A-Z][a-z]+){1,3})\b/g)) add(m[0], 2);
+  }
+  const common = new Set(["the", "this", "that", "part", "prompt", "table", "day", "and", "for", "with", "you", "your",
+    "in", "on", "at", "to", "of", "a", "an", "is", "it", "we", "our", "step", "note", "use", "all", "each", "not"]);
+  const upperCommon = new Set([...common, "our", "are", "can", "will", "how"]);
+  const ok = (t) => !common.has(t.split(" ")[0].toLowerCase()) && !(t === t.toUpperCase() && upperCommon.has(t.toLowerCase()));
+  // most_common(80): by count, ties in first-seen order
+  const terms = [...counts.entries()].map(([t, n], i) => [t, n, i]).sort((a, b) => b[1] - a[1] || a[2] - b[2])
+    .slice(0, 80).filter(([t, n]) => n >= 3 && ok(t)).map(([t]) => t);
+  let out = "";
+  for (const t of terms) {
+    if (out.length + t.length + 2 > maxChars) break;
+    out += (out ? ", " : "") + t;
+  }
+  return out ? out + "." : "";
+}
 const el = (tag, cls, text) => {
   const e = document.createElement(tag);
   if (cls) e.className = cls;

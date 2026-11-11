@@ -43,6 +43,15 @@ export async function checkKey(apiKey) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** Opens the connection to Claude before the first sentence with a free token count, so the first
+ *  translation is not slower than the others (Windows 1.9.5). Errors are ignored. */
+export async function warmUp(apiKey, model) {
+  try {
+    await fetch(`${API}/messages/count_tokens`, { method: "POST", headers: headers(apiKey),
+      body: JSON.stringify({ model: model || MODEL, messages: [{ role: "user", content: "hi" }] }) });
+  } catch { /* offline: the real request will say so */ }
+}
+
 /**
  * Stream a Claude reply; returns the full text. Retries once without the fallback option if rejected,
  * and once more on rate limits / overload / network errors (like the SDK's max_retries=1).

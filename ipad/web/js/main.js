@@ -10,7 +10,7 @@ import { ensureFiles, hasWebGPU, modelFiles } from "./models.js";
 import { Translator, Chatter, Summarizer, TRANSLATE_PRESETS, DEFAULT_PRESET } from "./assistants.js";
 import { fileToBlock, ACCEPT } from "./files.js";
 import * as upd from "./updates.js";
-import { LearningUI, shareBlob, takeawaysPdf } from "./learning.js";
+import { LearningUI, shareBlob, takeawaysPdf, courseTerms } from "./learning.js";
 import { MicCheck } from "./diag.js";
 
 // Running inside the TestFlight app (ipad/ios): files ship in the app, updates come from TestFlight.
@@ -176,7 +176,23 @@ class App {
     this.summarizer = this.summarizer || new Summarizer(() => this.apiKey, (k, v) => this.handle(k, v),
                                                         (a, b) => this.transcriptRange(a, b), () => this.lastSummary);
     if (this.ready) this.setStatus("✓ Sẵn sàng. Nhấn ON để bắt đầu nghe.", "ok");
+    this.translator.warm();                              // the first translation is then as fast as the others
     this.checkUpdates();
+  }
+
+  /** Listening (again) after more than 2 minutes: open the Claude connection before the first sentence. */
+  warmIfIdle() {
+    if (this.apiKey && Date.now() - (this.translator.warmedAt || 0) > 120_000) this.translator.warm();
+  }
+
+  /** The course vocabulary from the Learning library, for Whisper (names, acronyms, terms). */
+  async refreshGlossary() {
+    try {
+      await this.learning.ready;
+      this.recognizer.glossary = await courseTerms(this.learning.lib);
+    } catch (e) {
+      console.warn("course terms:", e);
+    }
   }
 
   logout() {
@@ -668,6 +684,18 @@ class App {
     this.followNow();
   }
 
+  /** Whisper corrected the English: its new translation replaces the line in one go (no "…" in between). */
+  viReplace(uid, g, text) {
+    const r = this.rows.get(uid);
+    if (!r || r.viGen > g) return;
+    r.viGen = g;
+    r.vi = text;
+    r.viFilled = true;
+    r.viEl.classList.remove("pending");
+    r.viEl.lastChild.textContent = splitSentences(text);
+    this.followNow();
+  }
+
   viReset(uid, g) {
     const r = this.rows.get(uid);
     if (!r) return;
@@ -713,6 +741,7 @@ class App {
       case "vi_slot": this.viSlot(val); break;
       case "vi_piece": this.viPiece(...val); break;
       case "vi_reset": this.viReset(...val); break;
+      case "vi_replace": this.viReplace(...val); break;
       case "vi_drop": this.viDrop(val); break;
       case "chat_piece":
         if (this.chatLog.length) this.chatLog[this.chatLog.length - 1].a += val;
@@ -823,6 +852,8 @@ class App {
   async startListening() {
     this.wantOn = false;
     if (!this.on) return;
+    this.warmIfIdle();
+    this.refreshGlossary();
     try {
       await this.recognizer.start(this.audioCtx);
       this.audioCtx = this.recognizer.ctx;
@@ -895,6 +926,7 @@ class App {
       }
       this.audioCtx = this.recognizer.ctx;
       this.micPaused = false;
+      this.warmIfIdle();
       this.hideTap();
       $("micLevel").classList.remove("paused");
       this.keepAwake(true);

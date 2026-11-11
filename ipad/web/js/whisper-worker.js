@@ -35,11 +35,42 @@ async function load(gpu, native) {
   throw last;
 }
 
-async function transcribe(audio) {
+/** Token ids of a special token such as "<|startofprev|>" (undefined if the model has none). */
+function special(tok, t) {
+  const v = tok.model?.tokens_to_ids?.get?.(t);
+  if (v !== undefined) return v;
+  const ids = tok.encode(t, { add_special_tokens: false });
+  return ids.length === 1 ? ids[0] : undefined;
+}
+
+/** Whisper with a prompt (the course's vocabulary + the last words heard), like initial_prompt on the desktop:
+ *  <|startofprev|> prompt <|startoftranscript|> <|notimestamps|> -> the words of this audio. */
+async function transcribePrompted(a, prompt) {
+  const tok = asr.tokenizer, model = asr.model;
+  const prev = special(tok, "<|startofprev|>"), sot = special(tok, "<|startoftranscript|>"),
+        nots = special(tok, "<|notimestamps|>");
+  if (prev === undefined || sot === undefined || nots === undefined) return null;
+  const ptoks = tok.encode(" " + prompt, { add_special_tokens: false }).slice(-160);   // Whisper reads <= 223
+  const ids = [prev, ...ptoks, sot, nots];
+  const { input_features } = await asr.processor(a);
+  const out = await model.generate({ inputs: input_features, decoder_input_ids: ids, max_new_tokens: 160 });
+  const seq = Array.from(out.tolist ? out.tolist()[0] : out[0], Number).slice(ids.length);
+  return tok.decode(seq, { skip_special_tokens: true }).trim();
+}
+
+async function transcribe(audio, prompt = "") {
   let peak = 0;
   for (const v of audio) peak = Math.max(peak, Math.abs(v));
   const gain = Math.min(8.0, 0.6 / (peak || 1));           // auto-gain: quiet mics are boosted (max 8x)
   const a = audio.map((v) => v * gain);
+  if (prompt) {
+    try {
+      const t = await transcribePrompted(a, prompt);
+      if (t !== null) return t;
+    } catch (e) {
+      console.warn("whisper prompt off:", e);          // e.g. an older model: plain transcription below
+    }
+  }
   const out = await asr(a, { return_timestamps: false });
   return (out?.text || "").trim();
 }
@@ -54,7 +85,7 @@ self.onmessage = async (ev) => {
       self.postMessage({ type: "ready", mode });
     } else if (msg.type === "run") {
       await loading;
-      const text = await transcribe(msg.audio);
+      const text = await transcribe(msg.audio, String(msg.prompt || "").trim());
       self.postMessage({ type: "text", id: msg.id, text });
     }
   } catch (e) {

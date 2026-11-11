@@ -194,6 +194,20 @@
         "Cạnh giữa khung Claude trả lời và ô Hỏi Claude dễ kéo bằng ngón tay hơn (vùng chạm to, sáng lên khi kéo), ô prompt cao được tới gần hết màn hình; chạm 2 lần vào cạnh: to/nhỏ. Độ cao được ghi nhớ.",
         "Từ bản 13: micro tự thử 4 cách thu âm và nhớ cách chạy được; app không còn chờ/kẹt vì Whisper."
       ]
+    },
+    {
+      "version": "1.9.5",
+      "build": 15,
+      "channel": "beta",
+      "date": "2026-11-11",
+      "notes": [
+        "Nghe tiếng Anh chính xác hơn, như bản Windows 1.9.5:",
+        "Whisper được gợi ý trước các từ của khóa học (viết tắt, thuật ngữ viết hoa lặp lại trong tài liệu Learning) và ~150 ký tự vừa nghe, nên nhận đúng tên riêng và thuật ngữ hơn.",
+        "Bỏ các câu Whisper tự bịa khi im lặng (\"thanks for watching\", \"please subscribe\", \"subtitles by\"...) và khi chỉ nghe được vài từ mà Whisper viết ra câu khác.",
+        "Khi câu chốt khác câu nháp (dù chỉ một từ), bản dịch được làm lại và thay ngay vào dòng đó, không nháy \"…\".",
+        "Kết nối tới Claude được mở sẵn khi đăng nhập và khi nghe lại sau hơn 2 phút, nên câu dịch đầu tiên không chậm hơn các câu sau.",
+        "Từ bản 14: mở file Learning ngay trong app, nút ⤢ Sửa cho ô prompt, cạnh kéo giữa khung trả lời và ô prompt."
+      ]
     }
   ]
 }

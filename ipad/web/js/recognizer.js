@@ -16,6 +16,8 @@ const UTT_HARD = 7.0;           // always cut by this length (s)
 export const noSpeechTags = (t) => String(t || "")
   .replace(/\[[^\]]*\]|\((?:music|applause|laughter|laughs|silence|inaudible|noise|blank[^)]*|static|coughs?)\)|\*[^*]*\*/gi, " ")
   .replace(/\s+/g, " ").trim();
+/** Phrases Whisper is known to invent on short or unclear audio (learned from video subtitles). */
+export const HALLUCINATION = /thank(s| you) for watching|please (like and )?subscribe|subtitles? by|see you (in the )?next (video|time)|amara\.org|transcribed by/i;
 const WHISPER_BACKLOG = 3;
 const WHISPER_LIMIT = 15000;   // ms for one utterance; longer = Whisper is stuck      // if Whisper falls further behind, older utterances keep their draft text
 
@@ -117,12 +119,12 @@ class WorkerClient {
     });
   }
 
-  call(type, audio) {
+  call(type, audio, extra = {}) {
     const id = this.next++;
     const copy = Float32Array.from(audio);
     return new Promise((resolve, reject) => {
       this.waiting.set(id, { resolve, reject });
-      this.worker.postMessage({ type, id, audio: copy }, [copy.buffer]);
+      this.worker.postMessage({ type, id, audio: copy, ...extra }, [copy.buffer]);
     });
   }
 }
@@ -135,6 +137,7 @@ export class Recognizer {
     this.uttSpk = {};                    // utterance id -> speaker id
     this.uttId = 0;
     this.context = "";
+    this.glossary = "";                  // course vocabulary for Whisper (from the Learning library)
     this.running = false;
     this.vosk = null;
     this.spk = null;
@@ -466,7 +469,9 @@ export class Recognizer {
         const w = this.whisper;
         let late = false;
         try {
-          const r = await Promise.race([w.call("run", item.audio),
+          // the course's vocabulary + the last words heard help Whisper with names and terms (Windows 1.9.5)
+          const prompt = ((this.glossary ? this.glossary + " " : "") + this.context.slice(-150)).trim();
+          const r = await Promise.race([w.call("run", item.audio, { prompt }),
             new Promise((res) => setTimeout(() => { late = true; res(null); }, WHISPER_LIMIT))]);
           text = r?.text || "";
         } catch { text = ""; }
@@ -483,8 +488,13 @@ export class Recognizer {
         text = noSpeechTags(text);
       }
       const nW = text.split(/\s+/).filter(Boolean).length, nD = item.draft.split(/\s+/).filter(Boolean).length;
+      const words = (s) => new Set(s.toLowerCase().replace(/[^a-z0-9' ]/g, " ").split(/\s+/).filter(Boolean));
+      const wd = words(item.draft), shared = [...words(text)].filter((x) => wd.has(x)).length / Math.max(1, wd.size);
+      // phrases Whisper invents in silence ("thanks for watching"...), or a few words heard and Whisper wrote
+      // something else (Windows 1.9.5)
+      const invented = (HALLUCINATION.test(text) && !HALLUCINATION.test(item.draft)) || (nD <= 3 && shared < 0.5);
       // empty, or far longer than what Vosk heard (Whisper sometimes invents text on cut-off audio)
-      if (!text.replace(/[ .,!?\-'"]/g, "") || nW > 2 * nD + 3) text = cap(item.draft);
+      if (!text.replace(/[ .,!?\-'"]/g, "") || nW > 2 * nD + 3 || invented) text = cap(item.draft);
       this._final(item.id, text);
     }
     this.whisperBusy = false;
