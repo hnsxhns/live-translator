@@ -792,6 +792,79 @@ if hasattr(app, "download_quality_model") and hasattr(mw, "_set_quality"):
         mw._set_quality(app.QUALITY_FAST)
         pump(0.3)
 
+# --- v1.9.9: Source login browser (pywebview -> WebKit on Mac): opens the saved page, scans it by itself,
+#     hands back links + login cookies; documents are then downloaded with the login ---
+if getattr(app, "IS_MAC", False) and os.path.exists(os.path.join(ROOT, "source_browser.py")):
+    import http.server
+    import socketserver
+    lsite = os.path.join(OUT, "login_site")
+    os.makedirs(lsite, exist_ok=True)
+    for nm in ("week1.pdf", "notes.txt", "slide.png"):
+        __import__("shutil").copy(pdf if nm.endswith(".pdf") else (cert if nm.endswith(".png") else bk),
+                                  os.path.join(lsite, nm))
+    page_html = ('<html><head><title>Materials</title></head><body><h1>Materials</h1>'
+                 '<a href="/files/week1.pdf">Week 1 slides</a> <a href="/files/notes.txt">Notes</a> '
+                 '<a href="/files/slide.png">Slide</a></body></html>').encode()
+
+    class Login(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if self.path.startswith("/materials"):
+                body = page_html
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Set-Cookie", "session=ok123; Path=/")
+            elif self.path.startswith("/files/"):
+                if "session=ok123" not in (self.headers.get("Cookie") or ""):
+                    self.send_response(403)                 # like a course site: files need the login
+                    self.end_headers()
+                    return
+                with open(os.path.join(lsite, self.path.split("/")[-1]), "rb") as f:
+                    body = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_HEAD(self):
+            self.do_GET()
+    lsrv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Login)
+    threading.Thread(target=lsrv.serve_forever, daemon=True).start()
+    murl = f"http://127.0.0.1:{lsrv.server_address[1]}/materials"
+    outj = os.path.join(OUT, "source_page.json")
+    prof = os.path.join(OUT, "source_profile")
+    t0 = time.time()
+    try:
+        proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "app.py"), "--source-browser", murl, outj, prof])
+        while proc.poll() is None and time.time() - t0 < 90:
+            pump(0.2)
+        if proc.poll() is None:
+            proc.kill()
+        page = json.load(open(outj, encoding="utf-8")) if os.path.exists(outj) else {}
+        n_links = len(page.get("links") or [])
+        ck = [c.get("name") for c in page.get("cookies") or []]
+        check("source_login_browser_scans_page", n_links >= 3 and "session" in ck and not page.get("error"),
+              f"{time.time() - t0:.0f}s, {n_links} links, cookies {ck}, error {page.get('error')}")
+        got = []
+        if page.get("links"):
+            hdr = {"Cookie": learning.cookie_header(page.get("cookies"), murl)}
+            dest2 = os.path.join(OUT, "LoginDownloads")
+            for u, _t, ext, *_ in learning.browser_doc_links(page, learning.SOURCE_EXTS & learning.supported_exts()):
+                pth, _sha, _new = learning.download(u, dest2, ext, headers=hdr)
+                got.append(os.path.basename(pth))
+        check("source_downloads_with_login_cookies", len(got) == 3, f"saved {sorted(got)}")
+    except Exception as e:  # noqa: BLE001
+        check("source_login_browser_scans_page", False, repr(e)[:200])
+    finally:
+        lsrv.shutdown()
+
 # --- clean exit: no extra processes, no hang ---
 save_results()
 print(json.dumps(results, ensure_ascii=False, indent=2), flush=True)

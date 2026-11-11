@@ -1248,9 +1248,10 @@ MIME_EXT = {"application/pdf": ".pdf", "image/png": ".png", "image/jpeg": ".jpg"
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx"}
 
 
-def _http(url, method="GET", timeout=30):
+def _http(url, method="GET", timeout=30, headers=None):
     import urllib.request
-    req = urllib.request.Request(url, method=method, headers={"User-Agent": SOURCE_UA, "Accept": "*/*"})
+    req = urllib.request.Request(url, method=method, headers={"User-Agent": SOURCE_UA, "Accept": "*/*",
+                                                              **(headers or {})})
     ctx = None
     if IS_MAC:
         # python.org Python on macOS does not use the system's certificates: without this every https
@@ -1324,14 +1325,93 @@ def doc_links(url, exts):
     return out
 
 
-def download(url, folder, ext_hint=""):
-    """Download a file into folder (never overwriting a different file). Returns (path, sha256, newly saved)."""
+def cookie_header(cookies, url):
+    """'Cookie' header value for url from the login browser's cookies (domain and path must match)."""
+    from urllib.parse import urlparse
+    p = urlparse(url)
+    host, path = (p.hostname or "").lower(), p.path or "/"
+    out = []
+    for c in cookies or []:
+        dom = (c.get("domain") or "").lower().lstrip(".")
+        if dom and not (host == dom or host.endswith("." + dom)):
+            continue
+        if not path.startswith(c.get("path") or "/"):
+            continue
+        out.append(f"{c['name']}={c['value']}")
+    return "; ".join(out)
+
+
+def login_headers(page, url):
+    """Headers that make a download look like it comes from the signed-in browser window."""
+    h = {"Referer": page.get("url") or url}
+    if page.get("ua"):
+        h["User-Agent"] = page["ua"]
+    ck = cookie_header(page.get("cookies"), url)
+    if ck:
+        h["Cookie"] = ck
+    return h
+
+
+def probe_doc(url, headers):
+    """For a link without a file extension: what does the server send? Returns (ext, file name) for a document,
+    None for a web page. Reads only the headers."""
+    import email.message
+    with _http(url, timeout=20, headers=headers) as r:
+        ctype = (r.headers.get_content_type() or "").lower()
+        name = ""
+        cd = r.headers.get("Content-Disposition")
+        if cd:
+            msg = email.message.Message()
+            msg["content-disposition"] = cd
+            name = msg.get_filename() or ""
+    ext = os.path.splitext(name)[1].lower() or MIME_EXT.get(ctype, "")
+    if ctype == "text/html" and not name:
+        return None
+    return (ext, name) if ext else None
+
+
+def browser_doc_links(page, exts):
+    """Documents among the links the login window collected: by file extension, by a download attribute, or
+    (for links that look like downloads) by what the server sends. Returns [(url, link text, ext, file name)]."""
+    from urllib.parse import unquote, urlparse
+    out, seen, probed = [], set(), 0
+    for l in page.get("links") or []:
+        link = (l.get("href") or "").split("#")[0]
+        p = urlparse(link)
+        if p.scheme not in ("http", "https") or link in seen:
+            continue
+        seen.add(link)
+        text = l.get("text") or ""
+        dl = l.get("download") or ""
+        ext = os.path.splitext(unquote(p.path))[1].lower()
+        if ext in exts:
+            out.append((link, text, ext, os.path.basename(unquote(p.path))))
+        elif os.path.splitext(dl)[1].lower() in exts:
+            out.append((link, text, os.path.splitext(dl)[1].lower(), dl))
+        elif probed < 40 and (dl or re.search(r"download|export|attachment|file|resource|material|document|"
+                                              r"/d/|pluginfile|forcedownload", link, re.I)):
+            probed += 1
+            try:
+                got = probe_doc(link, login_headers(page, link))
+            except Exception:  # noqa: BLE001
+                got = None
+            if got and got[0] in exts:
+                out.append((link, text, got[0], got[1]))
+    return out
+
+
+def download(url, folder, ext_hint="", headers=None):
+    """Download a file into folder (never overwriting a different file). Returns (path, sha256, newly saved).
+    `headers` carries the login (cookies) for sites that need one."""
     import email.message
     from urllib.parse import unquote, urlparse
     os.makedirs(folder, exist_ok=True)
-    with _http(url, timeout=120) as r:
+    with _http(url, timeout=120, headers=headers) as r:
         name = ""
         cd = r.headers.get("Content-Disposition")
+        if (r.headers.get_content_type() or "").lower() == "text/html" and not cd:
+            # a web page instead of the file: usually the site's login page (login expired)
+            raise ValueError("trang web trả về một trang thay vì file (có thể cần đăng nhập lại trong cửa sổ Source)")
         if cd:
             msg = email.message.Message()
             msg["content-disposition"] = cd
@@ -1552,8 +1632,9 @@ class LearningUI:
         top = self._dialog("Source — trang web chứa tài liệu", "660x230")
         tk.Label(top, text="Link trang web chứa tài liệu khóa học:", font=(A.UI_FONT, 10, "bold"),
                  bg="white").pack(anchor="w", padx=14, pady=(14, 2))
-        tk.Label(top, text="Mỗi lần bấm 🌐 Source, app quét trang này; tài liệu mới (PDF, Word, ảnh, file chữ...) "
-                           "được tự tải về thư mục học (thư mục con Source) và upload cho Claude.",
+        tk.Label(top, text="Mỗi lần bấm 🌐 Source, trang này mở trong một cửa sổ trình duyệt của app: đăng nhập "
+                           "(chỉ lần đầu, app nhớ phiên), mở mục tài liệu (Materials) rồi bấm nút xanh 📥. Tài liệu "
+                           "chưa có trong thư mục học được tải về đó và upload cho Claude.",
                  bg="white", fg="#666", font=(A.UI_FONT, 9), wraplength=620, justify="left").pack(anchor="w", padx=14)
         var = tk.StringVar(value=current)
         entry = tk.Entry(top, textvariable=var, font=(A.UI_FONT, 10))
@@ -1568,7 +1649,7 @@ class LearningUI:
                 return
             result.append(url)
             top.destroy()
-        self._buttons(top, ok, ok="Lưu và quét")
+        self._buttons(top, ok, ok="Lưu và mở")
         top.wait_window()
         if not result:
             return None
@@ -1580,6 +1661,9 @@ class LearningUI:
         return result[0]
 
     def scan_source(self):
+        """Open the Source page in the login window (the login is remembered, so usually it opens signed in);
+        the user goes to the materials page and presses the button; documents not yet in the study folder are
+        downloaded into it, with the login, and uploaded for Claude."""
         if self.syncing:
             self.mw.status.config(text="⏳ Đang đồng bộ — chờ xong rồi bấm Source lại.", fg="#ffd479")
             return
@@ -1589,31 +1673,78 @@ class LearningUI:
             if not folder:
                 return
         url = self.lib.data["source_url"]
-        dest = os.path.join(folder, "Source")
+        out = os.path.join(A.DATA_DIR, "learning", f"source_page_{os.getpid()}.json")
+        profile = os.path.join(A.DATA_DIR, "learning", "source_browser")   # keeps the site login
+        try:
+            os.remove(out)
+        except OSError:
+            pass
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable, "--source-browser", url, out, profile]
+        else:
+            cmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(A.__file__)), "app.py"),
+                   "--source-browser", url, out, profile]
+        try:
+            proc = subprocess.Popen(cmd)
+        except Exception as e:  # noqa: BLE001
+            self.chat_note(f"Không mở được cửa sổ Source: {e}")
+            return
         self.syncing = True
-        self.chat_note(f"Đang quét {url} để tìm tài liệu mới...")
-        self.mw.busy("source", "Đang quét trang Source tìm tài liệu mới...")
+        self.chat_note(f"Đã mở {url} trong cửa sổ Source. Nếu đã đăng nhập từ lần trước, app tự tải sau vài giây "
+                       f"và tự đóng cửa sổ. Lần đầu: đăng nhập, mở trang chứa tài liệu (Materials), rồi bấm nút xanh "
+                       f"“📥 Tải tài liệu mới từ trang này” ở góc dưới — lần sau app nhớ trang đó và làm tự động.")
+        self.mw.busy("source", "Đang chờ bạn mở trang tài liệu trong cửa sổ Source...")
 
         def progress(msg):
             self.later(lambda: self.mw.busy("source", msg))
 
         def work():
-            got, dup, problems, links, r = [], 0, [], [], None
+            got, have_n, dup, problems, links, r = [], 0, 0, [], [], None
+            page = None
             try:
-                links = doc_links(url, SOURCE_EXTS & supported_exts())
+                proc.wait()
+                if os.path.exists(out):
+                    with open(out, encoding="utf-8") as f:
+                        page = json.load(f)
+                    os.remove(out)
+                if page is None:
+                    self.later(lambda: (self.mw.done("source"),
+                                        self.chat_note("Đã đóng cửa sổ Source mà chưa bấm “Tải tài liệu mới” — "
+                                                       "không tải gì.")))
+                    return
+                if page.get("error"):
+                    problems.append(page["error"])
+                    return
+                with self.lib.lock:                          # next time open this materials page directly
+                    self.lib.data["source_url"] = page.get("url") or url
+                progress("Đang tìm tài liệu trên trang...")
+                links = browser_doc_links(page, SOURCE_EXTS & supported_exts())
                 known = self.lib.data.setdefault("source_files", {})
-                todo = [x for x in links if x[0] not in known]
+                # what is already in the study folder (any sub-folder): by file name and by content
+                names = set()
+                for base, dirs, files in os.walk(folder):
+                    dirs[:] = [d for d in dirs if not d.startswith(".")]
+                    names.update(n.lower() for n in files)
                 have = {d.get("sha") for d in self.lib.docs()}
+                todo = []
+                for link, text, ext, name in links:
+                    k = known.get(link)
+                    if (k and (k.get("name", "").lower() in names or k.get("sha") in have)) or \
+                            (name and safe_name(name).lower() in names):    # in the folder, or a known duplicate
+                        have_n += 1
+                    else:
+                        todo.append((link, text, ext))
                 for k, (link, text, ext) in enumerate(todo, 1):
                     progress(f"Đang tải tài liệu mới {k}/{len(todo)} từ Source...")
                     try:
-                        path, sha, created = download(link, dest, ext)
+                        path, sha, created = download(link, folder, ext, login_headers(page, link))
                     except Exception as e:  # noqa: BLE001
                         problems.append(f"{text or link}: {e}")
                         continue
                     with self.lib.lock:
-                        known[link] = {"name": os.path.basename(path), "sha": sha, "time": time.strftime("%Y-%m-%d %H:%M")}
-                    if sha in have:
+                        known[link] = {"name": os.path.basename(path), "sha": sha,
+                                       "time": time.strftime("%Y-%m-%d %H:%M")}
+                    if sha in have or not created:
                         dup += 1                                 # same content as a document already there
                         if created:
                             try:
@@ -1633,8 +1764,12 @@ class LearningUI:
                 problems.append(A.friendly_error(e) if isinstance(e, anthropic.APIError) else f"{type(e).__name__}: {e}")
             finally:
                 self.syncing = False
-            msg = (f"Source: {len(links)} link tài liệu trên trang; "
-                   + (f"{len(got)} tài liệu mới đã tải về {dest} và upload cho Claude:\n" +
+                if page is None and not problems:
+                    return
+            where = (page or {}).get("title") or (page or {}).get("url") or url
+            msg = (f"Source ({where}): {len(links)} tài liệu trên trang"
+                   + (f", {have_n} đã có trong thư mục học" if have_n else "") + "; "
+                   + (f"{len(got)} tài liệu mới đã tải về {folder} và upload cho Claude:\n" +
                       "\n".join(f"  • {n}" for n in got) if got else "không có tài liệu mới.")
                    + (f"\n{dup} file trùng nội dung với tài liệu đã có (bỏ qua)." if dup else ""))
             if problems:

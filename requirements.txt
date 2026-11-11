@@ -9,3 +9,4 @@ sherpa-onnx
 pymupdf
 pillow
 pyyaml
+pywebview

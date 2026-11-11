@@ -46,6 +46,9 @@ fi
   --distpath dist --workpath build/mac --specpath build/mac \
   "${ADD[@]}" --collect-all ctranslate2 --collect-all vosk --collect-all sherpa_onnx \
   --collect-all pymupdf --hidden-import learning \
+  --hidden-import source_browser --collect-all webview \
+  --hidden-import objc --hidden-import Foundation --hidden-import AppKit --hidden-import WebKit \
+  --hidden-import PyObjCTools --hidden-import Quartz --hidden-import Security --hidden-import UniformTypeIdentifiers \
   --collect-data faster_whisper --exclude-module onnxruntime --exclude-module torch \
   "$PWD/app.py"
 

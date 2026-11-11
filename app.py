@@ -25,13 +25,19 @@ for _name in ("stdout", "stderr"):
         setattr(sys, _name, open(os.devnull, "w", encoding="utf-8"))
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
+if "--source-browser" in sys.argv:          # the Source login window runs as its own small process
+    import source_browser
+    _i = sys.argv.index("--source-browser")
+    source_browser.run(*sys.argv[_i + 1:_i + 4])
+    sys.exit(0)
+
 import anthropic
 import numpy as np
 
 import learning
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.9.8"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.9.9"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # The login client waits at most 20 s for data (right for live translation). Chat and the Learning menu send
 # whole documents, and Claude can read/think longer than that before the first word: give them more time.
@@ -188,6 +194,33 @@ def download_quality_model(progress):
                 progress(done, total)
         os.replace(final + ".part", final)
     progress(total, total)
+
+
+def free_memory_mb():
+    """Memory Windows can still hand out (MB): the smaller of free RAM+page file (commit) and free RAM x 2.
+    None when unknown (other systems)."""
+    try:
+        import ctypes
+
+        class MS(ctypes.Structure):
+            _fields_ = [("len", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total_phys", ctypes.c_ulonglong),
+                        ("avail_phys", ctypes.c_ulonglong), ("total_pf", ctypes.c_ulonglong),
+                        ("avail_pf", ctypes.c_ulonglong), ("total_v", ctypes.c_ulonglong),
+                        ("avail_v", ctypes.c_ulonglong), ("ext", ctypes.c_ulonglong)]
+        m = MS()
+        m.len = ctypes.sizeof(m)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+            return None
+        return min(m.avail_pf, m.avail_phys * 2) / 2**20
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# Cao needs ~0.4 GB more (peak ~0.7 GB while loading). When Windows runs out of memory the app crashes inside
+# Tk (seen on 12/11: another program used 11 GB), so Cao is only started with room to spare, and is turned off
+# again by itself if free memory gets low while it runs.
+HQ_START_MB = 1500
+HQ_KEEP_MB = 700
 
 
 def quality_model_path():
@@ -762,8 +795,18 @@ class Recognizer(threading.Thread):
     def pick_model(self):
         """High quality when chosen and loaded, unless utterances are piling up (then the fast model catches
         up, so captions never fall far behind the speaker)."""
-        if self.quality == QUALITY_HIGH and self.whisper_hq is not None and self.whisper_q.qsize() < 2:
-            return self.whisper_hq
+        if self.quality == QUALITY_HIGH and self.whisper_hq is not None:
+            free = free_memory_mb()
+            if free is not None and free < HQ_KEEP_MB:        # the PC is running out of memory: give it back
+                self.whisper_hq = None
+                self.quality = QUALITY_FAST
+                import gc
+                gc.collect()
+                self.ui_q.put(("quality_off", f"Máy sắp hết bộ nhớ (còn {free:.0f} MB) — đã tắt chất lượng nghe "
+                                              f"Cao, chuyển về Nhanh để app không bị dừng."))
+                return self.whisper
+            if self.whisper_q.qsize() < 2:
+                return self.whisper_hq
         return self.whisper
 
     def transcribe(self, audio, model=None):
@@ -2475,6 +2518,17 @@ class MainWindow:
         if getattr(self, "_quality_job", False):         # already downloading/loading: just keep showing progress
             self.quality_var.set(self._quality_label)
             return
+        free = free_memory_mb()
+        if free is not None and free < HQ_START_MB:
+            self._quality_back()
+            msg = (f"Máy đang thiếu bộ nhớ (còn khoảng {free:.0f} MB) nên chưa bật được chất lượng nghe Cao — "
+                   f"vẫn dùng Nhanh. Hãy đóng bớt chương trình khác rồi chọn lại Cao.")
+            if startup:
+                self.ui_q.put(("error", msg))
+            else:
+                from tkinter import messagebox
+                messagebox.showwarning("Chất lượng nghe: Cao", msg, parent=self.root)
+            return
         need_download = quality_model_path() is None
         if need_download:
             from tkinter import messagebox
@@ -2660,6 +2714,9 @@ class MainWindow:
                         val()
                     except Exception as e:  # noqa: BLE001  (keep the UI loop alive)
                         self.status.config(text=friendly_error(e), fg="#ff7b7b")
+                elif kind == "quality_off":         # Cao was turned off for lack of memory
+                    self._quality_back()
+                    self.status.config(text=val, fg="#ffd479")
                 elif kind == "force_off":
                     if self.on:
                         self.toggle_onoff()
