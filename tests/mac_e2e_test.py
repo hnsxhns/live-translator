@@ -234,7 +234,8 @@ shot("04_user_scrolled_up")
 # --- rest of the speech arrives while the user reads above ---
 at(seg_times[-1][2] + 8)
 st = mw.status.cget("text")
-check("mic_silence_warning", "Micro không gửi âm thanh" in st, st[:120])
+check("mic_silence_warning", "Micro không gửi âm thanh" in st,
+      f"{st[:90]} | zero seconds counted: {getattr(mw.recognizer, 'zero_seconds', '?')}")
 yl = mw.left.yview()
 check("no_fight_with_user_scroll", (not overflow) or yl[0] < 0.05,
       f"EN view stayed at {yl[0]:.2f}-{yl[1]:.2f} while new text arrived")
@@ -548,13 +549,57 @@ if hasattr(mw.learning, "list_outputs"):
         if delb:
             delb.invoke()
             pump(1.5)
-    in_trash = os.path.exists(os.path.expanduser(f"~/.Trash/{os.path.basename(victim)}")) if getattr(app, "IS_MAC", False) else None
+    import glob as _glob                               # the app adds a date/time to the name in the Trash
+    stem = os.path.splitext(os.path.basename(victim))[0]
+    in_trash = bool(_glob.glob(os.path.expanduser(f"~/.Trash/{stem}*"))) if getattr(app, "IS_MAC", False) else None
     check("list_output_delete_goes_to_trash",
           target is not None and not os.path.exists(victim) and not errors and in_trash is not False,
           f"found in list={target is not None}; file still there={os.path.exists(victim)}; in ~/.Trash={in_trash}; errors={errors}")
     if top:
         top.destroy()
         pump(0.3)
+
+# --- v1.9.0: modal dialogs that ask the learner (choose an option / type a value) ---
+if hasattr(mw.learning, "ask_choice"):
+    def click_in_last_dialog(label, before=None):
+        tops = toplevels()
+        if not tops:
+            return
+        if before:
+            before(tops[-1])
+        b = find_button(tops[-1], label)
+        if b:
+            b.invoke()
+
+    def pick_second(top):
+        stack = [top]
+        while stack:
+            x = stack.pop()
+            if isinstance(x, tk.Listbox):
+                x.selection_clear(0, "end")
+                x.selection_set(1)
+            stack.extend(x.winfo_children())
+
+    opts = [{"label": "Bảng A", "values": [{"slot": "bảng", "text": "Bảng A: doanh thu"}]},
+            {"label": "Bảng B", "values": [{"slot": "bảng", "text": "Bảng B: chi phí"}]}]
+    root.after(800, lambda: click_in_last_dialog("Chọn", pick_second))
+    got = mw.learning.ask_choice({"question": "Chọn bảng của bạn", "options": opts})
+    check("dialog_choose_option", got is opts[1], f"returned {got and got.get('label')}")
+
+    typed = "Đề bài của tôi: phân tích doanh thu quý 3, có dấu ắ ơ ư đ"
+
+    def type_text(top):
+        stack = [top]
+        while stack:
+            x = stack.pop()
+            if isinstance(x, tk.Text):
+                x.insert("1.0", typed)
+                return
+            stack.extend(x.winfo_children())
+    root.after(800, lambda: click_in_last_dialog("Điền vào prompt", type_text))
+    got = mw.learning.ask_text({"name": "de_bai", "label": "Đề bài"})
+    check("dialog_type_value_vietnamese", got == typed, f"returned {got!r}"[:120])
+    pump(0.3)
 
 # --- clean exit: no extra processes, no hang ---
 save_results()

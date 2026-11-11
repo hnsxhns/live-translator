@@ -24,7 +24,7 @@ import numpy as np
 import learning
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.8.9.1"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.9.0"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # The login client waits at most 20 s for data (right for live translation). Chat and the Learning menu send
 # whole documents, and Claude can read/think longer than that before the first word: give them more time.
@@ -671,13 +671,14 @@ class Recognizer(threading.Thread):
                 # Mac: with microphone access denied, CoreAudio sends exact zeros instead of an error
                 if float(np.max(np.abs(block))) == 0.0:
                     zero_s += len(block) / SAMPLE_RATE
+                    self.zero_seconds = zero_s           # (read by the test / diagnostics)
                     if zero_s >= 4.0 and not warned_zero:
                         warned_zero = True
                         self.ui_q.put(("error", "Micro không gửi âm thanh. Trên Mac: System Settings → Privacy & "
                                                 "Security → Microphone → bật Live Translator, rồi mở lại ứng dụng."
                                        if IS_MAC else "Micro không gửi âm thanh. Kiểm tra micro trong cài đặt máy."))
                 else:
-                    zero_s = 0.0
+                    zero_s = self.zero_seconds = 0.0
                 utt.append(block)
                 utt_len += len(block)
 

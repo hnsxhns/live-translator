@@ -802,8 +802,39 @@ MERGE_SCHEMA = {
         "type": "object", "additionalProperties": False, "required": ["title", "goal", "day", "doc_ids", "steps"],
         "properties": {"title": _STR, "goal": _STR, "day": {"type": "integer"},
                        "doc_ids": {"type": "array", "items": _STR}, "steps": STEPS_SCHEMA}}}}}
-PLAN_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["steps"],
-               "properties": {"steps": STEPS_SCHEMA}}
+# plans used to solve an exercise: each step keeps the course's own prompt (verbatim) with its blanks marked as
+# slots, so the app can fill them itself (a choice the learner makes, an earlier step's result, or the learner)
+SLOT_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["name", "kind", "label", "from_step"],
+               "properties": {"name": _STR, "kind": {"type": "string", "enum": ["choice", "previous", "learner"]},
+                              "label": _STR, "from_step": {"type": "integer"}}}
+STEPS2_SCHEMA = {"type": "array", "items": {
+    "type": "object", "additionalProperties": False, "required": ["title", "instruction", "prompt_template", "slots"],
+    "properties": {"title": _STR, "instruction": _STR, "prompt_template": _STR,
+                   "slots": {"type": "array", "items": SLOT_SCHEMA}}}}
+PARAMS_SCHEMA = {"type": "array", "items": {
+    "type": "object", "additionalProperties": False, "required": ["name", "question", "options"],
+    "properties": {"name": _STR, "question": _STR, "options": {"type": "array", "items": {
+        "type": "object", "additionalProperties": False, "required": ["label", "values"],
+        "properties": {"label": _STR, "values": {"type": "array", "items": {
+            "type": "object", "additionalProperties": False, "required": ["slot", "text"],
+            "properties": {"slot": _STR, "text": _STR}}}}}}}}}
+PLAN_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["params", "steps"],
+               "properties": {"params": PARAMS_SCHEMA, "steps": STEPS2_SCHEMA}}
+PROMPT_GUIDE = (
+    " For every step also give prompt_template and slots. prompt_template: when the document gives a ready "
+    "prompt for that step, copy it VERBATIM, replacing each blank the learner would have to fill or paste (e.g. "
+    "'[insert your table's challenge list from the Appendix]', '[YOUR PROBLEM]') with {{slot_name}}; when the "
+    "prompt relies on an earlier step's result (e.g. 'the list of sub-problems from Stage 1', 'the workflow we "
+    "designed'), append at its end a line such as '\n\nKết quả bước trước:\n{{slot_name}}' so that result "
+    "can be pasted in automatically. Use an empty string when the step has no ready prompt. slots: one entry "
+    "per {{slot_name}} used: kind 'choice' when the value is data the document already contains and the learner "
+    "only has to pick (e.g. their table's list in the appendix), 'previous' when it is the result of an earlier "
+    "step (from_step = that step's number, counting every step of the plan from 1 in order), 'learner' when only "
+    "the learner can give it (from_step 0); label = a short Vietnamese description. Reuse the same slot name "
+    "for the same value in every step (e.g. your_problem). params: the questions to ask the learner once to "
+    "pick such data (e.g. 'Bạn ngồi bàn nào hôm qua?'); give every option (e.g. each table) with a short label "
+    "(e.g. 'Table 3') and, for each choice slot it fills, the full text copied from the document. Empty list "
+    "if there is nothing to choose.")
 BIGEX_SYSTEM = (
     "You read a course document and list its substantial exercises, assignments, labs or projects "
     "(bài tập lớn) — tasks the learner has to carry out, especially ones whose instructions go through "
@@ -822,21 +853,22 @@ PLAN_SYSTEM = (
     "through one at a time, following the document's own instructions and order (3-8 steps for one exercise; "
     "when asked to follow the whole file, one step per exercise or instruction block, in the file's order, up "
     "to 15 steps). Return JSON only: steps with "
-    "a short title and a Vietnamese instruction (keep technical terms, commands and values from the document).")
+    "a short title and a Vietnamese instruction (keep technical terms, commands and values from the document)."
+    + PROMPT_GUIDE)
 
 
 WHOLE_SCHEMA = {
-    "type": "object", "additionalProperties": False, "required": ["goal", "exercises"],
-    "properties": {"goal": _STR, "exercises": {"type": "array", "items": {
+    "type": "object", "additionalProperties": False, "required": ["goal", "params", "exercises"],
+    "properties": {"goal": _STR, "params": PARAMS_SCHEMA, "exercises": {"type": "array", "items": {
         "type": "object", "additionalProperties": False, "required": ["title", "goal", "steps"],
-        "properties": {"title": _STR, "goal": _STR, "steps": STEPS_SCHEMA}}}}}
+        "properties": {"title": _STR, "goal": _STR, "steps": STEPS2_SCHEMA}}}}}
 WHOLE_SYSTEM = (
     "The attached course file may be one big problem made of many sub-exercises that build on each other. "
     "Return JSON only: goal = the overall goal of the whole file (one Vietnamese sentence); exercises = every "
     "sub-exercise in the file's own order (title as written, goal in one Vietnamese sentence, and its concrete "
     "steps: follow the file's own steps exactly when it gives them, otherwise 2-6 clear steps; Vietnamese, "
     "keeping technical terms, commands, numbers and names from the file). Note in a step's instruction when it "
-    "uses the result of an earlier sub-exercise. Skip reading-only parts.")
+    "uses the result of an earlier sub-exercise. Skip reading-only parts." + PROMPT_GUIDE)
 
 
 def parts_to_steps(parts):
@@ -847,29 +879,29 @@ def parts_to_steps(parts):
         for j, st in enumerate(p["steps"], 1):
             steps.append({"title": st["title"], "instruction": st["instruction"], "part": k, "parts": len(parts),
                           "part_title": p["title"], "part_goal": p.get("goal", ""), "pstep": j,
-                          "psteps": len(p["steps"])})
+                          "psteps": len(p["steps"]), "prompt_template": st.get("prompt_template", ""),
+                          "slots": st.get("slots", [])})
     return steps
 
 
 def known_file_plan(doc):
     """A whole-file plan that needs no Claude call: saved from before, or built from the sub-exercises
     (with steps) that the folder scan already found in this file. None if Claude must read the file."""
-    if doc.get("fileplan"):
-        return doc["fileplan"]["goal"], doc["fileplan"]["steps"]
-    found = doc.get("bigex") or []
-    if found and all(p.get("steps") for p in found):
-        return doc.get("description", ""), parts_to_steps(found)
+    fp = doc.get("fileplan")
+    if fp and fp.get("v") == 2:          # plans from older versions lack the course prompts: make a new one
+        return fp["goal"], fp["steps"], fp.get("params", [])
     return None
 
 
-def file_exercise(doc, goal, steps):
+def file_exercise(doc, goal, steps, params=None):
     """The whole file as one exercise (sub-exercise by sub-exercise)."""
     return {"title": doc.get("title") or doc["name"], "goal": goal, "day": doc.get("day") or 0,
-            "doc_ids": [doc["id"]], "steps": steps, "whole_file": True}
+            "doc_ids": [doc["id"]], "steps": steps, "whole_file": True, "params": params or []}
 
 
-def single_exercise(doc, title, goal, steps):
-    return {"title": title, "goal": goal, "day": doc.get("day") or 0, "doc_ids": [doc["id"]], "steps": steps}
+def single_exercise(doc, title, goal, steps, params=None):
+    return {"title": title, "goal": goal, "day": doc.get("day") or 0, "doc_ids": [doc["id"]], "steps": steps,
+            "params": params or []}
 
 
 def exercise_key(ex):
@@ -882,23 +914,25 @@ def exercise_key(ex):
 def plan_file(lib, client, doc, known):
     """Plan a whole file: (overall goal, [steps]) where each step knows its sub-exercise (part). Saved."""
     info = f"File: {doc['rel']}\nSub-exercises already noticed in it: " + ("; ".join(known) or "(none)")
-    res = _ask_doc(lib, client, WHOLE_SYSTEM, doc, info, WHOLE_SCHEMA, effort="low")
+    res = _ask_doc(lib, client, WHOLE_SYSTEM, doc, info, WHOLE_SCHEMA, effort="low", max_tokens=32000)
     goal, steps = res.get("goal", ""), parts_to_steps(res.get("exercises") or [])
+    params = res.get("params") or []
     if steps:
         with lib.lock:
-            doc["fileplan"] = {"goal": goal, "steps": steps}
+            doc["fileplan"] = {"v": 2, "goal": goal, "steps": steps, "params": params}
         lib.save()
-    return goal, steps
+    return goal, steps, params
 
 
-def _ask_doc(lib, client, system, doc, info, schema, effort="medium"):
+def _ask_doc(lib, client, system, doc, info, schema, effort="medium", max_tokens=16000):
     """ask_json with one library document attached (falls back to its text if the file is refused)."""
     try:
-        return ask_json(client, system, [lib.block(doc), {"type": "text", "text": info}], schema, effort=effort)
+        return ask_json(client, system, [lib.block(doc), {"type": "text", "text": info}], schema, effort=effort,
+                        max_tokens=max_tokens)
     except anthropic.BadRequestError:
         text = lib.text(doc)[:300_000]
         return ask_json(client, system, f"{info}\n\n<file name=\"{doc['name']}\">\n{text}\n</file>", schema,
-                        effort=effort)
+                        effort=effort, max_tokens=max_tokens)
 
 
 def scan_exercises(lib, client, progress, full=False):
@@ -951,16 +985,17 @@ def plan_steps(lib, client, ex):
     """Steps for an exercise from the per-document list (it has none yet)."""
     doc = ex["doc"]
     saved = (doc.get("plans") or {}).get(ex["title"])
-    if saved:
-        return saved
+    if isinstance(saved, dict) and saved.get("v") == 2:
+        return saved["steps"], saved.get("params", [])
     info = (f"Exercise: {ex['title']}\nSummary: {ex.get('summary', '')}\nLocation: {ex.get('location', '')}\n"
             f"File: {doc['rel']}")
-    steps = _ask_doc(lib, client, PLAN_SYSTEM, doc, info, PLAN_SCHEMA, effort="low").get("steps") or []
+    res = _ask_doc(lib, client, PLAN_SYSTEM, doc, info, PLAN_SCHEMA, effort="low", max_tokens=32000)
+    steps, params = res.get("steps") or [], res.get("params") or []
     if steps:
         with lib.lock:
-            doc.setdefault("plans", {})[ex["title"]] = steps
+            doc.setdefault("plans", {})[ex["title"]] = {"v": 2, "steps": steps, "params": params}
         lib.save()
-    return steps
+    return steps, params
 
 
 def pdf_fonts():
@@ -1062,9 +1097,15 @@ EXERCISE_RULES = (
     "1. If this step needs information only the learner can give (their own data, choices or parameters, or the "
     "blanks of a template from the course book) and the message does not contain it yet, only ask for those "
     "items as a short numbered list and end with the line [[CẦN NHẬP: item 1 | item 2]]. Do nothing else.\n"
-    "2. Otherwise do the step and give the result in a few lines. If the step needs a prompt for an AI tool, give "
-    "the complete prompt between a line '----- PROMPT -----' and a line '----- HẾT PROMPT -----' (copy the "
-    "course book's template when it has one, filled in with the learner's information).\n"
+    "2. Otherwise do the step. If the message contains 'PROMPT BÀI TẬP', that is the course's own prompt with "
+    "the learner's data already filled in: answer it fully, exactly as the exercise asks (this is the step's "
+    "result) — complete, but without padding. Otherwise give the result in a few lines. If the step needs a "
+    "prompt for an AI tool, give the complete prompt between a line '----- PROMPT -----' and a line "
+    "'----- HẾT PROMPT -----' (copy the course book's template when it has one, filled in with the learner's "
+    "information).\n"
+    "2b. Then give the essential reusable result of this step (e.g. the final structured list, the themes, the "
+    "plan, the problem statement) between a line '----- KẾT QUẢ GỌN -----' and a line '----- HẾT KẾT QUẢ -----': "
+    "as compact as possible but complete enough to be pasted into a later prompt.\n"
     "3. Then one line: '➡ Mang sang bước sau: ...' with only what the next step needs from this result (very "
     "short). Skip it at the last step.\n"
     "4. If the next step (see <next_step>) will need input from the learner (information, a plan, a prompt to "
@@ -1090,6 +1131,10 @@ DRAFT_BLOCK = re.compile(r"-{3,} *MẪU BƯỚC SAU *-{3,} *\n(.*?)\n *-{3,} *H�
 DRAFT_START_TK = r"-{3,} *MẪU BƯỚC SAU *-{3,}"
 DRAFT_END_TK = r"-{3,} *HẾT MẪU *-{3,}"
 BLANK = re.compile(r"\[cần điền[^\]]*\]", re.I)
+OUTPUT_BLOCK = re.compile(r"-{3,} *KẾT QUẢ GỌN *-{3,} *\n(.*?)\n *-{3,} *HẾT KẾT QUẢ *-{3,}", re.S | re.I)
+OUTPUT_START_TK = r"-{3,} *KẾT QUẢ GỌN *-{3,}"
+OUTPUT_END_TK = r"-{3,} *HẾT KẾT QUẢ *-{3,}"
+SLOT_MARK = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
 MARKER = re.compile(r"\[\[\s*(?:CẦN NHẬP|CAN NHAP|XONG BƯỚC|XONG BUOC)[^\]]*\]\]", re.I)
 MARKER_TK = r"\[\[ *(CẦN NHẬP|CAN NHAP|XONG BƯỚC|XONG BUOC)[^]]*\]\]"      # the same, for Tk's text search
 NEEDS_INPUT = re.compile(r"\[\[\s*(?:CẦN NHẬP|CAN NHAP)(?!\s*TI)\s*:?\s*([^\]]*)\]\]", re.I)
@@ -1131,6 +1176,9 @@ def solution_pdf(lib, session, summary):
             parts.append(f"<h3>{label}: {_html.escape(st.get('title', ''))}</h3>")
             if st.get("instruction"):
                 parts.append(f"<p class='instr'>{_html.escape(st['instruction'])}</p>")
+        if item.get("prompt"):                                     # the course prompt used, as filled in
+            body = "<br/>".join(_html.escape(ln) for ln in item["prompt"].split("\n"))
+            parts.append(f"<p class='plabel'><b>Prompt đã dùng:</b></p><p class='prompt'>{body}</p>")
         if item.get("input"):
             filled = item["q"]
             m = re.search(r"thông tin của tôi[^\n]*\n", item["q"], re.I)      # only what the learner sent
@@ -1597,13 +1645,14 @@ class LearningUI:
         def prepare(it):
             """Start working out the steps in the background as soon as an item is selected, so that
             ▶ Bắt đầu shows the first prompt at once (the result is saved for next time too)."""
-            if it["kind"] == "file" and it["exs"] and not known_file_plan(it["doc"]):
+            if it["kind"] == "file" and not known_file_plan(it["doc"]):
                 d = it["doc"]
                 self.prefetch(f"file:{d['id']}",
                               lambda: plan_file(self.lib, self.mw.client, d, [e["title"] for e in it["exs"]]))
-            elif it["kind"] == "ex" and not it["ex"].get("steps"):
+            elif it["kind"] == "ex":
                 d, e = it["doc"], it["ex"]
-                if not (d.get("plans") or {}).get(e["title"]):
+                saved = (d.get("plans") or {}).get(e["title"])
+                if not (isinstance(saved, dict) and saved.get("v") == 2):
                     self.prefetch(f"ex:{d['id']}:{e['title']}", lambda: plan_steps(self.lib, self.mw.client, {
                         "title": e["title"], "summary": e.get("goal", ""), "location": e.get("location", ""),
                         "doc": d}))
@@ -1627,7 +1676,7 @@ class LearningUI:
                 d, exs = it["doc"], it["exs"]
                 kp = known_file_plan(d)
                 if kp:
-                    detail.insert("end", progress_note(file_exercise(d, kp[0], kp[1])).strip() + "\n")
+                    detail.insert("end", progress_note(file_exercise(d, kp[0], kp[1], kp[2])).strip() + "\n")
                 tree.item(tree.selection()[0], open=True)
                 detail.insert("end", f"{d.get('description', '')}\n\n" + (
                     "Bài tập trong file:\n" + "\n".join(f"  • {e['title']}" for e in exs) if exs else
@@ -1676,17 +1725,12 @@ class LearningUI:
                 self.start_session(it["ex"], restart=redo)
                 return
             d = it["doc"]
-            if it["kind"] == "ex" and it["ex"].get("steps"):
-                ex = it["ex"]
-                top.destroy()
-                self.start_session(single_exercise(d, ex["title"], ex.get("goal", ""), ex["steps"]), restart=redo)
-                return
             top.destroy()                  # close right away: progress shows in the Claude pane
             if it["kind"] == "file":       # the whole file: one big problem, sub-exercise by sub-exercise
                 prep = f"file:{d['id']}"
                 known = known_file_plan(d)
                 if known:                  # steps already known (saved): the first prompt appears at once
-                    self.start_session(file_exercise(d, known[0], known[1]), restart=redo)
+                    self.start_session(file_exercise(d, *known), restart=redo)
                     return
                 self.chat_note(f"Đang chuẩn bị các bài tập con và các bước của file \"{d['name']}\"... "
                                "Câu prompt đầu tiên sẽ hiện trong ô nhập khi xong.")
@@ -1694,25 +1738,26 @@ class LearningUI:
                 def plan():
                     self.wait_prefetch(prep)          # it may already be on its way since the file was selected
                     known = known_file_plan(d)
-                    goal, steps = known if known else plan_file(self.lib, self.mw.client, d,
-                                                                [e["title"] for e in it["exs"]])
+                    goal, steps, params = known if known else plan_file(self.lib, self.mw.client, d,
+                                                                        [e["title"] for e in it["exs"]])
                     if not steps:
                         raise ValueError("Claude không tìm thấy bài tập trong file")
-                    return file_exercise(d, goal, steps)
+                    return file_exercise(d, goal, steps, params)
             else:
                 prep = f"ex:{d['id']}:{it['ex']['title']}"
                 ex = {"title": it["ex"]["title"], "summary": it["ex"].get("goal", ""),
                       "location": it["ex"].get("location", ""), "doc": d}
-                if not (d.get("plans") or {}).get(ex["title"]):
-                    self.chat_note(f"Đang chia bài \"{ex['title']}\" thành các bước... "
+                saved = (d.get("plans") or {}).get(ex["title"])
+                if not (isinstance(saved, dict) and saved.get("v") == 2):
+                    self.chat_note(f"Đang chuẩn bị bài \"{ex['title']}\" (các bước và prompt của sách)... "
                                    "Câu prompt đầu tiên sẽ hiện trong ô nhập khi xong.")
 
                 def plan():
                     self.wait_prefetch(prep)
-                    steps = plan_steps(self.lib, self.mw.client, ex)      # uses the saved steps if any
+                    steps, params = plan_steps(self.lib, self.mw.client, ex)      # uses the saved plan if any
                     if not steps:
                         raise ValueError("Claude không trả về các bước")
-                    return single_exercise(d, ex["title"], ex.get("summary", ""), steps)
+                    return single_exercise(d, ex["title"], ex.get("summary", ""), steps, params)
             self.mw.status.config(text="🎓 Đang chuẩn bị bài tập...", fg="#ddd")
 
             def work():
@@ -1780,7 +1825,9 @@ class LearningUI:
             self.lib.data.setdefault("sessions", {})[s["key"]] = {
                 "ex": s["ex"], "i": s["i"], "log": s["log"], "overview": s.get("overview", ""),
                 "awaiting": s.get("awaiting"), "carry": s.get("carry"), "next_inputs": s.get("next_inputs"),
-                "next_draft": s.get("next_draft"),
+                "next_draft": s.get("next_draft"), "choices": s.get("choices", {}),
+                "choice_values": s.get("choice_values", {}), "slot_values": s.get("slot_values", {}),
+                "outputs": s.get("outputs", {}),
                 "done": done, "time": time.strftime("%d/%m %H:%M")}
         self.lib.save()
 
@@ -1792,7 +1839,8 @@ class LearningUI:
             # an exercise opened before: carry on where it stopped
             self.session = {"ex": ex, "i": min(saved["i"], len(steps)), "log": saved.get("log", []),
                             "overview": saved.get("overview", ""), "key": key, "resume": True}
-            for k in ("awaiting", "carry", "next_inputs", "next_draft"):
+            for k in ("awaiting", "carry", "next_inputs", "next_draft", "choices", "choice_values", "slot_values",
+                      "outputs"):
                 if saved.get(k):
                     self.session[k] = saved[k]
             k = self.session["i"]
@@ -1806,7 +1854,8 @@ class LearningUI:
             else:
                 self.prompt_step()
             return
-        self.session = {"ex": ex, "i": -1, "log": [], "overview": "", "key": key}   # i = -1: the overview first
+        self.session = {"ex": ex, "i": -1, "log": [], "overview": "", "key": key,     # i = -1: the overview first
+                        "choices": {}, "choice_values": {}, "slot_values": {}, "outputs": {}}
         if steps and steps[0].get("part"):
             lines = [f"  Bài {st['part']}/{st['parts']}: {st['part_title']} ({st['psteps']} bước)"
                      for st in steps if st["pstep"] == 1]
@@ -1881,10 +1930,19 @@ class LearningUI:
         lines = [f"{head}: {step['title']}.", step["instruction"]]
         if new_part and step.get("part_goal"):
             lines.append(f"Mục tiêu bài này: {step['part_goal']}")
-        if s.get("carry"):
-            lines.append(f"Mang sang từ bước trước: {s['carry']}")
         draft = s.get("next_draft")
-        if draft:                       # Claude prepared this input: template + known values, blanks for the rest
+        if step.get("prompt_template"):
+            # the course's own prompt: the app fills its blanks itself (the learner's choice, earlier results,
+            # values the learner gave once) - nothing to copy and paste
+            self.ensure_inputs(step)
+            draft = self.fill_template(step)
+            lines.append("PROMPT BÀI TẬP (đã điền sẵn):")
+            lines.append(draft)
+        elif s.get("carry"):
+            lines.append(f"Mang sang từ bước trước: {s['carry']}")
+        if step.get("prompt_template"):
+            pass
+        elif draft:                     # Claude prepared this input: template + known values, blanks for the rest
             lines.append("Thông tin của tôi (đã điền sẵn — chỉ cần điền các chỗ [cần điền: ...]):")
             lines.append(draft)
         elif s.get("next_inputs"):                         # Claude said this step needs the learner's information
@@ -1893,7 +1951,14 @@ class LearningUI:
         label = (f"{self._step_name(i)} · {step['part_title'][:25]}" if step.get("part")
                  else f"Bài tập · {self._step_name(i)} · {ex['title'][:30]}")
         blanks = len(BLANK.findall(draft or ""))
-        if draft or s.get("next_inputs"):
+        if step.get("prompt_template"):
+            if blanks:
+                label += f" · còn {blanks} chỗ cần điền"
+                self.mw.status.config(text=f"🎓 Prompt đã điền sẵn — còn {blanks} chỗ [cần điền] trong ô nhập.",
+                                      fg="#ffd479")
+            else:
+                self.mw.status.config(text="🎓 Prompt của bước đã được điền sẵn đầy đủ — bấm Gửi.", fg="#7ee2a8")
+        elif draft or s.get("next_inputs"):
             label += f" · còn {blanks} chỗ cần điền" if draft else " · điền thông tin"
             self.mw.status.config(text=(f"🎓 Bản nháp đã điền sẵn — còn {blanks} chỗ [cần điền] trong ô nhập."
                                         if draft else "🎓 Điền thông tin vào mẫu trong ô nhập rồi gửi."),
@@ -1903,8 +1968,105 @@ class LearningUI:
         ids = ex.get("doc_ids", []) if (i > 0 and (i % 6 == 0 or new_part)) or s.get("resume") else []
         self.set_prompt("\n".join(lines), {
             "kind": "exstep", "step": i, "doc_ids": ids, "label": label,
-            "input": bool(draft or s.get("next_inputs")),
+            "input": bool(draft or s.get("next_inputs")) and not step.get("prompt_template"),
+            "course_prompt": step.get("prompt_template") and draft,
             "blocks": [{"type": "text", "text": EXERCISE_RULES}, self._next_step_block(i)] + self._resume_blocks()})
+
+    # ---- filling the course's prompts: choices (e.g. the learner's table), earlier results, learner values ----
+    def fill_template(self, step):
+        """The step's course prompt with every blank filled in that the app can fill; [cần điền: ...] for the rest."""
+        s = self.session
+        values = {}
+        for slot in step.get("slots", []):
+            name, kind = slot["name"], slot.get("kind")
+            val = None
+            if kind == "choice":
+                val = s.setdefault("choice_values", {}).get(name)
+            elif kind == "previous":
+                k = int(slot.get("from_step") or 0) - 1
+                val = s.setdefault("outputs", {}).get(str(k))
+            if val is None:
+                val = s.setdefault("slot_values", {}).get(name)
+            values[name] = val if val else f"[cần điền: {slot.get('label') or name}]"
+
+        def sub(m):
+            name = m.group(1)
+            return values.get(name) or s.get("slot_values", {}).get(name) or f"[cần điền: {name}]"
+        return SLOT_MARK.sub(sub, step["prompt_template"]).strip()
+
+    def ensure_inputs(self, step):
+        """Before a course prompt is shown: ask the learner for the choices and values it needs (once each)."""
+        s = self.session
+        params = s["ex"].get("params") or []
+        changed = False
+        for slot in step.get("slots", []):
+            name, kind = slot["name"], slot.get("kind")
+            if kind == "choice" and name not in s.setdefault("choice_values", {}):
+                param = next((p for p in params if any(v["slot"] == name for o in p.get("options", [])
+                                                       for v in o.get("values", []))), None)
+                if param and param["name"] not in s.setdefault("choices", {}):
+                    opt = self.ask_choice(param)
+                    if opt:
+                        s["choices"][param["name"]] = opt["label"]
+                        for v in opt.get("values", []):
+                            s["choice_values"][v["slot"]] = v["text"]
+                        self.chat_note(f"{param['question']} → {opt['label']} (dữ liệu đã được điền vào prompt)")
+                        changed = True
+            elif kind == "learner" and not s.setdefault("slot_values", {}).get(name):
+                val = self.ask_text(slot)
+                if val:
+                    s["slot_values"][name] = val
+                    changed = True
+        if changed:
+            self.save_session()
+
+    def ask_choice(self, param):
+        """Ask the learner to pick one option (e.g. their table); shows what each option will fill in."""
+        options = param.get("options") or []
+        if not options:
+            return None
+        top = self._dialog("Chọn để điền vào prompt", "640x460")
+        tk.Label(top, text=param.get("question") or "Chọn một mục:", font=(A.UI_FONT, 11, "bold"), bg="white",
+                 wraplength=600, justify="left").pack(anchor="w", padx=14, pady=(12, 6))
+        row = tk.Frame(top, bg="white")
+        row.pack(fill="both", expand=True, padx=14)
+        lst = tk.Listbox(row, width=18, font=(A.UI_FONT, 11), activestyle="none", exportselection=False)
+        for o in options:
+            lst.insert("end", o["label"])
+        lst.pack(side="left", fill="y")
+        prev = tk.Text(row, wrap="word", font=(A.UI_FONT, 9), bg="#fbf8f6", bd=1, relief="solid")
+        prev.pack(side="left", fill="both", expand=True, padx=(8, 0))
+
+        def show(*_):
+            prev.delete("1.0", "end")
+            sel = lst.curselection()
+            if sel:
+                for v in options[sel[0]].get("values", []):
+                    prev.insert("end", f"{v['slot']}:\n{v['text']}\n\n")
+        lst.bind("<<ListboxSelect>>", show)
+        lst.selection_set(0)
+        show()
+        result = []
+        self._buttons(top, lambda: (result.append(lst.curselection()), top.destroy()), ok="Chọn")
+        lst.bind("<Double-1>", lambda e: (result.append(lst.curselection()), top.destroy()))
+        top.wait_window()
+        return options[result[0][0]] if result and result[0] else None
+
+    def ask_text(self, slot):
+        """Ask once for a value only the learner can give (e.g. their problem statement); reused in later prompts."""
+        top = self._dialog("Thông tin cho prompt", "620x300")
+        tk.Label(top, text=f"Nhập: {slot.get('label') or slot['name']}", font=(A.UI_FONT, 11, "bold"), bg="white",
+                 wraplength=580, justify="left").pack(anchor="w", padx=14, pady=(12, 2))
+        tk.Label(top, text="Chỉ cần nhập một lần — các prompt sau dùng lại tự động.", fg="#666", bg="white",
+                 font=(A.UI_FONT, 9)).pack(anchor="w", padx=14)
+        box = tk.Text(top, height=6, wrap="word", font=(A.UI_FONT, 11), bd=1, relief="solid")
+        box.pack(fill="both", expand=True, padx=14, pady=6)
+        box.focus_set()
+        result = []
+        self._buttons(top, lambda: (result.append(box.get("1.0", "end").strip()), top.destroy()), ok="Điền vào prompt")
+        top.unbind("<Return>")                         # Enter makes a new line in the box
+        top.wait_window()
+        return result[0] if result and result[0] else None
 
     def prompt_inputs(self, fields):
         """Claude asked for the learner's own information: a fill-in form in the prompt box."""
@@ -1939,6 +2101,13 @@ class LearningUI:
             return
         w.configure(state="normal")
         count = tk.IntVar()
+        # the compact result is kept for later prompts; it need not be shown twice
+        idx = w.search(OUTPUT_START_TK, start, stopindex="end", regexp=True, nocase=True, count=count)
+        if idx:
+            end = w.search(OUTPUT_END_TK, idx, stopindex="end", regexp=True, nocase=True, count=count)
+            if end:
+                w.delete(idx, f"{end}+{count.get()}c")
+                w.insert(idx, "📌 (đã lưu kết quả gọn của bước này — sẽ tự điền vào prompt các bước sau)", "file")
         # the draft for the next step goes into the prompt box, not into the answers pane
         idx = w.search(DRAFT_START_TK, start, stopindex="end", regexp=True, nocase=True, count=count)
         if idx:
@@ -1974,7 +2143,7 @@ class LearningUI:
             w.insert(f"{pos}+2c", "[📋 Copy prompt]", tag)
         w.configure(state="disabled")
         if turn:
-            turn["a"] = DRAFT_BLOCK.sub("", MARKER.sub("", turn.get("a", ""))).strip()
+            turn["a"] = OUTPUT_BLOCK.sub("", DRAFT_BLOCK.sub("", MARKER.sub("", turn.get("a", "")))).strip()
 
     def copy_text(self, text):
         self.root.clipboard_clear()
@@ -2013,7 +2182,10 @@ class LearningUI:
                 self.prompt_step()
                 return
             s["log"].append({"i": s["i"], "step": steps[s["i"]], "q": turn.get("q", ""), "a": answer,
-                             "input": bool(job.get("input"))})
+                             "input": bool(job.get("input")), "prompt": job.get("course_prompt") or ""})
+            # the step's compact result is what later prompts get pasted in automatically
+            om = OUTPUT_BLOCK.search(raw)
+            s.setdefault("outputs", {})[str(s["i"])] = (om.group(1).strip() if om else answer)[:12000]
             ask = NEEDS_INPUT.search(raw)
             if ask and not DONE.search(raw):                # Claude needs the learner's information first
                 s["awaiting"] = [f for f in ask.group(1).split("|") if f.strip()] or ["thông tin"]
