@@ -34,7 +34,7 @@ async function runningContext(ctx) {
 }
 
 /** Main-thread version of capture-worklet.js (for the ScriptProcessor fallback): -> 16 kHz blocks of 100 ms. */
-function downsampler(rate, out) {
+export function downsampler(rate, out) {
   const ratio = rate / SR;
   let acc = [], pos = 0, buf = new Float32Array(1600), n = 0;
   return (ch) => {

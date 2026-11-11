@@ -11,6 +11,7 @@ import { Translator, Chatter, Summarizer, TRANSLATE_PRESETS, DEFAULT_PRESET } fr
 import { fileToBlock, ACCEPT } from "./files.js";
 import * as upd from "./updates.js";
 import { LearningUI, shareBlob, takeawaysPdf } from "./learning.js";
+import { MicCheck } from "./diag.js";
 
 // Running inside the TestFlight app (ipad/ios): files ship in the app, updates come from TestFlight.
 const NATIVE = !!(window.LT_NATIVE && window.webkit?.messageHandlers?.lt);
@@ -232,6 +233,7 @@ class App {
       saveConfig(cfg);
     };
     $("toggle").onclick = () => this.toggleOnOff();
+    $("btnMicCheck").onclick = () => new MicCheck(this).open();
     $("btnLogout").onclick = () => this.logout();
     $("btnBackup").onclick = () => this.backupSession();
     $("btnRestore").onclick = () => $("restorePick").click();
@@ -645,7 +647,7 @@ class App {
       case "mic_lost": this.micLost(); break;
       case "mic_silent":
         this.setStatus("⚠ Micro không thu được tiếng. Kiểm tra: Cài đặt → Quyền riêng tư → Micro (bật cho Safari/app), " +
-                       "không có app khác đang dùng micro; rồi tắt và bật ON lại.", "err");
+                       "không có app khác đang dùng micro; rồi tắt và bật ON lại. Bấm 🩺 Micro để kiểm tra từng bước.", "err");
         break;
       case "mic_resume_failed": this.waitTap(val); break;
       case "ctx": this.audioCtx = val; break;

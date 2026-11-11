@@ -182,7 +182,7 @@ export class Library {
   templates() {
     const docs = this.docs().filter((d) => d.ext === ".pdf");
     const hit = docs.filter((d) => d.kind === "journal_template");
-    return hit.length ? hit : docs.filter((d) => JOURNAL_NAME.test(d.name));
+    return hit.length ? hit : docs.filter((d) => JOURNAL_NAME.test(d.name.normalize("NFC")));
   }
 
   /** Short description of the library for Claude's context. */
@@ -280,7 +280,7 @@ class Syncer {
         // keep the "cleanest" name: no "(1)"/"- Copy" mark, shortest, oldest
         list.sort((a, b) => (copyMarked(a.name) - copyMarked(b.name)) || (a.name.length - b.name.length) ||
                             (a.lastModified - b.lastModified));
-        const rels = list.map((f) => f.webkitRelativePath || f.name);
+        const rels = list.map((f) => (f.webkitRelativePath || f.name).normalize("NFC"));   // iPad/Mac may give decomposed names
         const id = sha.slice(0, 12);
         const old = lib.data.docs[id];
         if (old) {
@@ -299,9 +299,10 @@ class Syncer {
           continue;
         }
         await idbPut("text", id, text);
-        const doc = { id, sha, name: src.name, ext, stored: `${id}_${safeName(src.name)}`, rel: rels[0], sources: rels,
+        const nm = src.name.normalize("NFC");
+        const doc = { id, sha, name: nm, ext, stored: `${id}_${safeName(nm)}`, rel: rels[0], sources: rels,
           size: src.size, pages, added: today, mtime: isoDate(new Date(src.lastModified || Date.now())), file_id: "",
-          title: stem(src.name), description: "", kind: "other", day: 0, date: "", exercises: [], catalogued: false };
+          title: stem(nm), description: "", kind: "other", day: 0, date: "", exercises: [], catalogued: false };
         lib.data.docs[id] = doc;
         fresh.push(doc);
       }
@@ -656,12 +657,43 @@ const MERGE_SCHEMA = {
   properties: { exercises: { type: "array", items: {
     type: "object", additionalProperties: false, required: ["title", "goal", "day", "doc_ids", "steps"],
     properties: { title: STR, goal: STR, day: { type: "integer" }, doc_ids: { type: "array", items: STR }, steps: STEPS_SCHEMA } } } } };
-const PLAN_SCHEMA = { type: "object", additionalProperties: false, required: ["steps"], properties: { steps: STEPS_SCHEMA } };
+// plans used to solve an exercise: each step keeps the course's own prompt (verbatim) with its blanks marked as
+// slots, so the app can fill them itself (a choice the learner makes, an earlier step's result, or the learner)
+const SLOT_SCHEMA = { type: "object", additionalProperties: false, required: ["name", "kind", "label", "from_step"],
+  properties: { name: STR, kind: { type: "string", enum: ["choice", "previous", "learner"] }, label: STR,
+                from_step: { type: "integer" } } };
+const STEPS2_SCHEMA = { type: "array", items: {
+  type: "object", additionalProperties: false, required: ["title", "instruction", "prompt_template", "slots"],
+  properties: { title: STR, instruction: STR, prompt_template: STR, slots: { type: "array", items: SLOT_SCHEMA } } } };
+const PARAMS_SCHEMA = { type: "array", items: {
+  type: "object", additionalProperties: false, required: ["name", "question", "options"],
+  properties: { name: STR, question: STR, options: { type: "array", items: {
+    type: "object", additionalProperties: false, required: ["label", "values"],
+    properties: { label: STR, values: { type: "array", items: {
+      type: "object", additionalProperties: false, required: ["slot", "text"],
+      properties: { slot: STR, text: STR } } } } } } } } };
+const PLAN_SCHEMA = { type: "object", additionalProperties: false, required: ["params", "steps"],
+  properties: { params: PARAMS_SCHEMA, steps: STEPS2_SCHEMA } };
 const WHOLE_SCHEMA = {
-  type: "object", additionalProperties: false, required: ["goal", "exercises"],
-  properties: { goal: STR, exercises: { type: "array", items: {
+  type: "object", additionalProperties: false, required: ["goal", "params", "exercises"],
+  properties: { goal: STR, params: PARAMS_SCHEMA, exercises: { type: "array", items: {
     type: "object", additionalProperties: false, required: ["title", "goal", "steps"],
-    properties: { title: STR, goal: STR, steps: STEPS_SCHEMA } } } } };
+    properties: { title: STR, goal: STR, steps: STEPS2_SCHEMA } } } } };
+const PROMPT_GUIDE = (
+  " For every step also give prompt_template and slots. prompt_template: when the document gives a ready " +
+  "prompt for that step, copy it VERBATIM, replacing each blank the learner would have to fill or paste (e.g. " +
+  "'[insert your table's challenge list from the Appendix]', '[YOUR PROBLEM]') with {{slot_name}}; when the " +
+  "prompt relies on an earlier step's result (e.g. 'the list of sub-problems from Stage 1', 'the workflow we " +
+  "designed'), append at its end a line such as '\n\nKết quả bước trước:\n{{slot_name}}' so that result " +
+  "can be pasted in automatically. Use an empty string when the step has no ready prompt. slots: one entry " +
+  "per {{slot_name}} used: kind 'choice' when the value is data the document already contains and the learner " +
+  "only has to pick (e.g. their table's list in the appendix), 'previous' when it is the result of an earlier " +
+  "step (from_step = that step's number, counting every step of the plan from 1 in order), 'learner' when only " +
+  "the learner can give it (from_step 0); label = a short Vietnamese description. Reuse the same slot name " +
+  "for the same value in every step (e.g. your_problem). params: the questions to ask the learner once to " +
+  "pick such data (e.g. 'Bạn ngồi bàn nào hôm qua?'); give every option (e.g. each table) with a short label " +
+  "(e.g. 'Table 3') and, for each choice slot it fills, the full text copied from the document. Empty list " +
+  "if there is nothing to choose.");
 const BIGEX_SYSTEM = (
   "You read a course document and list its substantial exercises, assignments, labs or projects " +
   "(bài tập lớn) — tasks the learner has to carry out, especially ones whose instructions go through " +
@@ -680,23 +712,24 @@ const PLAN_SYSTEM = (
   "through one at a time, following the document's own instructions and order (3-8 steps for one exercise; " +
   "when asked to follow the whole file, one step per exercise or instruction block, in the file's order, up " +
   "to 15 steps). Return JSON only: steps with " +
-  "a short title and a Vietnamese instruction (keep technical terms, commands and values from the document).");
+  "a short title and a Vietnamese instruction (keep technical terms, commands and values from the document)." +
+  PROMPT_GUIDE);
 const WHOLE_SYSTEM = (
   "The attached course file may be one big problem made of many sub-exercises that build on each other. " +
   "Return JSON only: goal = the overall goal of the whole file (one Vietnamese sentence); exercises = every " +
   "sub-exercise in the file's own order (title as written, goal in one Vietnamese sentence, and its concrete " +
   "steps: follow the file's own steps exactly when it gives them, otherwise 2-6 clear steps; Vietnamese, " +
   "keeping technical terms, commands, numbers and names from the file). Note in a step's instruction when it " +
-  "uses the result of an earlier sub-exercise. Skip reading-only parts.");
+  "uses the result of an earlier sub-exercise. Skip reading-only parts." + PROMPT_GUIDE);
 
 /** askJson with one library document attached (falls back to its text if the file is refused). */
-async function askDoc(lib, key, system, doc, info, schema, effort = "medium") {
+async function askDoc(lib, key, system, doc, info, schema, effort = "medium", maxTokens = 16000) {
   try {
-    return await askJson(key, system, [await lib.block(doc), { type: "text", text: info }], schema, { effort });
+    return await askJson(key, system, [await lib.block(doc), { type: "text", text: info }], schema, { effort, maxTokens });
   } catch (e) {
     if (!(e instanceof ClaudeError && e.status === 400)) throw e;
     const text = (await lib.text(doc)).slice(0, 300_000);
-    return askJson(key, system, `${info}\n\n<file name="${doc.name}">\n${text}\n</file>`, schema, { effort });
+    return askJson(key, system, `${info}\n\n<file name="${doc.name}">\n${text}\n</file>`, schema, { effort, maxTokens });
   }
 }
 
@@ -705,29 +738,30 @@ export function partsToSteps(parts) {
   const ps = (parts || []).filter((p) => p.steps?.length);
   const steps = [];
   ps.forEach((p, k) => p.steps.forEach((st, j) => steps.push({ title: st.title, instruction: st.instruction,
-    part: k + 1, parts: ps.length, part_title: p.title, part_goal: p.goal || "", pstep: j + 1, psteps: p.steps.length })));
+    part: k + 1, parts: ps.length, part_title: p.title, part_goal: p.goal || "", pstep: j + 1, psteps: p.steps.length,
+    prompt_template: st.prompt_template || "", slots: st.slots || [] })));
   return steps;
 }
 
-/** A whole-file plan that needs no Claude call: saved from before, or built from the sub-exercises (with steps)
- *  that the folder scan already found in this file. null if Claude must read the file. */
+/** A whole-file plan saved from before: [goal, steps, params]. Plans from older versions lack the course's
+ *  prompts, so they are made again. null if Claude must read the file. */
 export function knownFilePlan(doc) {
-  if (doc.fileplan) return [doc.fileplan.goal, doc.fileplan.steps];
-  const found = doc.bigex || [];
-  if (found.length && found.every((p) => p.steps?.length)) return [doc.description || "", partsToSteps(found)];
+  const fp = doc.fileplan;
+  if (fp && fp.v === 2) return [fp.goal, fp.steps, fp.params || []];
   return null;
 }
+const planV2 = (saved) => !!saved && !Array.isArray(saved) && saved.v === 2;
 
 /** Plan a whole file: [overall goal, steps] where each step knows its sub-exercise (part). Saved in the library. */
 export async function planFile(lib, key, doc, known) {
   const info = `File: ${doc.rel}\nSub-exercises already noticed in it: ` + (known.join("; ") || "(none)");
-  const res = await askDoc(lib, key, WHOLE_SYSTEM, doc, info, WHOLE_SCHEMA, "low");
-  const goal = res.goal || "", steps = partsToSteps(res.exercises);
+  const res = await askDoc(lib, key, WHOLE_SYSTEM, doc, info, WHOLE_SCHEMA, "low", 32000);
+  const goal = res.goal || "", steps = partsToSteps(res.exercises), params = res.params || [];
   if (steps.length) {
-    doc.fileplan = { goal, steps };
+    doc.fileplan = { v: 2, goal, steps, params };
     await lib.save();
   }
-  return [goal, steps];
+  return [goal, steps, params];
 }
 
 /** Read the files, find the big exercises with their steps and save the list in the library.
@@ -781,14 +815,15 @@ export async function scanExercises(lib, key, progress, full = false) {
 export async function planSteps(lib, key, ex) {
   const doc = ex.doc;
   const saved = (doc.plans || {})[ex.title];
-  if (saved) return saved;
+  if (planV2(saved)) return [saved.steps, saved.params || []];
   const info = `Exercise: ${ex.title}\nSummary: ${ex.summary || ""}\nLocation: ${ex.location || ""}\nFile: ${doc.rel}`;
-  const steps = (await askDoc(lib, key, PLAN_SYSTEM, doc, info, PLAN_SCHEMA, "low")).steps || [];
+  const res = await askDoc(lib, key, PLAN_SYSTEM, doc, info, PLAN_SCHEMA, "low", 32000);
+  const steps = res.steps || [], params = res.params || [];
   if (steps.length) {
-    (doc.plans = doc.plans || {})[ex.title] = steps;
+    (doc.plans = doc.plans || {})[ex.title] = { v: 2, steps, params };
     await lib.save();
   }
-  return steps;
+  return [steps, params];
 }
 
 // ---- guided exercises: rules for Claude and the markers it writes (v1.8.5, drafts v1.8.9) ----
@@ -805,9 +840,15 @@ export const EXERCISE_RULES = (
   "1. If this step needs information only the learner can give (their own data, choices or parameters, or the " +
   "blanks of a template from the course book) and the message does not contain it yet, only ask for those " +
   "items as a short numbered list and end with the line [[CẦN NHẬP: item 1 | item 2]]. Do nothing else.\n" +
-  "2. Otherwise do the step and give the result in a few lines. If the step needs a prompt for an AI tool, give " +
-  "the complete prompt between a line '----- PROMPT -----' and a line '----- HẾT PROMPT -----' (copy the " +
-  "course book's template when it has one, filled in with the learner's information).\n" +
+  "2. Otherwise do the step. If the message contains 'PROMPT BÀI TẬP', that is the course's own prompt with " +
+  "the learner's data already filled in: answer it fully, exactly as the exercise asks (this is the step's " +
+  "result) — complete, but without padding. Otherwise give the result in a few lines. If the step needs a " +
+  "prompt for an AI tool, give the complete prompt between a line '----- PROMPT -----' and a line " +
+  "'----- HẾT PROMPT -----' (copy the course book's template when it has one, filled in with the learner's " +
+  "information).\n" +
+  "2b. Then give the essential reusable result of this step (e.g. the final structured list, the themes, the " +
+  "plan, the problem statement) between a line '----- KẾT QUẢ GỌN -----' and a line '----- HẾT KẾT QUẢ -----': " +
+  "as compact as possible but complete enough to be pasted into a later prompt.\n" +
   "3. Then one line: '➡ Mang sang bước sau: ...' with only what the next step needs from this result (very " +
   "short). Skip it at the last step.\n" +
   "4. If the next step (see <next_step>) will need input from the learner (information, a plan, a prompt to " +
@@ -829,9 +870,12 @@ const DONE = /\[\[\s*(?:XONG BƯỚC|XONG BUOC)\s*\]\]/i;
 const DRAFT_BLOCK = /-{3,} *MẪU BƯỚC SAU *-{3,} *\n([\s\S]*?)\n *-{3,} *HẾT MẪU *-{3,}/i;
 const DRAFT_ANY = /-{3,} *MẪU BƯỚC SAU *-{3,} *\n[\s\S]*?(?:\n *-{3,} *HẾT MẪU *-{3,}|$)/gi;
 const BLANK = /\[cần điền[^\]]*\]/gi;
+const OUTPUT_BLOCK = /-{3,} *KẾT QUẢ GỌN *-{3,} *\n([\s\S]*?)\n *-{3,} *HẾT KẾT QUẢ *-{3,}/i;
+const OUTPUT_ANY = /-{3,} *KẾT QUẢ GỌN *-{3,} *\n[\s\S]*?(?:\n *-{3,} *HẾT KẾT QUẢ *-{3,}|$)/gi;
+const SLOT_MARK = /\{\{\s*([^{}]+?)\s*\}\}/g;
 const draftOf = (raw) => { const m = DRAFT_BLOCK.exec(raw || ""); return m ? m[1].trim() : null; };
 const PROMPT_BLOCK = /-{3,} *PROMPT *-{3,} *\n([\s\S]*?)\n *-{3,} *HẾT PROMPT *-{3,}/gi;
-export const stripMarkers = (t) => String(t || "").replace(DRAFT_ANY, "").replace(MARKER, "").replace(/[ \t]+\n/g, "\n").trim();
+export const stripMarkers = (t) => String(t || "").replace(OUTPUT_ANY, "").replace(DRAFT_ANY, "").replace(MARKER, "").replace(/[ \t]+\n/g, "\n").trim();
 const NO_EMOJI = /[\u{10000}-\u{10FFFF}☀-➿️‍]/gu;    // the PDF font has no emoji
 const fields = (m) => (m ? m[1].split("|").map((f) => f.trim()).filter(Boolean) : null);
 
@@ -847,9 +891,10 @@ export function hashKey(text) {
 }
 
 /** The whole file as one exercise (sub-exercise by sub-exercise). */
-export const fileExercise = (doc, goal, steps) => ({ title: clean(doc.title || doc.name), goal, day: doc.day || 0,
-  doc_ids: [doc.id], steps, whole_file: true });
-export const singleExercise = (doc, title, goal, steps) => ({ title, goal, day: doc.day || 0, doc_ids: [doc.id], steps });
+export const fileExercise = (doc, goal, steps, params = []) => ({ title: clean(doc.title || doc.name), goal, day: doc.day || 0,
+  doc_ids: [doc.id], steps, whole_file: true, params: params || [] });
+export const singleExercise = (doc, title, goal, steps, params = []) => ({ title, goal, day: doc.day || 0, doc_ids: [doc.id],
+  steps, params: params || [] });
 /** Identifies an exercise (its files, title and steps): saved progress belongs to it. */
 export const exerciseKey = (ex) => hashKey(JSON.stringify([clean(ex.title), [...(ex.doc_ids || [])].sort(),
   (ex.steps || []).map((s) => clean(s.title))]));
@@ -1014,6 +1059,10 @@ export async function solutionPdf(lib, session, summary) {
       const label = st.part ? `Bước ${st.pstep}/${st.psteps}` : `Bước ${(i || 0) + 1}`;
       blocks.push(one("h3", `${label}: ${st.title || ""}`));
       if (st.instruction) blocks.push(one("instr", st.instruction));
+    }
+    if (item.prompt) {
+      blocks.push({ type: "plabel", runs: [["Prompt đã dùng:", true]] });
+      blocks.push({ type: "prompt", runs: item.prompt.split("\n").flatMap((ln, k) => (k ? [["\n", false], [ln, false]] : [[ln, false]])) });
     }
     if (item.input) {
       let filled = item.q;
@@ -1592,12 +1641,12 @@ export class LearningUI {
     // start working out the steps in the background as soon as an item is selected, so that ▶ Bắt đầu shows
     // the first prompt at once (the result is saved for next time too)
     const prepare = (it) => {
-      if (it.kind === "file" && it.exs.length && !knownFilePlan(it.doc)) {
+      if (it.kind === "file" && !knownFilePlan(it.doc)) {
         const d = it.doc;
         this.prefetch(`file:${d.id}`, () => planFile(this.lib, this.app.apiKey, d, it.exs.map((e) => e.title)));
-      } else if (it.kind === "ex" && !it.ex.steps?.length) {
+      } else if (it.kind === "ex") {
         const d = it.doc, e = it.ex;
-        if (!(d.plans || {})[e.title]) {
+        if (!planV2((d.plans || {})[e.title])) {
           this.prefetch(`ex:${d.id}:${e.title}`, () => planSteps(this.lib, this.app.apiKey,
             { title: e.title, summary: e.goal || "", location: e.location || "", doc: d }));
         }
@@ -1617,7 +1666,7 @@ export class LearningUI {
       if (it.kind !== "big") prepare(it);
       if (it.kind === "file") {
         const kp = knownFilePlan(it.doc);
-        detail.textContent = (kp ? progressNote(fileExercise(it.doc, kp[0], kp[1])).trim() + "\n" : "") +
+        detail.textContent = (kp ? progressNote(fileExercise(it.doc, ...kp)).trim() + "\n" : "") +
           `${it.doc.description || ""}\n\n` + (it.exs.length
           ? "Bài tập trong file:\n" + it.exs.map((e) => `  • ${e.title}`).join("\n")
           : "Chưa thấy bài tập riêng trong file (nhấn 🔄 Refresh để Claude đọc kỹ file).") +
@@ -1693,16 +1742,12 @@ export class LearningUI {
       this.app.closeSheet();                 // close right away: progress shows in the Claude pane
       if (it.kind === "big") { this.startSession(it.ex, redo); return; }
       const d = it.doc;
-      if (it.kind === "ex" && it.ex.steps?.length) {
-        this.startSession(singleExercise(d, it.ex.title, it.ex.goal || "", it.ex.steps), redo);
-        return;
-      }
       let plan;
       if (it.kind === "file") {              // the whole file: one big problem, sub-exercise by sub-exercise
         const prep = `file:${d.id}`;
         const known = knownFilePlan(d);
         if (known) {                         // steps already known (saved): the first prompt appears at once
-          this.startSession(fileExercise(d, known[0], known[1]), redo);
+          this.startSession(fileExercise(d, ...known), redo);
           return;
         }
         this.chatNote(`Đang chuẩn bị các bài tập con và các bước của file "${d.name}"... ` +
@@ -1710,21 +1755,21 @@ export class LearningUI {
         plan = async () => {
           await this.waitPrefetch(prep);     // it may already be on its way since the file was selected
           const kp = knownFilePlan(d);
-          const [goal, steps] = kp || await planFile(this.lib, this.app.apiKey, d, it.exs.map((e) => e.title));
+          const [goal, steps, params] = kp || await planFile(this.lib, this.app.apiKey, d, it.exs.map((e) => e.title));
           if (!steps.length) throw new Error("Claude không tìm thấy bài tập trong file");
-          return fileExercise(d, goal, steps);
+          return fileExercise(d, goal, steps, params);
         };
       } else {
         const prep = `ex:${d.id}:${it.ex.title}`;
         const ex = { title: it.ex.title, summary: it.ex.goal || "", location: it.ex.location || "", doc: d };
-        if (!(d.plans || {})[ex.title]) {
-          this.chatNote(`Đang chia bài "${clean(ex.title)}" thành các bước... Câu prompt đầu tiên sẽ hiện trong ô nhập khi xong.`);
+        if (!planV2((d.plans || {})[ex.title])) {
+          this.chatNote(`Đang chuẩn bị bài "${clean(ex.title)}" (các bước và prompt của sách)... Câu prompt đầu tiên sẽ hiện trong ô nhập khi xong.`);
         }
         plan = async () => {
           await this.waitPrefetch(prep);
-          const steps = await planSteps(this.lib, this.app.apiKey, ex);     // uses the saved steps if any
+          const [steps, params] = await planSteps(this.lib, this.app.apiKey, ex);     // uses the saved plan if any
           if (!steps.length) throw new Error("Claude không trả về các bước");
-          return singleExercise(d, ex.title, ex.summary, steps);
+          return singleExercise(d, ex.title, ex.summary, steps, params);
         };
       }
       this.app.setStatus("🎓 Đang chuẩn bị bài tập...");
@@ -1765,7 +1810,8 @@ export class LearningUI {
     const d = new Date();
     (this.lib.data.sessions = this.lib.data.sessions || {})[s.key] = {
       ex: s.ex, i: s.i, log: s.log, overview: s.overview || "", awaiting: s.awaiting || null, carry: s.carry || null,
-      next_inputs: s.next_inputs || null, next_draft: s.next_draft || null, done,
+      next_inputs: s.next_inputs || null, next_draft: s.next_draft || null, choices: s.choices || {},
+      choice_values: s.choice_values || {}, slot_values: s.slot_values || {}, outputs: s.outputs || {}, done,
       time: `${pad(d.getDate())}/${pad(d.getMonth() + 1)} ${pad(d.getHours())}:${pad(d.getMinutes())}` };
     await this.lib.save();
   }
@@ -1780,7 +1826,7 @@ export class LearningUI {
       // an exercise opened before: carry on where it stopped
       this.session = { ex, i: Math.min(saved.i, steps.length), log: saved.log || [], overview: saved.overview || "",
                        key, resume: true };
-      for (const k of ["awaiting", "carry", "next_inputs", "next_draft"]) if (saved[k]) this.session[k] = saved[k];
+      for (const k of ["awaiting", "carry", "next_inputs", "next_draft", "choices", "choice_values", "slot_values", "outputs"]) if (saved[k]) this.session[k] = saved[k];
       const k = this.session.i;
       this.chatNote(`Tiếp tục bài "${ex.title}" (đã lưu lúc ${saved.time || ""}): đã xong ${k}/${steps.length} bước. ` +
                     "Muốn làm lại từ đầu: Exercises → tích \"Làm lại từ đầu\"." +
@@ -1845,7 +1891,7 @@ export class LearningUI {
     return { type: "text", text: `<next_step>${this.stepName(i + 1)}: ${st.title} — ${st.instruction}</next_step>` };
   }
 
-  promptStep() {
+  async promptStep() {
     const s = this.session, ex = s.ex, i = s.i;
     if (i < 0) {                                               // a 2-3 line overview first
       this.setPrompt(`Bài tập "${ex.title}": tóm tắt rất ngắn (2-3 dòng) đề bài, mục tiêu và kết quả cần có.`,
@@ -1858,9 +1904,18 @@ export class LearningUI {
     const head = step.part ? `${step.part_title} — ${this.stepName(i)}` : this.stepName(i);
     const lines = [`${head}: ${step.title}.`, step.instruction];
     if (newPart && step.part_goal) lines.push(`Mục tiêu bài này: ${step.part_goal}`);
-    if (s.carry) lines.push(`Mang sang từ bước trước: ${s.carry}`);
-    const draft = s.next_draft;
-    if (draft) {                     // Claude prepared this input: template + known values, blanks for the rest
+    let draft = s.next_draft;
+    const course = !!step.prompt_template;
+    if (course) {
+      // the course's own prompt: the app fills its blanks itself (the learner's choice, earlier results,
+      // values the learner gave once) - nothing to copy and paste
+      await this.ensureInputs(step);
+      if (this.session !== s || s.i !== i) return;          // the exercise changed while a question was open
+      draft = this.fillTemplate(step);
+      lines.push("PROMPT BÀI TẬP (đã điền sẵn):");
+      lines.push(draft);
+    } else if (s.carry) lines.push(`Mang sang từ bước trước: ${s.carry}`);
+    if (course) { /* the prompt above is the input */ } else if (draft) {                     // Claude prepared this input: template + known values, blanks for the rest
       lines.push("Thông tin của tôi (đã điền sẵn — chỉ cần điền các chỗ [cần điền: ...]):");
       lines.push(draft);
     } else if (s.next_inputs) {                                // Claude said this step needs the learner's information
@@ -1869,7 +1924,12 @@ export class LearningUI {
     }
     let label = step.part ? `${this.stepName(i)} · ${step.part_title.slice(0, 25)}` : `Bài tập · ${this.stepName(i)} · ${ex.title.slice(0, 30)}`;
     const blanks = (draft || "").match(BLANK)?.length || 0;
-    if (draft || s.next_inputs) {
+    if (course) {
+      if (blanks) {
+        label += ` · còn ${blanks} chỗ cần điền`;
+        this.app.setStatus(`🎓 Prompt đã điền sẵn — còn ${blanks} chỗ [cần điền] trong ô nhập.`, "warn");
+      } else this.app.setStatus("🎓 Prompt của bước đã được điền sẵn đầy đủ — bấm Gửi.", "ok");
+    } else if (draft || s.next_inputs) {
       label += draft ? ` · còn ${blanks} chỗ cần điền` : " · điền thông tin";
       this.app.setStatus(draft ? `🎓 Bản nháp đã điền sẵn — còn ${blanks} chỗ [cần điền] trong ô nhập.`
                                : "🎓 Điền thông tin vào mẫu trong ô nhập rồi gửi.", "warn");
@@ -1877,8 +1937,116 @@ export class LearningUI {
     // the documents go again with each new sub-exercise and now and then, so they stay in Claude's recent
     // history (the overview already sent them)
     const ids = (i > 0 && (i % 6 === 0 || newPart)) || s.resume ? ex.doc_ids || [] : [];
-    this.setPrompt(lines.join("\n"), { kind: "exstep", step: i, doc_ids: ids, label, input: !!(draft || s.next_inputs),
+    this.setPrompt(lines.join("\n"), { kind: "exstep", step: i, doc_ids: ids, label, input: !!(draft || s.next_inputs) && !course,
+      course_prompt: course ? draft : "",
       blocks: [{ type: "text", text: EXERCISE_RULES }, this.nextStepBlock(i), ...this.resumeBlocks()] });
+  }
+
+  // ---- filling the course's prompts: choices (e.g. the learner's table), earlier results, learner values ----
+  /** The step's course prompt with every blank filled in that the app can fill; [cần điền: ...] for the rest. */
+  fillTemplate(step) {
+    const s = this.session;
+    s.choice_values = s.choice_values || {};
+    s.slot_values = s.slot_values || {};
+    s.outputs = s.outputs || {};
+    const values = {};
+    for (const slot of step.slots || []) {
+      let val = null;
+      if (slot.kind === "choice") val = s.choice_values[slot.name];
+      else if (slot.kind === "previous") val = s.outputs[String((+slot.from_step || 0) - 1)];
+      if (val == null) val = s.slot_values[slot.name];
+      values[slot.name] = val || `[cần điền: ${slot.label || slot.name}]`;
+    }
+    return step.prompt_template.replace(SLOT_MARK, (m, name) =>
+      values[name] || s.slot_values[name] || `[cần điền: ${name}]`).trim();
+  }
+
+  /** Before a course prompt is shown: ask the learner for the choices and values it needs (once each). */
+  async ensureInputs(step) {
+    const s = this.session;
+    const params = s.ex.params || [];
+    s.choices = s.choices || {};
+    s.choice_values = s.choice_values || {};
+    s.slot_values = s.slot_values || {};
+    let changed = false;
+    for (const slot of step.slots || []) {
+      if (slot.kind === "choice" && !(slot.name in s.choice_values)) {
+        const param = params.find((p) => (p.options || []).some((o) => (o.values || []).some((v) => v.slot === slot.name)));
+        if (param && !(param.name in s.choices)) {
+          const opt = await this.askChoice(param);
+          if (opt) {
+            s.choices[param.name] = opt.label;
+            for (const v of opt.values || []) s.choice_values[v.slot] = v.text;
+            this.chatNote(`${param.question} → ${opt.label} (dữ liệu đã được điền vào prompt)`);
+            changed = true;
+          }
+        }
+      } else if (slot.kind === "learner" && !s.slot_values[slot.name]) {
+        const val = await this.askText(slot);
+        if (val) { s.slot_values[slot.name] = val; changed = true; }
+      }
+    }
+    if (changed) await this.saveSession();
+  }
+
+  /** A question in the sheet that resolves when it is answered or closed (null = skipped). */
+  ask(title, body, okText, getValue) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (v) => { if (done) return; done = true; dlg.removeEventListener("close", onClose); resolve(v); };
+      const dlg = document.getElementById("sheet");
+      const onClose = () => finish(null);
+      const row = el("div", "actions");
+      const skip = el("button", "", "Bỏ qua");
+      const ok = el("button", "primary", okText);
+      skip.onclick = () => { finish(null); this.app.closeSheet(); };
+      ok.onclick = () => { const v = getValue(); finish(v || null); this.app.closeSheet(); };
+      row.append(el("span", "spacer"), skip, ok);
+      body.append(row);
+      this.app.sheet(title, body, true);
+      dlg.addEventListener("close", onClose);
+    });
+  }
+
+  /** Ask the learner to pick one option (e.g. their table); shows what each option will fill in. */
+  askChoice(param) {
+    const options = param.options || [];
+    if (!options.length) return Promise.resolve(null);
+    const body = el("div", "lform");
+    body.append(el("b", "", param.question || "Chọn một mục:"));
+    const wrap = el("div", "choiceWrap");
+    const list = el("div", "choiceList");
+    const prev = el("div", "choicePrev");
+    let sel = 0;
+    const show = () => {
+      list.querySelectorAll(".sel").forEach((x) => x.classList.remove("sel"));
+      list.children[sel]?.classList.add("sel");
+      prev.textContent = (options[sel].values || []).map((v) => `${v.slot}:\n${v.text}`).join("\n\n");
+    };
+    options.forEach((o, k) => {
+      const b = el("button", "choiceOpt", o.label);
+      b.onclick = () => { sel = k; show(); };
+      b.ondblclick = () => { sel = k; body.querySelector(".actions .primary")?.click(); };
+      list.append(b);
+    });
+    wrap.append(list, prev);
+    body.append(wrap);
+    const p = this.ask("Chọn để điền vào prompt", body, "Chọn", () => options[sel]);
+    show();
+    return p;
+  }
+
+  /** Ask once for a value only the learner can give (e.g. their problem statement); reused in later prompts. */
+  askText(slot) {
+    const body = el("div", "lform");
+    body.append(el("b", "", `Nhập: ${slot.label || slot.name}`),
+                el("p", "muted", "Chỉ cần nhập một lần — các prompt sau dùng lại tự động."));
+    const box = el("textarea", "wide");
+    box.rows = 6;
+    body.append(box);
+    const p = this.ask("Thông tin cho prompt", body, "Điền vào prompt", () => box.value.trim());
+    setTimeout(() => box.focus(), 100);
+    return p;
   }
 
   /** Claude asked for the learner's own information: a fill-in form in the prompt box. */
@@ -1936,6 +2104,14 @@ export class LearningUI {
 
   /** The draft for the next step goes into the prompt box, not into the answers pane (it may span links). */
   hideDraft(marker) {
+    this.hideBlock(marker, /-{3,} *KẾT QUẢ GỌN *-{3,}/i, /-{3,} *HẾT KẾT QUẢ *-{3,}/i,
+                   "📌 (đã lưu kết quả gọn của bước này — sẽ tự điền vào prompt các bước sau)");
+    this.hideBlock(marker, /-{3,} *MẪU BƯỚC SAU *-{3,}/i, /-{3,} *HẾT MẪU *-{3,}/i,
+                   "📝 (bản nháp cho bước sau đã được điền sẵn vào ô nhập)");
+  }
+
+  /** Replace a start…end block after the answer marker (it may span links) by a short note. */
+  hideBlock(marker, START, END, note) {
     let inDraft = false;
     for (let n = marker.nextSibling; n;) {
       const next = n.nextSibling;
@@ -1943,13 +2119,13 @@ export class LearningUI {
         let t = n.data, out = "";
         while (t) {
           if (!inDraft) {
-            const m = /-{3,} *MẪU BƯỚC SAU *-{3,}/i.exec(t);
+            const m = START.exec(t);
             if (!m) { out += t; break; }
-            out += t.slice(0, m.index) + "📝 (bản nháp cho bước sau đã được điền sẵn vào ô nhập)";
+            out += t.slice(0, m.index) + note;
             t = t.slice(m.index + m[0].length);
             inDraft = true;
           } else {
-            const m = /-{3,} *HẾT MẪU *-{3,}/i.exec(t);
+            const m = END.exec(t);
             if (!m) break;
             t = t.slice(m.index + m[0].length);
             inDraft = false;
@@ -1999,7 +2175,10 @@ export class LearningUI {
         this.promptStep();
         return;
       }
-      s.log.push({ i: s.i, step: steps[s.i], q: turn.q || "", a: answer, input: !!job.input });
+      s.log.push({ i: s.i, step: steps[s.i], q: turn.q || "", a: answer, input: !!job.input, prompt: job.course_prompt || "" });
+      // the step's compact result is what later prompts get pasted in automatically
+      const om = OUTPUT_BLOCK.exec(raw);
+      (s.outputs = s.outputs || {})[String(s.i)] = (om ? om[1].trim() : answer).slice(0, 12000);
       const ask = NEEDS_INPUT.exec(raw);
       if (ask && !DONE.test(raw)) {                            // Claude needs the learner's information first
         s.awaiting = fields(ask) || ["thông tin"];
