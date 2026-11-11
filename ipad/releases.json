@@ -208,6 +208,17 @@
         "Kết nối tới Claude được mở sẵn khi đăng nhập và khi nghe lại sau hơn 2 phút, nên câu dịch đầu tiên không chậm hơn các câu sau.",
         "Từ bản 14: mở file Learning ngay trong app, nút ⤢ Sửa cho ô prompt, cạnh kéo giữa khung trả lời và ô prompt."
       ]
+    },
+    {
+      "version": "1.9.5",
+      "build": 16,
+      "channel": "beta",
+      "date": "2026-11-11",
+      "notes": [
+        "Đăng nhập nhanh hơn: sau khi Copy key ở trang Claude và quay lại app, một nút lớn hiện ra — chạm vào đó (hoặc bất kỳ đâu trên màn hình đăng nhập), chạm \"Dán\" khi iPad hỏi là app tự đăng nhập.",
+        "App tự tách lấy key (sk-ant-...) kể cả khi bộ nhớ tạm có thêm chữ khác, và báo rõ khi bộ nhớ tạm chưa có key.",
+        "Từ bản 15: nghe tiếng Anh chính xác hơn như Windows 1.9.5 (gợi ý từ vựng khóa học cho Whisper, bỏ câu bịa, dịch lại thay tại chỗ, mở sẵn kết nối Claude)."
+      ]
     }
   ]
 }

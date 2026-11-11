@@ -99,10 +99,17 @@ class App {
     // a key pasted by any means (long-press → Paste too) logs in at once
     $("key").addEventListener("paste", () => setTimeout(() => this.keyEntered(), 0));
     $("pasteKey").onclick = () => this.pasteKey();
+    $("pasteGo").onclick = () => this.pasteKey();
     $("getKey").addEventListener("click", () => {
-      $("loginStatus").textContent = "Sau khi copy key ở trang Claude, quay lại đây và bấm 📋 Dán.";
+      $("loginStatus").textContent = "Sau khi copy key ở trang Claude, quay lại đây: chạm một lần là app tự dán và đăng nhập.";
       $("loginStatus").className = "status";
+      this.awaitKey = true;                              // back from the Claude page -> one tap pastes the key
     });
+    // back on the app after copying the key (switching app, or the "‹ Live Translator" link)
+    const back = () => { if (document.visibilityState === "visible") this.backForKey(); };
+    document.addEventListener("visibilitychange", back);
+    window.addEventListener("focus", back);
+    window.addEventListener("pageshow", back);
     const guide = (open) => {
       $("guide").hidden = !open;
       $("guideBtn").setAttribute("aria-expanded", String(open));
@@ -118,17 +125,56 @@ class App {
     }
   }
 
-  /** Paste the key from the clipboard (iPad asks once to allow pasting). */
-  async pasteKey() {
+  /** Back from the Claude page with the key copied: the big paste button shows, and the first tap anywhere on
+   *  the login screen pastes (iPad only lets a page read the clipboard during a tap; it then shows "Dán").
+   *  Where reading is already allowed without asking (desktop Chrome), the key is read at once. */
+  async backForKey() {
+    if (!this.awaitKey || $("login").hidden || this.keyTap) return;
+    $("pasteGo").hidden = false;
+    $("login").classList.add("keyBack");               // step 1 is done: the paste button stands out
+    $("loginStatus").textContent = "Chạm nút cam (hoặc bất kỳ đâu) để dán key vừa copy.";
+    $("loginStatus").className = "status";
+    this.keyTap = (e) => {
+      if (e.target.closest?.("#getKey, #guide, #guideBtn, a, input, label")) return;   // those do their own thing
+      if (e.target.closest?.("#pasteGo, #pasteKey")) return;                  // the button pastes itself
+      this.pasteKey();
+    };
+    $("login").addEventListener("click", this.keyTap);
     try {
-      const text = (await navigator.clipboard.readText()).trim();
-      if (!text) throw new Error("empty");
-      $("key").value = text;
-      this.keyEntered();
+      const p = await navigator.permissions?.query?.({ name: "clipboard-read" });
+      if (p?.state === "granted") this.pasteKey(true);
+    } catch { /* Safari: not queryable -> the tap */ }
+  }
+
+  stopKeyWait() {
+    this.awaitKey = false;
+    $("pasteGo").hidden = true;
+    $("login").classList.remove("keyBack");
+    if (this.keyTap) $("login").removeEventListener("click", this.keyTap);
+    this.keyTap = null;
+  }
+
+  /** Paste the key from the clipboard (iPad shows "Dán" to allow it). The key is found even with other text
+   *  around it. quiet: a read without a tap (no message if there is nothing to read). */
+  async pasteKey(quiet = false) {
+    let text = "";
+    try {
+      text = String(await navigator.clipboard.readText() || "");
     } catch {
+      if (quiet) return;
       $("key").focus();
-      this.loginFail("Không đọc được bộ nhớ tạm. Chạm giữ vào ô nhập key → chọn Dán.");
+      this.loginFail("iPad chưa cho đọc bộ nhớ tạm. Chạm giữ vào ô nhập key → chọn Dán.");
+      return;
     }
+    const key = (/sk-ant-[\w-]{20,}/.exec(text.replace(/\s+/g, "")) || [])[0];
+    if (!key) {
+      if (quiet) return;
+      this.loginFail(text.trim() ? "Bộ nhớ tạm chưa có API key (bắt đầu bằng sk-ant-). Ở trang Claude bấm Copy cạnh key rồi quay lại."
+                                 : "Bộ nhớ tạm đang trống. Ở trang Claude bấm Copy cạnh key rồi quay lại.");
+      return;
+    }
+    $("key").value = key;
+    this.keyEntered();
   }
 
   keyEntered() {
@@ -171,6 +217,7 @@ class App {
     if (cfg.remember) cfg.api_key = key; else delete cfg.api_key;
     saveConfig(cfg);
     this.apiKey = key;
+    this.stopKeyWait();
     $("login").hidden = true;
     $("main").hidden = false;
     this.summarizer = this.summarizer || new Summarizer(() => this.apiKey, (k, v) => this.handle(k, v),

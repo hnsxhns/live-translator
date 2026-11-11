@@ -533,3 +533,17 @@ audio.vMedia { background: none; }
   .learnBtn { font-size: 20px; padding: 0 9px; }
   .promptRow .send { padding: 0 12px; }
 }
+
+/* back from the Claude page: one big button (any tap on the login screen also pastes) */
+.pasteGo { display: grid; gap: 3px; width: 100%; margin: 4px 0 12px; padding: 14px 16px; border: 0; border-radius: 14px;
+  background: var(--accent); color: #fff; font-size: 17px; font-weight: 700; text-align: center;
+  box-shadow: 0 6px 18px rgba(201, 100, 66, .28); animation: pasteNudge 1.6s ease-in-out infinite; }
+.pasteGo small { font-size: 13px; font-weight: 500; opacity: .9; }
+.pasteGo:active { background: var(--accent-dark); }
+.pasteGo[hidden] { display: none; }
+@keyframes pasteNudge { 0%, 100% { transform: none; } 50% { transform: translateY(-2px); box-shadow: 0 10px 24px rgba(201, 100, 66, .34); } }
+@media (prefers-reduced-motion: reduce) { .pasteGo { animation: none; } }
+#login.keyBack .getKey { background: var(--surface-2); color: var(--muted); box-shadow: none; border: 1px solid var(--border); }
+#login.keyBack .getKey .gkIcon { background: var(--ok); color: #fff; }
+#login.keyBack .getKey b, #login.keyBack .getKey small { color: var(--muted); }
+#login.keyBack #loginBtn { background: var(--surface); color: var(--text); border: 1px solid var(--border-strong); box-shadow: none; }
