@@ -10,3 +10,4 @@ pymupdf
 pillow
 pyyaml
 pywebview
+zxing-cpp

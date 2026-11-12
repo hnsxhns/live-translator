@@ -26,7 +26,7 @@ TOOLBAR_JS = r"""
   if (window.__ltBar || !document.body) return;
   var bar = document.createElement('div');
   window.__ltBar = bar;
-  bar.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;background:#1f2937;color:#fff;' +
+  bar.style.cssText = 'position:fixed;right:12px;top:50%;transform:translateY(-50%);z-index:2147483647;background:#1f2937;color:#fff;' +
     'font:13px Segoe UI,Arial,sans-serif;padding:10px 12px;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,.35);' +
     'max-width:400px;line-height:1.4';
   bar.innerHTML = '<div id="__ltHint" style="margin-bottom:8px">Live Translator: đăng nhập, bấm tab ' +
@@ -36,6 +36,37 @@ TOOLBAR_JS = r"""
     '<div id="__ltMsg" style="margin-top:6px;color:#d1fae5"></div>';
   document.body.appendChild(bar);
   var msg = document.getElementById('__ltMsg');
+  // the bar never has to cover the page: "—" folds it to a small tab, and it can be dragged anywhere
+  (function () {
+    var fold = document.createElement('span');
+    fold.textContent = '—';
+    fold.title = 'Thu nhỏ / mở lại';
+    fold.style.cssText = 'float:right;margin:-4px -4px 0 8px;padding:0 6px;cursor:pointer;font-weight:700;color:#cbd5e1';
+    bar.insertBefore(fold, bar.firstChild);
+    fold.onclick = function (ev) {
+      ev.stopPropagation();
+      var small = bar.getAttribute('data-small') !== '1';
+      bar.setAttribute('data-small', small ? '1' : '0');
+      for (var i = 0; i < bar.children.length; i++) if (bar.children[i] !== fold) bar.children[i].style.display = small ? 'none' : '';
+      fold.textContent = small ? 'LT ▸' : '—';
+      bar.style.padding = small ? '4px 6px' : '10px 12px';
+    };
+    var drag = null;
+    bar.style.cursor = 'move';
+    bar.addEventListener('mousedown', function (ev) {
+      if (ev.target !== bar && ev.target.tagName !== 'DIV') return;      // buttons and links still click
+      var r = bar.getBoundingClientRect();
+      drag = {dx: ev.clientX - r.left, dy: ev.clientY - r.top};
+      ev.preventDefault();
+    });
+    document.addEventListener('mousemove', function (ev) {
+      if (!drag) return;
+      bar.style.transform = 'none'; bar.style.right = 'auto';
+      bar.style.left = Math.max(0, Math.min(innerWidth - 60, ev.clientX - drag.dx)) + 'px';
+      bar.style.top = Math.max(0, Math.min(innerHeight - 30, ev.clientY - drag.dy)) + 'px';
+    });
+    document.addEventListener('mouseup', function () { drag = null; });
+  })();
 
   // every element of the page, also inside shadow roots and same-site frames
   function all(root, out) {
@@ -108,34 +139,101 @@ TOOLBAR_JS = r"""
     }
     return {panels: panels, tab: sel ? sel.text : '', tabs: t.map(function (x) { return (x.selected ? '*' : '') + x.text; })};
   }
-  function links(sc) {
-    var out = [], seen = {}, roots = sc.panels.length ? sc.panels : [document];
+  // Salesforce file ids (ContentDocument 069..., ContentVersion 068...) found in an element's attributes
+  var SFID = /\b(069|068)[A-Za-z0-9]{12}(?:[A-Za-z0-9]{3})?\b/;
+  var FILE = /\.(pdf|docx?|pptx?|xlsx?|txt|md|csv|png|jpe?g|zip)\b/i;
+  var sfPrefix = (location.pathname.match(/^(.*?)\/s\//) || [null, ''])[1];   // e.g. "/community"
+  // what the page shows now: real links and Salesforce file ids, only from visible elements (hidden tabs
+  // stay out), never the site's header/footer/menus unless inside the open tab's panel
+  function items(sc) {
+    var out = [], seen = {}, roots = sc && sc.panels.length ? sc.panels : [document];
     for (var r = 0; r < roots.length; r++) {
       var els = [roots[r]].concat(all(roots[r], []));
       for (var i = 0; i < els.length; i++) {
-        var a = els[i];
-        if (a.tagName !== 'A' || !a.href || mine(a) || seen[a.href]) continue;
-        if (!sc.panels.length && inChrome(a)) continue;
-        seen[a.href] = 1;
-        out.push({href: a.href, text: label(a), download: a.getAttribute('download') || ''});
+        var e = els[i];
+        if (!e.getAttribute || mine(e)) continue;
+        var raw = e.tagName === 'A' ? (e.getAttribute('href') || '') : '';
+        if (raw && raw !== '#' && !/^javascript:/i.test(raw) && /^https?:/i.test(e.href)) {   // a real link
+          if (seen[e.href] !== undefined || !visible(e) || (!(sc && sc.panels.length) && inChrome(e))) continue;
+          seen[e.href] = out.length;
+          out.push({key: e.href, href: e.href, text: label(e), download: e.getAttribute('download') || ''});
+        }
+        var attrs = e.attributes || [], took = false;
+        // a download address kept in an attribute (Salesforce buttons: data-url-value=".../download/?ids=068...")
+        for (var j = 0; j < attrs.length && !took; j++) {
+          var v = attrs[j].value || '';
+          if (attrs[j].name === 'href' || !/^https?:\/\//i.test(v) || !(/download|servlet|\/sfc\//i.test(v) || FILE.test(v))) continue;
+          took = true;
+          if (!visible(e)) break;
+          var t = label(e).slice(0, 120);
+          if (seen[v] !== undefined) {               // same file seen on its icon: the link with the name wins
+            if (t && (e.tagName === 'A' || !out[seen[v]].text)) out[seen[v]].text = t;
+            break;
+          }
+          seen[v] = out.length;
+          out.push({key: v, href: v, text: t, download: ''});
+        }
+        if (took) continue;
+        for (var j2 = 0; j2 < attrs.length; j2++) {
+          if (attrs[j2].name === 'href' && e.tagName === 'A' && seen[e.href] !== undefined) continue;  // already a link
+          var m = SFID.exec(attrs[j2].value || '');
+          if (!m) continue;
+          var id = m[0], k = 'sf:' + id.slice(0, 15);
+          if (seen[k] !== undefined || !visible(e)) break;
+          seen[k] = out.length;
+          out.push({key: k, href: location.origin + sfPrefix + '/s/' + (id.slice(0, 3) === '068' ? 'contentversion/' :
+                    'contentdocument/') + id, text: label(e).slice(0, 120), download: '', sf: true});
+          break;
+        }
       }
     }
     return out;
   }
+  function keys(list) { var s = {}; for (var i = 0; i < list.length; i++) s[list[i].key] = 1; return s; }
+  // file-like things on screen (for the diagnostic file: what the page really contains)
+  function outline() {
+    var out = [], els = all(document, []);
+    for (var i = 0; i < els.length && out.length < 150; i++) {
+      var e = els[i];
+      if (!e.getAttribute || mine(e) || !visible(e)) continue;
+      var t = (e.childElementCount ? '' : (e.textContent || '').trim());
+      var a = [];
+      for (var j = 0; j < (e.attributes || []).length; j++) {
+        var at = e.attributes[j];
+        if (/^(href|title|data-|aria-label|role|class|id)/.test(at.name)) a.push(at.name + '=' + (at.value || '').slice(0, 90));
+      }
+      var sa = a.join(' ');
+      if (FILE.test(t) || SFID.test(sa) || /download|file|attachment/i.test(sa))
+        out.push(e.tagName + ' [' + sa.slice(0, 300) + '] ' + t.slice(0, 120));
+    }
+    return out;
+  }
 
-  // remember the tabs/buttons the user clicks before pressing the button (e.g. "Materials"), to replay
-  var clicks = [];
+  // remember the tabs/buttons the user clicks before pressing the button (e.g. "Materials"), to replay;
+  // just before such a click, note what is on screen: what appears after it is that tab's content
+  var clicks = [], before = null;
+  function tabLike(e) {
+    var role = (e.getAttribute('role') || '').toLowerCase();
+    if (role === 'tab' || e.tagName === 'BUTTON' || role === 'button' || role === 'menuitem') return true;
+    if (e.tagName !== 'A') return false;              // a link that stays on the page (a tab made of a link)
+    var h = e.getAttribute('href') || '';
+    return !h || h === '#' || /^javascript:/i.test(h) || (e.href && e.href.split('#')[0] === location.href.split('#')[0]);
+  }
   document.addEventListener('click', function (ev) {
     var path = ev.composedPath ? ev.composedPath() : [ev.target];
     for (var i = 0; i < path.length; i++) {
       var e = path[i];
       if (!e || !e.getAttribute) continue;
       if (mine(e)) return;
-      var role = (e.getAttribute('role') || '').toLowerCase();
-      if (role === 'tab' || e.tagName === 'BUTTON' || role === 'button' || role === 'menuitem') {
+      if (tabLike(e)) {
         var t = label(e);
-        if (t && t.length <= 60) clicks.push({text: t, role: role, tag: e.tagName});
-        if (clicks.length > 5) clicks.shift();
+        var last = clicks[clicks.length - 1];
+        if (last && last.text === t && last.tag === e.tagName) return;   // the same tab again: keep the first
+        if (t && t.length <= 60) {
+          clicks.push({text: t, role: (e.getAttribute('role') || '').toLowerCase(), tag: e.tagName});
+          if (clicks.length > 5) clicks.shift();
+          before = keys(items(null));
+        }
         return;
       }
     }
@@ -148,28 +246,38 @@ TOOLBAR_JS = r"""
       msg.textContent = 'Đây là trang đăng nhập — hãy đăng nhập trước, rồi bấm tab Materials và bấm lại nút.';
       return;
     }
-    var sc = scope(), l = links(sc);
+    var sc = scope(), l = items(sc), kind = sc.panels.length ? 'panel' : 'page';
+    try { window.pywebview.api.log('scan: ' + l.length + ' items, panels ' + sc.panels.length + ', before ' + (before ? Object.keys(before).length : 'none')); } catch (x) {}
+    if (!sc.panels.length && before) {               // no standard tab panel: what the last tab click added
+      var added = l.filter(function (x) { return !before[x.key]; });
+      if (added.length) { l = added; kind = 'diff'; }
+    }
     sent = true;
-    msg.textContent = 'Đang gửi ' + l.length + ' link' + (sc.tab ? ' trong tab “' + sc.tab + '”' : '') + '...';
+    msg.textContent = 'Đang gửi ' + l.length + ' mục' + (sc.tab ? ' trong tab “' + sc.tab + '”' : '') + '...';
     window.pywebview.api.scan({url: location.href, title: document.title, links: l, ua: navigator.userAgent,
-                               clicks: clicks.slice(-3), scope: sc.panels.length ? 'panel' : 'page',
-                               tab: sc.tab, tabs: sc.tabs, panels: sc.panels.length});
+                               clicks: clicks.slice(-3), scope: kind, tab: sc.tab ||
+                               (clicks.length ? clicks[clicks.length - 1].text : ''), tabs: sc.tabs,
+                               panels: sc.panels.length, outline: outline()});
   }
   document.getElementById('__ltScan').onclick = scan;
 
   // ---- automatic: on the saved page, open the Materials tab (saved clicks), then scan. Never on a login
   // page, and never when the tab is not found: then the user is asked to do it. ----
   var target = __TARGET__, saved = __CLICKS__;
+  function log(m) { try { window.pywebview.api.log(m); } catch (x) {} }
+  log('page ' + location.href + ' | target ' + target + ' | login ' + isLogin() + ' | saved ' + JSON.stringify(saved));
   if (isLogin()) {
     msg.textContent = 'Hãy đăng nhập — sau đó app tự mở tab Materials và tải tài liệu.';
     return;
   }
   function same(a, b) {
-    try { var x = new URL(a), y = new URL(b);
-          return x.origin === y.origin && x.pathname.replace(/\/+$/, '') === y.pathname.replace(/\/+$/, '') &&
-                 x.search === y.search; } catch (e) { return false; }
+    try {
+      var x = new URL(a), y = new URL(b), ok = true;
+      y.searchParams.forEach(function (v, k) { if (x.searchParams.get(k) !== v) ok = false; });
+      return ok && x.origin === y.origin && x.pathname.replace(/\/+$/, '') === y.pathname.replace(/\/+$/, '');
+    } catch (e) { return false; }
   }
-  if (!target || !same(location.href, target)) return;
+  if (!target || !same(location.href, target)) { log('not the saved page: no automatic steps'); return; }
   var cancelled = false;
   var stop = document.createElement('a');
   stop.textContent = 'Huỷ tự động';
@@ -178,23 +286,35 @@ TOOLBAR_JS = r"""
   stop.onclick = function () { cancelled = true; msg.textContent = 'Đã huỷ — bấm nút khi sẵn sàng.'; stop.remove(); };
   bar.appendChild(stop);
   var MAT = /^(course\s+)?materials?$|^tài liệu$|^resources$/i;
+  function clickable(e) {
+    var role = (e.getAttribute('role') || '').toLowerCase();
+    return e.tagName === 'BUTTON' || e.tagName === 'A' || role === 'tab' || role === 'button' || role === 'menuitem';
+  }
+  // the element to click for a saved tab: same kind of element (tag/role) and same text; a wrapper with that
+  // text (e.g. a DIV around the button) is not it - its clickable inside/outside part is used instead
   function find(c) {
-    var want = c.text.toLowerCase(), els = all(document, []);
+    var want = c.text.toLowerCase(), els = all(document, []), loose = null;
     for (var i = 0; i < els.length; i++) {
       var e = els[i];
-      if (mine(e)) continue;
+      if (mine(e) || !e.getAttribute) continue;
       var role = (e.getAttribute('role') || '').toLowerCase();
-      if (c.text === '__auto__') {
-        if ((role === 'tab' || e.tagName === 'A' || e.tagName === 'BUTTON' || e.tagName === 'LI') &&
-            MAT.test(label(e)) && visible(e)) return e;
-      } else if ((role === c.role || e.tagName === c.tag) && label(e).toLowerCase() === want && visible(e)) {
-        return e;
-      }
+      var text = label(e);
+      var match = c.text === '__auto__' ? MAT.test(text) : text.toLowerCase() === want;
+      if (!match || !visible(e)) continue;
+      if (c.text === '__auto__' ? clickable(e) || e.tagName === 'LI'
+                                : (c.role ? role === c.role : e.tagName === c.tag)) return e;
+      if (!loose) loose = e;
     }
-    return null;
+    if (!loose) return null;
+    var inner = [loose].concat(all(loose, [])).filter(function (x) { return x.getAttribute && clickable(x) && visible(x); });
+    if (inner.length) return inner[0];
+    for (var p = parentOf(loose); p; p = parentOf(p)) if (clickable(p)) return p;
+    return loose;
   }
   if (!saved || !saved.length) saved = [{text: '__auto__'}];   // first time: a tab called Materials
-  var noTab = saved.length === 1 && saved[0].text === '__page__';  // last time the files were on the page itself
+  // last time the files were on the page itself: still open a tab called Materials if the page has one
+  var noTab = saved.length === 1 && saved[0].text === '__page__';
+  if (noTab) saved = [{text: '__auto__'}];
   // wait until the number of links stops changing (pages built by scripts), then call next
   function settle(next) {
     var last = -1, stable = 0, waited = 0;
@@ -208,9 +328,8 @@ TOOLBAR_JS = r"""
   var step = 0, opened = 0;
   function replay() {
     if (cancelled) return;
-    if (noTab) return countdown();
     if (step >= saved.length) {
-      if (!opened) {                               // not signed in yet, or the page changed: let the user do it
+      if (!opened && !noTab) {                               // not signed in yet, or the page changed: let the user do it
         cancelled = true; stop.remove();
         msg.textContent = 'Chưa thấy tab Materials — hãy đăng nhập / bấm tab Materials rồi bấm nút.';
         return;
@@ -225,7 +344,8 @@ TOOLBAR_JS = r"""
       tries++;
       if (e || tries >= 16) {
         clearInterval(t);
-        if (e) { opened++; try { e.click(); } catch (x) {} }
+        log((e ? 'clicked ' : 'not found ') + JSON.stringify(c) + (e ? ' (' + e.tagName + ' "' + label(e) + '")' : ''));
+        if (e) { opened++; before = keys(items(null)); try { e.click(); } catch (x) {} }   // note the screen first
         step++;
         settle(replay);
       }
@@ -306,18 +426,111 @@ def keep_session_cookies(window, cookies, host):
         return 0
 
 
+def keep_all_session_cookies(window, timeout=5.0):
+    """Every session cookie in the window's profile (the course site AND the sign-in services it used, e.g. a
+    university login) re-saved as a 30-day cookie, so the next window opens signed in. Windows only.
+    Returns how many were kept, or None when this way is not available."""
+    if sys.platform != "win32":
+        return None
+    try:
+        from System import Action, DateTime
+        from System.Collections.Generic import List
+        from System.Threading.Tasks import Task, TaskScheduler
+        from Microsoft.Web.WebView2.Core import CoreWebView2Cookie
+    except Exception as e:  # noqa: BLE001
+        trace(f"all-cookies unavailable: {e}")
+        return None
+    form, done, n = window.native, threading.Event(), [0]
+
+    def on_ui():
+        mgr = form.browser.webview.CoreWebView2.CookieManager
+
+        def got(task):
+            try:
+                for c in task.Result:
+                    if c.IsSession:
+                        c.Expires = DateTime.Now.AddDays(30)
+                        mgr.AddOrUpdateCookie(c)
+                        n[0] += 1
+            except Exception as e:  # noqa: BLE001
+                trace(f"all-cookies: {e}")
+            finally:
+                done.set()
+        mgr.GetCookiesAsync("").ContinueWith(Action[Task[List[CoreWebView2Cookie]]](got),
+                                             TaskScheduler.FromCurrentSynchronizationContext())
+    try:
+        form.Invoke(Action(on_ui))
+    except Exception as e:  # noqa: BLE001
+        trace(f"all-cookies invoke: {e}")
+        return None
+    done.wait(timeout)
+    return n[0]
+
+
+def read_all_cookies(window, timeout=5.0):
+    """Every cookie in the window's profile, of every site (the course site, its file server, its sign-in
+    service), so downloads that hop between them work like in the browser. None when not available."""
+    if sys.platform != "win32":
+        return None
+    try:
+        from System import Action
+        from System.Collections.Generic import List
+        from System.Threading.Tasks import Task, TaskScheduler
+        from Microsoft.Web.WebView2.Core import CoreWebView2Cookie
+    except Exception:  # noqa: BLE001
+        return None
+    form, done, out = window.native, threading.Event(), []
+
+    def on_ui():
+        mgr = form.browser.webview.CoreWebView2.CookieManager
+
+        def got(task):
+            try:
+                for c in task.Result:
+                    out.append({"name": c.Name, "value": c.Value, "domain": c.Domain, "path": c.Path or "/",
+                                "secure": bool(c.IsSecure), "httponly": bool(c.IsHttpOnly),
+                                "session": bool(c.IsSession)})
+            except Exception as e:  # noqa: BLE001
+                trace(f"read cookies: {e}")
+            finally:
+                done.set()
+        mgr.GetCookiesAsync("").ContinueWith(Action[Task[List[CoreWebView2Cookie]]](got),
+                                             TaskScheduler.FromCurrentSynchronizationContext())
+    try:
+        form.Invoke(Action(on_ui))
+    except Exception:  # noqa: BLE001
+        return None
+    done.wait(timeout)
+    return out
+
+
 class Api:
     def __init__(self, out):
         self.out = out
         self._window = None                 # private: pywebview walks public attributes (huge, slow)
         self._host = ""
 
+    def log(self, msg):
+        """Notes from the page's automatic steps -> source_autolog.txt beside the result file (kept small)."""
+        trace("js: " + str(msg))
+        try:
+            path = os.path.join(os.path.dirname(self.out), "source_autolog.txt")
+            old = open(path, encoding="utf-8").read()[-20000:] if os.path.exists(path) else ""
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(old + time.strftime("%H:%M:%S ") + str(msg)[:2000] + "\n")
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
     def scan(self, page):
         """Called from the page (button or automatic): save links + login cookies, then close the window."""
         cookies = []
         try:
-            cookies = read_cookies(self._window)
-            keep_session_cookies(self._window, cookies, self._host)
+            if keep_all_session_cookies(self._window) is None:     # all sites' sign-in, else this site's
+                keep_session_cookies(self._window, read_cookies(self._window), self._host)
+            cookies = read_all_cookies(self._window)                 # every site: downloads may hop between them
+            if cookies is None:
+                cookies = read_cookies(self._window)
         except Exception as e:  # noqa: BLE001
             page["cookie_error"] = str(e)
         page["cookies"] = cookies
@@ -349,8 +562,16 @@ def run(url, out, profile, clicks="[]"):
     os.makedirs(profile, exist_ok=True)
     api = Api(out)
     api._host = urlparse(url).hostname or ""
+    # near the top of the screen and no taller than it, so the bar at the bottom is always reachable
+    sw, sh = 1366, 768
+    try:
+        s0 = webview.screens[0]
+        sw, sh = int(s0.width), int(s0.height)
+    except Exception:  # noqa: BLE001
+        pass
+    width, height = min(1200, sw - 40), min(860, sh - 90)   # leave room for the taskbar
     w = webview.create_window("Source — đăng nhập, mở phần tài liệu rồi bấm 📥 Tải tài liệu mới", url,
-                              js_api=api, width=1200, height=860)
+                              js_api=api, width=width, height=height, x=max(0, (sw - width) // 2), y=8)
     api._window = w
     try:
         saved = json.loads(clicks or "[]")
@@ -366,7 +587,9 @@ def run(url, out, profile, clicks="[]"):
         except Exception as e:  # noqa: BLE001
             trace(f"inject failed: {e}")
         try:                                # keep the login after every page (also if the user just closes)
-            n = keep_session_cookies(w, read_cookies(w), urlparse(w.get_current_url() or url).hostname or "")
+            n = keep_all_session_cookies(w)
+            if n is None:
+                n = keep_session_cookies(w, read_cookies(w), urlparse(w.get_current_url() or url).hostname or "")
             trace(f"kept {n} session cookies")
         except Exception as e:  # noqa: BLE001
             trace(f"cookies: {e}")

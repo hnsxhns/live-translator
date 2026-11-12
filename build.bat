@@ -13,7 +13,7 @@ if exist vendor\ant.exe set ADD=%ADD% --add-binary "vendor\ant.exe;vendor"
 .venv\Scripts\python -m PyInstaller --noconfirm --clean --onedir --windowed --name %NAME% ^
   --contents-directory app_files ^
   %ADD% --collect-all ctranslate2 --collect-all vosk --collect-all sherpa_onnx --hidden-import native_edit --hidden-import learning --collect-all pymupdf ^
-  --hidden-import source_browser --collect-all webview --collect-all pythonnet --collect-all clr_loader --hidden-import clr ^
+  --hidden-import source_browser --hidden-import feedback --hidden-import feedback_browser --hidden-import zxingcpp --collect-all webview --collect-all pythonnet --collect-all clr_loader --hidden-import clr ^
   --collect-data faster_whisper ^
   --exclude-module onnxruntime --exclude-module torch app.py || exit /b 1
 rem Single-file exe (launcher + app zip) and a plain zip of the same app
