@@ -13,6 +13,7 @@ import { askJson, uploadFile, ClaudeError, friendlyError } from "./claude.js";
 import { fileToBlock, docxText } from "./files.js";
 import { openFile, shareFile, mimeOf } from "./viewer.js";
 import { bookmarklet, BOOKMARK_VERSION } from "./source.js";
+import { Feedback } from "./feedback.js";
 
 const ROOT = new URL("../../../", import.meta.url).href;
 const PDFJS = ROOT + "lib/pdfjs-4.10.38/";
@@ -1206,6 +1207,7 @@ export class LearningUI {
     this.app = app;
     this.lib = new Library();
     this.ready = this.lib.load();
+    this.feedback = new Feedback(this);         // 📝 course survey (QR), answers drafted by Claude, reviewed by the user
     this.job = null;                 // documents/instructions that go with the next prompt
     this.syncing = false;
     this.session = null;             // the exercise being solved step by step
@@ -1251,6 +1253,7 @@ export class LearningUI {
            () => this.stopSession(), true, "lmItem sub");
     }
     item("📓  Journal — điền nhật ký buổi học (PDF)", () => this.journal(), n > 0);
+    item("📝  Feedback — điền khảo sát buổi học (QR)", () => this.feedback.open());
     item("🏆  Certificate — chứng chỉ & chia sẻ", () => this.certificate());
     body.append(el("hr", "lsep"));
     const outs = (this.lib.data.outputs || []).length;

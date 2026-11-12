@@ -561,3 +561,13 @@ audio.vMedia { background: none; }
 .srcNotice { background: #fff7e6; border: 1px solid #f1d39a; color: #5c4210; border-radius: var(--radius-sm); padding: 11px 13px;
   font-size: 14.5px; line-height: 1.5; }
 .srcNotice b { color: #8a5a00; }
+
+/* ---- 📝 Feedback (course survey) ---- */
+.fbPanel .fbLinks, .fbPanel .fbDay { font-size: 15px; padding: 8px 10px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  background: var(--surface-2); max-width: 100%; }
+.fbDayRow { display: flex; align-items: center; gap: 10px; font-size: 15px; }
+.fbQ { display: grid; gap: 6px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); }
+.fbQText { font-weight: 600; font-size: 15px; line-height: 1.4; }
+.fbQ select, .fbQ textarea { width: 100%; font-size: 16px; padding: 8px 10px; border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm); background: #fff; }
+.fbChecks { display: grid; gap: 4px; font-size: 15px; }

@@ -58,7 +58,8 @@ export async function warmUp(apiKey, model) {
  * `prompt` is either the user's text or a full list of messages (multi-turn chat).
  */
 export async function claudeStream(apiKey, { system, prompt, effort, onPiece, model, thinking, maxTokens = 4000,
-                                             format, timeoutMs, retries = 1 }) {
+                                             format, timeoutMs, retries = 1, tools = null, full = false }) {
+  // full: -> {text, content (text and tool_use blocks), stopReason} instead of the text (tool use, Windows 1.9.17)
   const messages = Array.isArray(prompt) ? prompt : [{ role: "user", content: prompt }];
   const m = model || MODEL;
   const usesFiles = JSON.stringify(messages).includes('"type":"file"');
@@ -68,6 +69,9 @@ export async function claudeStream(apiKey, { system, prompt, effort, onPiece, mo
                      output_config: { effort } };
       if (format) body.output_config.format = format;           // structured (JSON schema) output
       if (thinking) body.thinking = thinking;
+      if (tools?.length) body.tools = tools;
+      const blocks = [];                                        // content blocks by index (full mode)
+      let stopReason = "";
       const betas = usesFiles ? [FILES_BETA] : [];
       if (useFallback && !m.startsWith("claude-haiku")) {     // Haiku has no fallback
         body.fallbacks = "default";
@@ -111,16 +115,33 @@ export async function claudeStream(apiKey, { system, prompt, effort, onPiece, mo
               if (!line.startsWith("data:")) continue;
               let data;
               try { data = JSON.parse(line.slice(5)); } catch { continue; }
-              if (data.type === "content_block_delta" && data.delta?.type === "text_delta") {
+              if (data.type === "content_block_start") {
+                blocks[data.index] = { ...data.content_block, _json: "" };
+              } else if (data.type === "content_block_delta" && data.delta?.type === "text_delta") {
                 out += data.delta.text;
                 onPiece?.(data.delta.text);
+                if (blocks[data.index]) blocks[data.index].text = (blocks[data.index].text || "") + data.delta.text;
+              } else if (data.type === "content_block_delta" && data.delta?.type === "input_json_delta") {
+                if (blocks[data.index]) blocks[data.index]._json += data.delta.partial_json || "";
+              } else if (data.type === "message_delta") {
+                stopReason = data.delta?.stop_reason || stopReason;
               } else if (data.type === "error") {
                 throw new ClaudeError(0, data.error?.type, data.error?.message);
               }
             }
           }
         }
-        return out;
+        if (!full) return out;
+        const content = blocks.filter(Boolean).map((b) => {
+          const { _json, ...rest } = b;
+          if (b.type === "tool_use") {
+            let input = rest.input || {};
+            try { if (_json) input = JSON.parse(_json); } catch { input = {}; }   // a cut-off input: empty
+            return { type: "tool_use", id: rest.id, name: rest.name, input };
+          }
+          return b.type === "text" ? { type: "text", text: rest.text || "" } : null;
+        }).filter((b) => b && (b.type !== "text" || b.text));
+        return { text: out, content, stopReason };
       } catch (err) {
         const e = err?.name === "AbortError" ? new ClaudeError(0, "timeout", "request timed out") : err;
         const msg = String(e?.message || e).toLowerCase();
@@ -135,7 +156,7 @@ export async function claudeStream(apiKey, { system, prompt, effort, onPiece, mo
       }
     }
   }
-  return "";
+  return full ? { text: "", content: [], stopReason: "" } : "";
 }
 
 /** Upload a file to Claude (Files API) -> file id. */
@@ -209,6 +230,17 @@ function objectEnd(t, i) {
 }
 
 /** Claude API errors -> short Vietnamese explanation. */
+/** A few words for the Vietnamese pane: why a segment has no translation (Windows 1.9.11). */
+export function shortError(e) {
+  const s = String(e?.message || e).toLowerCase();
+  if (s.includes("credit balance")) return "tài khoản API hết credit";
+  if (e instanceof ClaudeError && e.status === 401) return "cần đăng nhập lại";
+  if ((e instanceof ClaudeError && e.status === 429) || s.includes("overloaded")) return "Claude đang quá tải";
+  if (e?.type === "timeout" || s.includes("timed out")) return "Claude trả lời quá lâu";
+  if (e instanceof TypeError) return "mất kết nối mạng";
+  return "lỗi Claude";
+}
+
 export function friendlyError(e) {
   const s = String(e?.message || e).toLowerCase();
   if (s.includes("credit balance")) {

@@ -31,6 +31,30 @@ const el = (tag, cls, text) => {
   return e;
 };
 
+// ---------------- the session on screen, kept across reloads (Windows 1.9.11) ----------------
+// Safari on the iPad often reloads a tab that was in the background: the session is saved every minute and
+// whenever the app leaves the screen, in the browser's storage, and reopened after the login.
+let sessionDbP = null;
+function sessionDb() {
+  sessionDbP = sessionDbP || new Promise((resolve, reject) => {
+    const r = indexedDB.open("lt-session", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("s");
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error || new Error("IndexedDB"));
+  });
+  return sessionDbP;
+}
+async function sessionStore(mode, fn) {
+  const d = await sessionDb();
+  return new Promise((resolve, reject) => {
+    const tx = d.transaction("s", mode);
+    const req = fn(tx.objectStore("s"));
+    tx.oncomplete = () => resolve(req?.result);
+    tx.onerror = tx.onabort = () => reject(tx.error || new Error("không lưu được phiên"));
+  });
+}
+const AUTOSAVE_KEY = "autosave";
+
 // ---------------- settings (shared by every installed build) ----------------
 const CFG = "lt_config";
 function loadConfig() {
@@ -86,6 +110,7 @@ class App {
     this.learning = new LearningUI(this);
     this.sourceBridge = new SourceBridge(this);       // documents sent by the bookmark "📥 Live Translator"
     this.chatter.getLibrary = () => this.learning.catalogText();
+    this.chatter.toolHandler = (n, i) => this.chatTool(n, i);     // Claude reads library files / the class record
     this.buildUI();
   }
 
@@ -229,6 +254,7 @@ class App {
     this.summarizer.getTerms = () => this.recognizer.glossary;    // the same course words help the takeaways
     this.refreshGlossary();
     this.translator.warm();                              // the first translation is then as fast as the others
+    this.reopenLast();                                   // the session that was on screen last time
     this.checkUpdates();
   }
 
@@ -305,6 +331,9 @@ class App {
     $("btnLogout").onclick = () => this.logout();
     $("btnBackup").onclick = () => this.restoring() || this.backupSession();
     $("btnRestore").onclick = () => this.restoring() || $("restorePick").click();
+    $("btnNew").onclick = () => this.newSession();
+    setInterval(() => this.autosave(), 60_000);                   // the session survives a reload / closed tab
+    window.addEventListener("pagehide", () => this.autosave(true));
     $("restorePick").onchange = (e) => { const f = e.target.files[0]; e.target.value = ""; if (f) this.restoreSession(f); };
     $("btnVersion").textContent = LABEL;
     $("btnVersion").onclick = () => this.showVersions();
@@ -566,7 +595,9 @@ class App {
         this.setStatus(`🎓 Không đọc được tài liệu: ${e.message || e}`, "err");
       }
     }
-    this.chatter.ask(q, learnBlocks.concat(files.map(([, b]) => b)));
+    // Learning jobs about the documents (Agenda, exercises, a file...) don't need the class transcript: leaving
+    // it out makes them much cheaper. Questions and the class Summary get it (Windows 1.9.11).
+    this.chatter.ask(q, learnBlocks.concat(files.map(([, b]) => b)), !job || job.kind === "summary");
   }
 
   chatTurn(q, names, answer = null) {
@@ -581,10 +612,52 @@ class App {
     this.scrollEnd(w);
   }
 
+  /** What Claude knows about the session when answering. The Vietnamese repeats the English, so only its end
+   *  is sent (it would cost as much again); the rest is read with the class-record tool when needed. */
   chatContext() {
     return [this.transcriptText().slice(-40000),
-            this.translator.history.map(([, v]) => v).join("\n").slice(-20000),
-            this.lastSummary];
+            this.translator.history.map(([, v]) => v).join("\n").slice(-3000),
+            this.lastSummary.slice(-8000), this.on];
+  }
+
+  /** What Claude asked to read (chat tools, Windows 1.9.17): library documents by id, from the text the app
+   *  already keeps (nothing uploaded again), or the whole class record, optionally searched. */
+  async chatTool(name, inp) {
+    if (name === "read_library_documents") {
+      await this.learning.ready;
+      const lib = this.learning.lib, out = [];
+      let total = 0;
+      for (let key of (inp.ids || []).slice(0, 5)) {
+        key = String(key).trim().replace(/^\[|\]$/g, "");
+        const d = lib.get(key) || lib.docs().find((x) => (x.name + " " + (x.title || "")).toLowerCase().includes(key.toLowerCase()));
+        if (!d) { out.push(`<document id="${key}">(không có trong thư viện)</document>`); continue; }
+        let text = (await lib.text(d)) || "(file không có chữ đọc được, ví dụ ảnh hoặc PDF scan)";
+        text = text.slice(0, Math.max(2000, 150_000 - total)).slice(0, 60_000);
+        total += text.length;
+        out.push(`<document id="${d.id}" name="${d.name}" title="${d.title || ""}">\n${text}\n</document>`);
+      }
+      return out.join("\n\n");
+    }
+    if (name === "read_class_record") {
+      const part = inp.part || "english";
+      const limit = Math.max(2000, Math.min(+inp.max_chars || 30_000, 100_000));
+      const pairs = this.translator.history;
+      const text = part === "takeaways" ? this.lastSummary : part === "english" ? this.transcriptText()
+        : part === "vietnamese" ? pairs.map(([, v]) => v).join("\n") : pairs.map(([e, v]) => `EN: ${e}\nVI: ${v}`).join("\n");
+      if (!String(text || "").trim()) return "(chưa có nội dung)";
+      const term = String(inp.search || "").trim().toLowerCase();
+      if (term) {
+        const lines = text.split("\n"), keep = new Set();
+        lines.forEach((l, i) => {
+          if (l.toLowerCase().includes(term)) for (let j = Math.max(0, i - 1); j < Math.min(lines.length, i + 2); j++) keep.add(j);
+        });
+        if (!keep.size) return `(không có dòng nào nhắc tới “${inp.search}”)`;
+        const t = [...keep].sort((a, b) => a - b).map((j) => lines[j]).join("\n");
+        return t.slice(0, limit) + (t.length > limit ? "\n…(còn nữa)" : "");
+      }
+      return (text.length > limit ? "…(phần trước còn nữa)\n" : "") + text.slice(-limit);
+    }
+    return "(không rõ công cụ)";
   }
 
   // ---------------- speakers ----------------
@@ -940,6 +1013,7 @@ class App {
    *  by itself; if iPad wants a tap first, a big "tap to turn the mic on" button shows. */
   async onVisibility() {
     if (document.visibilityState === "visible") this.checkUpdates();
+    else this.autosave(true);                                     // Safari may drop a background tab
     this.syncMic();
   }
 
@@ -1067,11 +1141,73 @@ class App {
       transcript: this.transcript,
       takeaways: this.lastSummary,
       chat: this.chatLog,
+      // short text per message: files and documents Claude read are read again from the library when needed
       chat_history: this.chatter.history.map((m) => (typeof m.content === "string" ? m : {
         role: m.role,
-        content: m.content.map((b) => (b.type === "text" ? b.text || "" : `[file đính kèm: ${b.title || b.type}]`)).join(" "),
+        content: m.content.map((b) => (b.type === "text" ? b.text || ""
+          : b.type === "tool_use" ? `(Claude đọc: ${b.name} ${JSON.stringify(b.input || {})})`
+          : b.type === "tool_result" ? "(nội dung đã đọc — đọc lại khi cần)"
+          : `[file đính kèm: ${b.title || b.type}]`)).join(" "),
       })),
     };
+  }
+
+  /** Saves the session on screen (only when something changed); never while a restore is still filling the
+   *  panes (that would save half a session). An empty session removes the saved one. */
+  async autosave(force = false) {
+    if (this.restoringNow || !this.apiKey) return;
+    const sig = [this.order.length, this.lastSummary.length, this.chatLog.length,
+                 Object.values(this.translator.vi).reduce((a, v) => a + (v || "").length, 0),
+                 this.chatLog.at(-1)?.a.length || 0].join(",");
+    if (!force && sig === this.autosaveSig) return;
+    try {
+      const data = this.sessionData();
+      if (!(data.rows.length || data.takeaways || data.chat.length)) await sessionStore("readwrite", (s) => s.delete(AUTOSAVE_KEY));
+      else await sessionStore("readwrite", (s) => s.put(data, AUTOSAVE_KEY));
+      this.autosaveSig = sig;
+    } catch (e) {
+      console.warn("autosave", e);
+    }
+  }
+
+  /** After the login: bring back the session that was on screen (its translations, takeaways and answers are
+   *  not asked from Claude again). */
+  async reopenLast() {
+    if (this.reopened || this.order.length) return;
+    this.reopened = true;
+    let data = null;
+    try { data = await sessionStore("readonly", (s) => s.get(AUTOSAVE_KEY)); } catch { data = null; }
+    if (!data || data.app !== "LiveTranslator" || !(data.rows?.length || data.takeaways || data.chat?.length)) return;
+    this.restoringNow = true;
+    const failed = await this.loadSession(data);
+    this.autosaveSig = null;
+    this.setStatus(`↺ Đã mở lại phiên trước (${(data.rows || []).length} dòng, lưu lúc ${data.saved || "?"}). ` +
+                   "Bấm 🆕 Phiên mới để bắt đầu buổi khác.", failed.length ? "warn" : "ok");
+  }
+
+  /** An empty session; the current one is kept as a backup (in 📋 List Outputs) first. */
+  async newSession() {
+    if (this.restoring()) return;
+    const data = this.sessionData();
+    if (data.rows.length || data.takeaways || data.chat.length) {
+      if (!confirm("Lưu phiên hiện tại vào Backup (📋 List Outputs) rồi bắt đầu một phiên trống?")) return;
+      const d = new Date(), pad = (n) => String(n).padStart(2, "0");
+      const name = `LiveTranslator_backup_${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}.json`;
+      try {
+        await this.learning.addOutput("backup", name, new Blob([JSON.stringify(data, null, 1)], { type: "application/json" }),
+          "Backup phiên nghe", { detail: `${data.rows.length} dòng (trước khi mở phiên mới)` });
+      } catch (e) {
+        alert("Không lưu được backup: " + (e.message || e));
+        return;
+      }
+    }
+    if (this.on) this.toggleOnOff();
+    this.restoringNow = true;
+    await this.recognizer.stopping;
+    await this.loadSession({ app: "LiveTranslator", rows: [], transcript: [], takeaways: "", chat: [], chat_history: [], speakers: {} });
+    $("chat").replaceChildren();
+    await this.autosave(true);
+    this.setStatus("🆕 Phiên mới — nhấn ON để bắt đầu.", "ok");
   }
 
   async backupSession() {
