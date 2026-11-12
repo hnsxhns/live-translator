@@ -1,14 +1,12 @@
 // Version of this iPad build. Every build needs a new BUILD number (old builds stay online, like TestFlight).
 // APP_VERSION follows the desktop app whose features this build matches.
-export const APP_VERSION = "1.9.17";
-export const BUILD = 23;
+export const APP_VERSION = "1.9.20";
+export const BUILD = 24;
 export const CHANNEL = "beta";            // "beta" (testers only) or "stable"
 export const NOTES = [
-  "📝 Feedback có dấu trang riêng ltfeedback: cài và thử ngay trong mục Feedback (nút 📝 Cài dấu trang ltfeedback → Copy mã → 🧪 Thử với khảo sát mẫu). Chạy ltfeedback ở trang khảo sát là app đọc câu hỏi luôn (không phải chọn giữa khảo sát và tài liệu). Dấu trang ltsource vẫn dùng được cho khảo sát.",
-  "Đủ các tính năng mới của bản Windows 1.9.17 phù hợp với iPad:",
-  "📝 Feedback (Learning): chọn ảnh / ảnh màn hình / slide PDF có mã QR của khảo sát (hoặc dán link) → mở khảo sát → chạy dấu trang ltsource ở đó: Claude soạn câu trả lời tích cực, cụ thể theo tài liệu và bản ghi buổi học; bạn duyệt / sửa từng câu; app điền vào form. Bạn tự bấm Next / Submit — app không bao giờ tự gửi.",
-  "Hỏi Claude: Claude tự đọc toàn văn tài liệu trong thư viện và toàn bộ bản ghi buổi học (tìm theo từ) khi câu hỏi cần. Tiết kiệm credit: bối cảnh cố định gửi trước và được cache, tài liệu chỉ gửi một lần, câu hỏi về tài liệu Learning không kèm bản ghi buổi học, bản dịch chỉ gửi phần cuối.",
-  "Ý chính dùng Sonnet và làm mới mỗi 60 giây (rẻ hơn nhiều). Dòng chưa dịch được ghi rõ lý do (ví dụ hết credit, mất mạng).",
-  "Phiên đang mở được tự lưu mỗi phút và mỗi khi rời app, rồi tự mở lại khi vào app (Safari hay tự tải lại tab). Nút 🆕 Phiên mới: lưu phiên hiện tại vào Backup rồi bắt đầu phiên trống.",
-  "Dấu trang ltsource bản 3 (cần Copy mã và dán đè một lần): chỉ lấy tài liệu của tab đang mở, nhận mã file Salesforce trong nút tải, không quét trang đăng nhập; thanh công cụ thu nhỏ (—) và kéo đi được; đọc và điền khảo sát.",
+  "Nghe được giọng ở xa (người nói không cầm micro), như bản Windows 1.9.20:",
+  "Giọng nhỏ được nâng tiếng trước khi nhận chữ trực tiếp (giọng bình thường giữ nguyên); câu không ra chữ trực tiếp vẫn được Whisper nghe lại nếu rõ ràng to hơn tiếng ồn phòng; giữ chữ của Whisper trừ khi rõ ràng là bịa (cụm quen thuộc, nhiều chữ hơn mức nói được). Windows đo: giọng nhỏ 40 lần trước mất cả 14/14 câu, giờ 18% lỗi chữ; giọng bình thường và phòng ồn không đổi; tiếng ồn phòng không tạo dòng.",
+  "Khoảng ngừng tính theo tiếng ồn của phòng, nên giọng xa không bị cắt giữa câu; đoạn ngắn dưới 1,8 giây được nối với câu sau trừ khi có khoảng ngừng thật (0,6 giây).",
+  "Feedback: mỗi trang khảo sát chỉ một bảng duyệt; trang tải lại thì app điền lại câu trả lời đã duyệt; Claude không soạn được thì các câu chấm điểm vẫn được chọn sẵn mức tích cực nhất.",
+  "Từ bản 23: dấu trang ltfeedback cho Feedback; bản 22: Feedback khảo sát, Claude đọc tài liệu, tự lưu phiên, dấu trang bản 3.",
 ];

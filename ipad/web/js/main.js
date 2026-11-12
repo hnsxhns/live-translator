@@ -754,10 +754,14 @@ class App {
       r = { uid, sid: this.uidSpk[uid] || 1, en: "", draft: true, vi: "", viGen: 0, viFilled: false,
             enEl: this.cell("en", uid), viEl: this.cell("vi", uid) };
       this.rows.set(uid, r);
-      this.order.push(uid);
-      $("rows").insertBefore(r.enEl, $("partialEn"));     // live words stay the last row
-      $("rows").insertBefore(r.viEl, $("partialEn"));
-      this.relabel(this.order.length - 1);
+      // in speaking order: a sentence only Whisper heard (no live draft) arrives after the next one started
+      let at = this.order.length;
+      while (at > 0 && this.order[at - 1] > uid) at--;
+      const next = at < this.order.length ? this.rows.get(this.order[at]).enEl : $("partialEn");   // live words stay last
+      this.order.splice(at, 0, uid);
+      $("rows").insertBefore(r.enEl, next);
+      $("rows").insertBefore(r.viEl, next);
+      this.relabel(at);
     }
     return r;
   }
@@ -768,7 +772,8 @@ class App {
   }
 
   addDraft(uid, text) {
-    this.setPartial("");
+    // a late row (Whisper-only, older than the newest) must not clear the words being heard now
+    if (!this.order.length || uid > this.order[this.order.length - 1]) this.setPartial("");
     const r = this.row(uid);
     r.en = text;
     r.draft = true;

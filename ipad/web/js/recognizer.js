@@ -11,6 +11,30 @@ export const SR = 16000;
 const FRAME = 480;              // 30 ms frames
 const UTT_SOFT = 3.0;           // after this long, cut the utterance at the next short pause (s)
 const UTT_HARD = 7.0;           // always cut by this length (s)
+const UTT_MIN = 1.8;            // a piece Vosk ends before this is joined with what follows, unless a 0.6 s pause
+const QUIET_ADD = 0.0005;       // pause = below 2x room noise + this (was 0.002: a far voice never rose above it)
+const VOSK_QUIET_TARGET = 0.02; // speech below this (RMS) is raised for Vosk; louder speech reaches it unchanged
+
+/** The text a finished utterance shows: Whisper's, unless it is clearly invented (a known phrase, or more words
+ *  than anyone says in that time); then Vosk's live draft. Before 1.9.20 a Whisper text much longer than the
+ *  draft was thrown away - exactly what happens with a far speaker, where Vosk hears little. */
+export function chooseText(draft, text, secs) {
+  const capit = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+  const d = String(draft || "").trim(), t = String(text || "").trim();
+  const clean = t.replace(/^[ .,!?\-'"]+|[ .,!?\-'"]+$/g, "");
+  const nW = t.split(/\s+/).filter(Boolean).length, nD = d.split(/\s+/).filter(Boolean).length;
+  if (!clean) return capit(d);
+  if (HALLUCINATION.test(t) && !HALLUCINATION.test(d)) return capit(d);
+  if (nW > 4.5 * secs + 3) return capit(d);                 // faster than anyone speaks: invented
+  if (!d) {                                                 // only Whisper heard it: drop its usual noise guesses
+    if (nW <= 2 && /^(you|thank you|thanks|bye|okay|ok|uh|um|hmm|so)[.!?]?$/.test(clean.toLowerCase())) return "";
+    return t;
+  }
+  const words = (s) => new Set(s.toLowerCase().replace(/[^a-z0-9' ]/g, " ").split(/\s+/).filter(Boolean));
+  const wd = words(d), shared = [...words(t)].filter((x) => wd.has(x)).length / Math.max(1, wd.size);
+  if (nD <= 3 && nW <= 4 && shared < 0.5) return capit(d);  // a short guess that disagrees with what Vosk heard
+  return t;
+}
 /** Whisper in the browser marks silence/noise with tags such as "[BLANK_AUDIO]", "[Music]", "(applause)":
  *  they are not words (an empty result keeps Vosk's text). */
 export const noSpeechTags = (t) => String(t || "")
@@ -103,8 +127,10 @@ export class AudioCleaner {
   static TARGET = 0.08;                // speech loudness (RMS) Whisper sees
   static MAX_GAIN = 10.0;
 
-  constructor(cutoff = 100, sr = SR) {
-    this.stages = [0.5412, 1.3066].map((q) => {           // Butterworth Q values for 4th order
+  /** highpass false: level boost only (for Vosk: the filter hurt it in noise); target: speech RMS to reach. */
+  constructor(cutoff = 100, sr = SR, { highpass = true, target = AudioCleaner.TARGET } = {}) {
+    this.target = target;
+    this.stages = !highpass ? [] : [0.5412, 1.3066].map((q) => {   // Butterworth Q values for 4th order
       const w = (2 * Math.PI * cutoff) / sr, cos = Math.cos(w), alpha = Math.sin(w) / (2 * q), a0 = 1 + alpha;
       return { b0: (1 + cos) / 2 / a0, b1: -(1 + cos) / a0, b2: (1 + cos) / 2 / a0,
                a1: (-2 * cos) / a0, a2: (1 - alpha) / a0, z1: 0, z2: 0 };
@@ -144,7 +170,7 @@ export class AudioCleaner {
       if (speech.length) {
         const v = Math.sqrt(speech.reduce((a, b) => a + b * b, 0) / speech.length);
         this.level = this.level === null ? v : this.level + (v - this.level) * (v > this.level ? 0.5 : 0.15);
-        let want = Math.min(AudioCleaner.MAX_GAIN, Math.max(1.0, AudioCleaner.TARGET / Math.max(this.level, 1e-5)));
+        let want = Math.min(AudioCleaner.MAX_GAIN, Math.max(1.0, this.target / Math.max(this.level, 1e-5)));
         want = Math.min(want, Math.max(1.0, 0.02 / Math.max(floor, 1e-5)));   // noise stays quiet (floor x gain <= 0.02)
         this.gain += (want - this.gain) * (want < this.gain ? 0.6 : 0.2);    // turn down faster than up
       }
@@ -255,7 +281,7 @@ export class Recognizer {
     this.rec.setWords(true);
     this.rec.on("result", (m) => this._onResult(m.result));
     this.rec.on("partialresult", (m) => {
-      const p = m.result?.partial || "";
+      const p = ((this.held ? this.held + " " : "") + (m.result?.partial || "")).trim();
       if (p !== this.lastPartial) {
         this.lastPartial = p;
         this.emit("partial", p);
@@ -265,6 +291,11 @@ export class Recognizer {
     this.cut = 0;                  // sample index where the current utterance starts
     this.chunks = [];              // [{start, data, clean}] audio not yet given to an utterance
     this.cleaner = new AudioCleaner();   // hum/rumble filter + level boost for quiet or far speakers (Whisper only)
+    // for Vosk: only a QUIET voice is raised (a far voice at 1/40 of a close one was silence to it); a normal
+    // voice reaches Vosk unchanged (Windows 1.9.20)
+    this.booster = new AudioCleaner(100, SR, { highpass: false, target: VOSK_QUIET_TARGET });
+    this.held = "";                // words of a too-short piece, waiting to be joined with the rest
+    this.voiced = 0;               // how long this utterance was clearly louder than the room (s)
     this.rmsHist = [];
     this.quiet = 0;
     this.cutAsked = false;
@@ -387,6 +418,7 @@ export class Recognizer {
       this.running = false;
       this.paused = false;
       try {
+        this.cutAsked = true;                  // a held short piece is sent too
         rec.retrieveFinalResult();             // the last words still become an utterance
         await new Promise((r) => setTimeout(r, 600));
         rec.remove();
@@ -406,6 +438,7 @@ export class Recognizer {
     if (!this.running) return;
     this.running = false;
     this.paused = true;
+    this.cutAsked = true;                      // a held short piece is sent too
     try { this.rec.retrieveFinalResult(); } catch { /* */ }
     this._close();
     try { await this.ctx?.suspend(); } catch { /* */ }
@@ -445,7 +478,9 @@ export class Recognizer {
     try { clean = this.cleaner?.process(block) || null; } catch { clean = null; }   // never stops the listening
     this.chunks.push({ start: this.sent, data: block, clean });
     this.sent += block.length;
-    this.rec.acceptWaveformFloat(block, SR);
+    let forVosk = block;
+    try { forVosk = this.booster ? this.booster.process(block) : block; } catch { forVosk = block; }
+    this.rec.acceptWaveformFloat(forVosk, SR);
 
     // breath pauses: Vosk only ends an utterance after a long silence, so we also cut at short
     // pauses once the utterance is long enough -> accurate text comes sooner
@@ -461,11 +496,14 @@ export class Recognizer {
       const sorted = [...this.rmsHist].sort((a, b) => a - b);
       floor = sorted[Math.floor(0.2 * (sorted.length - 1))];
     }
+    // a pause is measured against the room's own noise (+0.0005; it was +0.002, which a far voice never rose
+    // above, so every sentence was cut); "voiced": clearly louder than the room (Windows 1.9.20)
     for (let k = this.rmsHist.length - n; k < this.rmsHist.length; k++) {
-      this.quiet = this.rmsHist[k] < floor * 2.0 + 0.002 ? this.quiet + FRAME / SR : 0;
+      this.quiet = this.rmsHist[k] < floor * 2.0 + QUIET_ADD ? this.quiet + FRAME / SR : 0;
+      if (this.rmsHist[k] > floor * 3.0 + QUIET_ADD * 0.5) this.voiced += FRAME / SR;
     }
     const secs = (this.sent - this.cut) / SR;
-    if (!this.cutAsked && ((secs >= UTT_SOFT && this.quiet >= 0.2) || secs >= UTT_HARD)) {
+    if (!this.cutAsked && ((secs >= UTT_SOFT && this.quiet >= 0.2) || secs >= UTT_HARD || (this.held && this.quiet >= 0.6))) {
       this.cutAsked = true;
       this.rec.retrieveFinalResult();
     }
@@ -485,25 +523,42 @@ export class Recognizer {
   }
 
   _onResult(result) {
+    const forced = this.cutAsked;           // our own cut (long enough, or held words + a real pause)
     this.cutAsked = false;
     const text = (result?.text || "").trim();
+    const joined = ((this.held ? this.held + " " : "") + text).trim();
+    // a piece Vosk ends under 1.8 s is joined with what follows, unless a real pause comes: far voices have
+    // short gaps mid-sentence (Windows 1.9.20)
+    if (!forced && joined && (this.sent - this.cut) / SR < UTT_MIN) {
+      this.held = joined;
+      return;
+    }
     const words = result?.result || [];
     let end;
     if (words.length) end = Math.min(this.sent, Math.round((words[words.length - 1].end + 0.25) * SR));
-    else end = text ? this.sent : Math.max(this.cut, this.sent - Math.round(0.3 * SR));
+    else end = joined ? this.sent : Math.max(this.cut, this.sent - Math.round(0.3 * SR));
     end = Math.max(end, this.cut);
     const [raw, clean] = this._take(this.cut, end);
     this.cut = end;
     this.lastPartial = "";
-    this._endUtterance(text, raw, clean);
+    const voiced = this.voiced;
+    this.held = "";
+    this.voiced = 0;
+    this._endUtterance(joined, raw, clean, voiced);
   }
 
-  /** raw: audio as recorded (voiceprints); clean: hum filtered + level boosted (Whisper). */
-  _endUtterance(draft, raw, clean = raw) {
+  /** raw: audio as recorded (voiceprints); clean: hum filtered + level boosted (Whisper);
+   *  voiced: seconds clearly louder than the room, measured on the audio as recorded. */
+  _endUtterance(draft, raw, clean = raw, voiced = 1) {
     const audio = raw;
-    if (["", "the", "huh", "uh", "um"].includes(draft)) {    // Vosk heard no real words: skip Whisper
-      this.emit("partial", "");
-      return;
+    if (["", "the", "huh", "uh", "um"].includes(draft)) {
+      // Vosk heard no words. A quiet or far voice (no microphone) can still be speech that Whisper hears
+      // well: let it decide when there were voice-loud parts; real silence is skipped (Windows 1.9.20).
+      if (clean.length < 0.6 * SR || voiced < 0.4) {
+        this.emit("partial", "");
+        return;
+      }
+      draft = "";
     }
     const id = ++this.uttId;
     const seconds = audio.length / SR;
@@ -513,7 +568,8 @@ export class Recognizer {
     const guess = sp.last ? sp.resolve(sp.last) : sp.nextId;
     this.uttSpk[id] = guess;
     this.emit("speaker", [id, guess, { ...sp.talk }, { ...sp.merged }]);
-    this.emit("draft", [id, draft]);
+    if (draft) this.emit("draft", [id, draft]);          // (no draft: the row appears when Whisper has text)
+    else this.emit("partial", "");
     this.spkChain = this.spkChain.then(async () => {
       let vec = null;
       if (this.spk && audio.length > SR / 2) {
@@ -535,7 +591,7 @@ export class Recognizer {
     while (this.queue.length) {
       while (this.queue.length > WHISPER_BACKLOG) {
         const x = this.queue.shift();
-        this._final(x.id, cap(x.draft));
+        if (x.draft) this._final(x.id, cap(x.draft));   // (no draft and no time for Whisper: nothing to show)
       }
       const item = this.queue.shift();
       let text = "";
@@ -563,14 +619,9 @@ export class Recognizer {
         } else this.whisperLate = 0;
         text = noSpeechTags(text);
       }
-      const nW = text.split(/\s+/).filter(Boolean).length, nD = item.draft.split(/\s+/).filter(Boolean).length;
-      const words = (s) => new Set(s.toLowerCase().replace(/[^a-z0-9' ]/g, " ").split(/\s+/).filter(Boolean));
-      const wd = words(item.draft), shared = [...words(text)].filter((x) => wd.has(x)).length / Math.max(1, wd.size);
-      // phrases Whisper invents in silence ("thanks for watching"...), or a few words heard and Whisper wrote
-      // something else (Windows 1.9.5)
-      const invented = (HALLUCINATION.test(text) && !HALLUCINATION.test(item.draft)) || (nD <= 3 && shared < 0.5);
-      // empty, or far longer than what Vosk heard (Whisper sometimes invents text on cut-off audio)
-      if (!text.replace(/[ .,!?\-'"]/g, "") || nW > 2 * nD + 3 || invented) text = cap(item.draft);
+      text = chooseText(item.draft, text, item.audio.length / SR);
+      if (!text) continue;                           // nothing heard after all (no draft, no Whisper text)
+      if (!item.draft) this.emit("draft", [item.id, text]);   // Vosk heard nothing: the row starts with Whisper's text
       this._final(item.id, text);
     }
     this.whisperBusy = false;

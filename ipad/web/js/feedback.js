@@ -32,6 +32,29 @@ const DRAFT_SCHEMA = {
     type: "object", additionalProperties: false, required: ["qid", "choice", "choices", "text"],
     properties: { qid: { type: "string" }, choice: { type: "string" },
                   choices: { type: "array", items: { type: "string" } }, text: { type: "string" } } } } } };
+// Without Claude: the most positive option of every rating / agreement question (Windows 1.9.18)
+const POSITIVE = [[/\bexcellent\b|\bextremely (likely|satisfied|useful|valuable)\b|\bstrongly agree\b|\boutstanding\b/, 100],
+  [/\bvery (good|likely|satisfied|useful|valuable|well)\b|\bagree\b(?!.*dis)/, 80],
+  [/\bgood\b|\bsatisfied\b|\blikely\b|\buseful\b|\byes\b/, 60]];
+export function positiveDefaults(questions) {
+  const out = {};
+  for (const q of questions) {
+    const opts = q.options || [];
+    if (!["radio", "select"].includes(q.type) || !opts.length) continue;
+    const score = (o) => {
+      const low = o.toLowerCase();
+      if (/\b(not|dis|poor|un|never|no)\b|disagree|unlikely|dissatisfied/.test(low)) return -1;
+      for (const [re, s] of POSITIVE) if (re.test(low)) return s;
+      const m = /^\s*(\d+)/.exec(o);
+      return m ? +m[1] : 0;
+    };
+    let best = opts[0];
+    for (const o of opts) if (score(o) >= score(best)) best = o;      // ties: the later option, like max() by index
+    if (score(best) > 0 || opts.every((o) => /^\s*\d+/.test(o))) out[q.qid] = { qid: q.qid, choice: best, choices: [], text: "" };
+  }
+  return out;
+}
+
 const LINKS_SCHEMA = { type: "object", additionalProperties: false, required: ["urls"],
   properties: { urls: { type: "array", items: { type: "string" } } } };
 
@@ -114,6 +137,8 @@ export class Feedback {
     this.L = learning;
     this.app = learning.app;
     this.session = null;            // {url, day}: the survey opened from here
+    this.answered = new Map();      // page (its questions) -> the approved answers: refilled if the page reloads
+    this.waiting = new Set();       // pages whose review is open (one review per page)
   }
 
   /** Menu entry: the survey from a QR image / slide PDF, or a link; then open it. */
@@ -227,16 +252,24 @@ export class Feedback {
       `<key_takeaways>\n${take || "(none)"}\n</key_takeaways>\n<transcript_end>\n${en || "(none)"}\n</transcript_end>`;
   }
 
-  /** The bookmark sent one survey page: draft, review, then send the answers back to be filled in. */
+  /** The bookmark sent one survey page: draft, review, then send the answers back to be filled in.
+   *  One review per page; a page answered before (it reloaded) is filled again at once (Windows 1.9.18). */
   async receive(source, origin, page) {
     const qs = (page.questions || []).filter((q) => q && q.qid);
     if (!qs.length) return;
     let host = origin;
     try { host = new URL(page.url).host; } catch { /* */ }
+    const sig = JSON.stringify(qs.map((q) => q.question));
+    if (this.answered.has(sig)) {                 // the same page again: fill it again
+      this.send(source, origin, this.answered.get(sig), "📝 Trang khảo sát tải lại — đã điền lại các câu trả lời đã duyệt.");
+      return;
+    }
+    if (this.waiting.has(sig)) return;            // its review is already open: one review per page
     if (!this.session && !confirm(`Nhận câu hỏi khảo sát từ ${host} để Claude soạn câu trả lời?`)) return;
+    this.waiting.add(sig);
     const day = this.session?.day || 0;
     this.app.busy("feedback", `Claude đang soạn câu trả lời cho ${qs.length} câu hỏi khảo sát...`);
-    let answers = {};
+    let answers = {}, error = "";
     try {
       const prompt = (await this.courseContext(day)) + `\n\n<survey_page title="${(page.title || "").replace(/"/g, "'")}">\n` +
         JSON.stringify(qs, null, 1) + "\n</survey_page>";
@@ -244,18 +277,31 @@ export class Feedback {
                                 { effort: "low", maxTokens: 8000 });
       for (const a of res?.answers || []) answers[a.qid] = a;
     } catch (e) {
-      this.app.setStatus(`📝 Không soạn được câu trả lời: ${friendlyError(e)}`, "err");
-      answers = {};
+      error = friendlyError(e);
+      this.app.setStatus(`📝 Claude chưa soạn được câu trả lời: ${error}`, "err");
     } finally {
       this.app.done("feedback");
     }
-    this.review(source, origin, page, qs, answers);
+    answers = { ...positiveDefaults(qs), ...answers };   // ratings filled even without Claude
+    this.review(source, origin, page, qs, answers, sig, error);
+  }
+
+  send(source, origin, answers, status) {
+    try {
+      source.postMessage({ type: "lt-fill", answers }, origin);
+      this.app.setStatus(status, "ok");
+    } catch (e) {
+      this.app.setStatus(`📝 Tab khảo sát đã đóng (${e.message || e}) — mở lại và chạy dấu trang.`, "err");
+    }
   }
 
   /** Every answer to review / edit; "Điền vào form" sends them to the survey tab. */
-  review(source, origin, page, qs, answers) {
+  review(source, origin, page, qs, answers, sig = "", error = "") {
     const body = el("div", "lform fbPanel");
-    body.append(el("p", "hint", `${qs.length} câu hỏi trên trang “${page.title || page.url}”. Sửa nếu cần, rồi bấm Điền vào form.`));
+    body.append(el("p", error ? "hint fbWarn" : "hint", error
+      ? `⚠ Claude chưa soạn được (${error}) — các câu chấm điểm đã chọn sẵn mức tích cực nhất; bạn tự viết các câu còn lại.`
+      : `${qs.length} câu hỏi trên trang “${page.title || page.url}”. Claude đã soạn sẵn (điểm tích cực cao, theo nội dung ` +
+        "buổi học). Sửa nếu cần, rồi bấm Điền vào form. App không tự gửi: bạn bấm Next / Submit trên trang."));
     const getters = [];
     for (const q of qs) {
       const a = answers[q.qid] || {};
@@ -294,16 +340,16 @@ export class Feedback {
     }
     const row = el("div", "actions");
     const cancel = el("button", "", "Huỷ");
-    cancel.onclick = () => this.app.closeSheet();
+    let done = false;
+    const finish = () => { if (!done) { done = true; this.waiting.delete(sig); } };
+    cancel.onclick = () => { finish(); this.app.closeSheet(); };
+    document.getElementById("sheet").addEventListener("close", finish, { once: true });
     const ok = el("button", "primary", "✍️ Điền vào form");
     ok.onclick = () => {
       const filled = getters.map((g) => g());
-      try {
-        source.postMessage({ type: "lt-fill", answers: filled }, origin);
-        this.app.setStatus("📝 Đã gửi câu trả lời — quay lại tab khảo sát, kiểm tra rồi tự bấm Next / Submit.", "ok");
-      } catch (e) {
-        this.app.setStatus(`📝 Tab khảo sát đã đóng (${e.message || e}) — mở lại và chạy dấu trang.`, "err");
-      }
+      if (sig) this.answered.set(sig, filled);       // refilled if this page reloads
+      finish();
+      this.send(source, origin, filled, "📝 Đã gửi câu trả lời — quay lại tab khảo sát, kiểm tra rồi tự bấm Next / Submit.");
       this.app.closeSheet();
     };
     row.append(el("span", "spacer"), cancel, ok);
