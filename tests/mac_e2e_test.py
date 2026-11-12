@@ -939,7 +939,8 @@ if getattr(app, "IS_MAC", False) and os.path.exists(os.path.join(ROOT, "feedback
         for q in qs:
             if q.get("type") == "textarea":
                 ans[q["qid"]] = {"qid": q["qid"], "choice": "", "choices": [], "text": "Bài giảng rất rõ ràng, cảm ơn thầy."}
-        feedback.write_answers([os.path.join(io_dir, "a_1.json")], ans)
+        # like the review dialog's "Điền vào form": a list of answers
+        feedback.write_answers([os.path.join(io_dir, "a_1.json")], list(ans.values()))
         fpath, t1 = os.path.join(io_dir, "filled_1.json"), time.time()
         while not os.path.exists(fpath) and time.time() - t1 < 30 and fproc.poll() is None:
             pump(0.3)
