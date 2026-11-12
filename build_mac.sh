@@ -47,6 +47,7 @@ fi
   "${ADD[@]}" --collect-all ctranslate2 --collect-all vosk --collect-all sherpa_onnx \
   --collect-all pymupdf --hidden-import learning \
   --hidden-import source_browser --collect-all webview \
+  --hidden-import feedback --hidden-import feedback_browser --collect-all zxingcpp \
   --hidden-import objc --hidden-import Foundation --hidden-import AppKit --hidden-import WebKit \
   --hidden-import PyObjCTools --hidden-import Quartz --hidden-import Security --hidden-import UniformTypeIdentifiers \
   --collect-data faster_whisper --exclude-module onnxruntime --exclude-module torch \
@@ -94,6 +95,7 @@ if pgrep -f "$APP/Contents/MacOS/" >/dev/null; then
 fi
 echo "--- selftest ---"; cat "$SELFTEST" 2>/dev/null || echo "(no selftest.txt)"; echo
 grep -q '^OK' "$SELFTEST" 2>/dev/null || { echo "Selftest failed"; exit 1; }
+grep -q '^qr reader: ok' "$SELFTEST" || { echo "Selftest: QR reader (zxing-cpp) missing from the app"; exit 1; }
 if [ -f vendor/ant ]; then   # the "Sign in with Claude" tool must be inside the app, not just on this Mac
   grep -q "^ant: .*\.app/.*vendor/ant$" "$SELFTEST" || { echo "Selftest: bundled ant not found"; exit 1; }
 fi

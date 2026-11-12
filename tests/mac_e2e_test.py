@@ -29,7 +29,13 @@ sys.stdout.reconfigure(encoding="utf-8")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 OUT = sys.argv[1]
-SEGMENTS = [a.split(":", 1) for a in sys.argv[2:]]          # [(speaker letter, wav path)]
+def _seg(arg):
+    spk, rest = arg.split(":", 1)
+    m = re.match(r"(.*):([0-9.]+)$", rest)
+    return (spk, m.group(1), float(m.group(2))) if m else (spk, rest, 1.0)
+
+
+SEGMENTS = [_seg(a) for a in sys.argv[2:]]                 # [(speaker letter, wav path, level)]
 os.makedirs(OUT, exist_ok=True)
 
 import sounddevice                                   # noqa: E402
@@ -84,10 +90,10 @@ messagebox.askokcancel = lambda *a, **k: True
 # ---- fake microphone: plays the segments in real time through the app's own callback ----
 SR = app.SAMPLE_RATE
 parts, seg_times, t = [np.zeros(SR, np.float32)], [], 1.0
-for spk, path in SEGMENTS:
+for spk, path, level in SEGMENTS:
     with wave.open(path) as w:
         assert w.getframerate() == SR and w.getnchannels() == 1 and w.getsampwidth() == 2, path
-        a = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768
+        a = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768 * level
     seg_times.append((spk, t, t + len(a) / SR))
     parts += [a, np.zeros(int(SR * 1.5), np.float32)]
     t += len(a) / SR + 1.5
@@ -244,6 +250,12 @@ shot("04_user_scrolled_up")
 # --- rest of the speech arrives while the user reads above ---
 at(seg_times[-1][2] + 8)
 st = mw.status.cget("text")
+QUIET_WORDS = ["final", "exam", "wednesday", "library"]
+if any(lv < 1.0 for _s, _p, lv in SEGMENTS):
+    eng = mw.left.get("1.0", "end").lower()
+    heard = [w for w in QUIET_WORDS if w in eng]
+    lv = min(lv for _s, _p, lv in SEGMENTS)
+    check("far_quiet_voice_recognized", len(heard) >= 2, f"voice at {lv:.0%} level: heard {heard} of {QUIET_WORDS}")
 check("mic_silence_warning", "Micro không gửi âm thanh" in st,
       f"{st[:90]} | zero seconds counted: {getattr(mw.recognizer, 'zero_seconds', '?')}; "
       f"audio blocks waiting now: {mw.recognizer.audio_q.qsize()}")
@@ -866,6 +878,105 @@ if getattr(app, "IS_MAC", False) and os.path.exists(os.path.join(ROOT, "source_b
         check("source_login_browser_scans_page", False, repr(e)[:200])
     finally:
         lsrv.shutdown()
+
+# --- v1.9.16+: Feedback - read a survey link from a QR code (the app's own reader, in a separate process so
+#     a crash in the native QR library shows up as a failed check, not a dead test) ---
+try:
+    import qrcode                                        # test-only QR maker (pure Python)
+    survey = "https://forms.example.org/s/course-feedback?id=42"
+    from PIL import Image as _Img
+    slide = _Img.new("RGB", (1280, 720), "white")
+    slide.paste(qrcode.make(survey).get_image().convert("RGB").resize((240, 240)), (900, 380))
+    qpng = os.path.join(OUT, "slide_with_qr.png")
+    slide.save(qpng)
+    r = subprocess.run([sys.executable, "-c", "import sys, json; sys.path.insert(0, sys.argv[1]); import feedback; "
+                        "from PIL import Image; print(json.dumps(feedback.qr_urls(Image.open(sys.argv[2]))))",
+                        ROOT, qpng], capture_output=True, text=True, timeout=120)
+    got = json.loads(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 and r.stdout.strip() else None
+    check("feedback_qr_link_read", got is not None and survey in got and app._qr_selftest() == "ok",
+          f"read {got}" if got is not None else f"QR reader process failed (exit {r.returncode}): {r.stderr[-200:]}")
+except ImportError:
+    results["notes"].append("QR check skipped: the test-only 'qrcode' package is not installed")
+except Exception as e:  # noqa: BLE001
+    check("feedback_qr_link_read", False, repr(e)[:200])
+
+# --- v1.9.16+: Feedback window (pywebview) reads the survey's questions, the app's answers are filled in ---
+if getattr(app, "IS_MAC", False) and os.path.exists(os.path.join(ROOT, "feedback_browser.py")):
+    import http.server
+    import socketserver
+    import feedback
+    fsite = os.path.join(OUT, "survey_site")
+    os.makedirs(fsite, exist_ok=True)
+    with open(os.path.join(fsite, "survey.html"), "w", encoding="utf-8") as f:
+        f.write('<html><body><h1>Course feedback</h1><form>'
+                '<p>How satisfied were you with the course?</p>'
+                '<label><input type="radio" name="sat" value="1"> Very dissatisfied</label>'
+                '<label><input type="radio" name="sat" value="2"> Dissatisfied</label>'
+                '<label><input type="radio" name="sat" value="3"> Satisfied</label>'
+                '<label><input type="radio" name="sat" value="4"> Very satisfied</label>'
+                '<p>What did you like most?</p><textarea name="like"></textarea>'
+                '<button type="button">Submit</button></form></body></html>')
+
+    class Q(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **k):
+            super().__init__(*a, directory=fsite, **k)
+
+        def log_message(self, *a):
+            pass
+    fsrv = socketserver.TCPServer(("127.0.0.1", 0), Q)
+    threading.Thread(target=fsrv.serve_forever, daemon=True).start()
+    io_dir = os.path.join(OUT, "feedback_io")
+    os.makedirs(io_dir, exist_ok=True)
+    fproc = subprocess.Popen([sys.executable, os.path.join(ROOT, "app.py"), "--feedback-browser",
+                              f"http://127.0.0.1:{fsrv.server_address[1]}/survey.html", io_dir,
+                              os.path.join(OUT, "feedback_profile")])
+    try:
+        qpath, t0 = os.path.join(io_dir, "q_1.json"), time.time()
+        while not os.path.exists(qpath) and time.time() - t0 < 60 and fproc.poll() is None:
+            pump(0.3)
+        qs = json.load(open(qpath, encoding="utf-8")).get("questions", []) if os.path.exists(qpath) else []
+        ans = feedback.positive_defaults(qs)
+        for q in qs:
+            if q.get("type") == "textarea":
+                ans[q["qid"]] = {"qid": q["qid"], "choice": "", "choices": [], "text": "Bài giảng rất rõ ràng, cảm ơn thầy."}
+        feedback.write_answers([os.path.join(io_dir, "a_1.json")], ans)
+        fpath, t1 = os.path.join(io_dir, "filled_1.json"), time.time()
+        while not os.path.exists(fpath) and time.time() - t1 < 30 and fproc.poll() is None:
+            pump(0.3)
+        filled = json.dumps(json.load(open(fpath, encoding="utf-8")), ensure_ascii=False) if os.path.exists(fpath) else ""
+        check("feedback_window_reads_and_fills_survey",
+              len(qs) >= 2 and "Very satisfied" in json.dumps(ans) and "rõ ràng" in filled,
+              f"{len(qs)} questions {[q.get('type') for q in qs]}; filled: {filled[:160]}")
+    except Exception as e:  # noqa: BLE001
+        check("feedback_window_reads_and_fills_survey", False, repr(e)[:200])
+    finally:
+        if fproc.poll() is None:
+            fproc.kill()                                   # the user would press Submit and close it
+        fsrv.shutdown()
+
+# --- v1.9.11: the session is saved (reopened at the next start); "Phiên mới" keeps a backup and clears ---
+if hasattr(mw, "_autosave") and hasattr(mw, "new_session"):
+    apath = os.path.join(app.DATA_DIR, app.AUTOSAVE_FILE)
+    n_before = len(mw.uid_spk)
+    mw._autosave(force=True)
+    saved = json.load(open(apath, encoding="utf-8")) if os.path.exists(apath) else {}
+    check("session_autosaved", len(saved.get("rows", [])) == n_before and n_before > 0,
+          f"{len(saved.get('rows', []))} rows saved of {n_before} at {apath}")
+    bdir = app.output_dir("Backup") or os.path.join(app.DATA_DIR, "backups")
+    before = set(os.listdir(bdir)) if os.path.isdir(bdir) else set()
+    mw.new_session()
+    t0 = time.time()
+    while (mw.restoring() if hasattr(mw, "restoring") else False) and time.time() - t0 < 30:
+        pump(0.2)
+    pump(1)
+    after = set(os.listdir(bdir)) if os.path.isdir(bdir) else set()
+    check("new_session_backs_up_and_clears", len(after - before) == 1 and not letters(mw.left),
+          f"new backup {sorted(after - before)}; English pane now {len(letters(mw.left))} chars")
+    for f in (apath,):
+        try:
+            os.remove(f)                                   # don't leave a session to reopen in the repo folder
+        except OSError:
+            pass
 
 # --- clean exit: no extra processes, no hang ---
 save_results()

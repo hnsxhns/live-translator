@@ -6,6 +6,7 @@ Login with an Anthropic (Claude) API key, then press ON to:
   - bottom pane: running Vietnamese key takeaways (Claude)
 """
 
+import hashlib
 import json
 import os
 import queue
@@ -25,10 +26,16 @@ for _name in ("stdout", "stderr"):
         setattr(sys, _name, open(os.devnull, "w", encoding="utf-8"))
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
+if "--feedback-browser" in sys.argv:        # the Feedback survey window (Learning menu), its own process too
+    import feedback_browser
+    _i = sys.argv.index("--feedback-browser")
+    feedback_browser.run(*sys.argv[_i + 1:_i + 4])     # survey url, exchange folder, profile
+    sys.exit(0)
+
 if "--source-browser" in sys.argv:          # the Source login window runs as its own small process
     import source_browser
     _i = sys.argv.index("--source-browser")
-    source_browser.run(*sys.argv[_i + 1:_i + 4])
+    source_browser.run(*sys.argv[_i + 1:_i + 5])     # url, result file, profile, saved clicks
     sys.exit(0)
 
 import anthropic
@@ -37,7 +44,7 @@ import numpy as np
 import learning
 
 # ---------------- Settings ----------------
-APP_VERSION = "1.9.9.1"            # shown in the title bar and used in the portable build's name
+APP_VERSION = "1.9.20"            # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # The login client waits at most 20 s for data (right for live translation). Chat and the Learning menu send
 # whole documents, and Claude can read/think longer than that before the first word: give them more time.
@@ -49,23 +56,76 @@ FRAME = 480                      # 30 ms frames
 VOSK_MODEL = "vosk-en-small"      # streaming model for live words (fast: ~0.2 s per 1 s audio)
 UTT_SOFT = 3.0                   # after this long, cut the utterance at the next short pause (s)
 UTT_HARD = 7.0                   # always cut by this length (s)
+QUIET_ADD = float(os.environ.get("LT_QUIET_ADD") or 0.0005)   # pause = below 2x room noise + this; was 0.002,
+                                 # which a far voice (no microphone) never rose above: every sentence was cut
+UTT_MIN = 1.8                    # a piece Vosk ends before this is joined with what follows, unless a real
+                                 # pause (>= 0.6 s) comes: far voices have short gaps mid-sentence
 # phrases Whisper is known to invent on short or unclear audio (learned from video subtitles)
 HALLUCINATION = re.compile(r"thank(s| you) for watching|please (like and )?subscribe|subtitles? by|"
                            r"see you (in the )?next (video|time)|amara\.org|transcribed by", re.I)
 TEACHER_MINUTES = 10             # whoever has spoken this long becomes "Teacher" (several -> Teacher 1, 2...)
 TEACHER_EARLY_MINUTES = 3        # ...or sooner: the main speaker (half of all speech so far) after this long
-SUMMARY_EVERY = 25.0             # refresh key takeaways this often (seconds)
+SUMMARY_EVERY = 60.0             # refresh key takeaways this often (s); was 25 s: 2.4x the Claude calls
+SUMMARY_MODEL = "claude-sonnet-5-5"   # takeaways are short notes: Sonnet writes them as well as Opus, cheaper
 # Folder next to the .exe (portable) or next to app.py.
 APP_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
 IS_MAC = sys.platform == "darwin"
-# Where settings are saved. On Mac the .app bundle is read-only (and signed), so use the user's
-# Application Support folder there; on Windows keep config.json next to the .exe (portable).
-if IS_MAC and getattr(sys, "frozen", False):
-    DATA_DIR = os.path.join(os.path.expanduser("~/Library/Application Support"), "LiveTranslator")
-    os.makedirs(DATA_DIR, exist_ok=True)
-else:
-    DATA_DIR = APP_DIR
+
+
+def stable_data_dir():
+    """Where settings, the Learning library (with its saved answers) and the last session live.
+
+    The portable .exe runs from a folder per version (%LOCALAPPDATA%\\LiveTranslator\\v<version>\\...), so data
+    kept there was lost at every update: login, library, Agenda/exercise answers (Claude had to read and
+    catalogue every document again, which costs credit). On Windows the data now lives in one folder for
+    all versions; the first run copies it from the newest older version."""
+    if IS_MAC and getattr(sys, "frozen", False):
+        # Mac: the .app bundle is read-only and signed; Application Support is already one folder for
+        # every version, so nothing has to be copied over
+        d = os.path.join(os.path.expanduser("~/Library/Application Support"), "LiveTranslator")
+        os.makedirs(d, exist_ok=True)
+        return d
+    base = os.environ.get("LOCALAPPDATA") if getattr(sys, "frozen", False) and sys.platform == "win32" else ""
+    if not base:
+        return APP_DIR
+    d = os.path.join(base, "LiveTranslator", "data")
+    if not os.path.exists(os.path.join(d, "config.json")) and not os.path.isdir(os.path.join(d, "learning")):
+        try:
+            import glob
+            olds = [os.path.dirname(p) for p in glob.glob(os.path.join(base, "LiveTranslator", "v*", "*", "config.json"))]
+            olds += [os.path.dirname(os.path.dirname(p)) for p in
+                     glob.glob(os.path.join(base, "LiveTranslator", "v*", "*", "learning", "library.json"))]
+            olds = [o for o in set(olds) | {APP_DIR} if os.path.isdir(o)]
+            newest = lambda o: max([os.path.getmtime(p) for p in (os.path.join(o, "config.json"),
+                                    os.path.join(o, "learning", "library.json")) if os.path.exists(p)] or [0])
+            src = max(olds, key=newest) if olds else None
+            os.makedirs(d, exist_ok=True)
+            if src and newest(src):
+                if os.path.exists(os.path.join(src, "config.json")):
+                    shutil.copy2(os.path.join(src, "config.json"), os.path.join(d, "config.json"))
+                if os.path.isdir(os.path.join(src, "learning")):
+                    shutil.copytree(os.path.join(src, "learning"), os.path.join(d, "learning"),
+                                    ignore=shutil.ignore_patterns("source_browser", "source_page_*"),
+                                    dirs_exist_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
+    os.makedirs(d, exist_ok=True)
+    # the High-quality model (486 MB) downloaded by an older version: reuse it instead of downloading again
+    if not os.path.exists(os.path.join(d, "models", "small.en", "model.bin")):
+        try:
+            import glob
+            found = glob.glob(os.path.join(base, "LiveTranslator", "v*", "*", "models", "small.en", "model.bin"))
+            if found:
+                shutil.copytree(os.path.dirname(max(found, key=os.path.getmtime)),
+                                os.path.join(d, "models", "small.en"), dirs_exist_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
+    return d
+
+
+DATA_DIR = stable_data_dir()         # settings, Learning library (DATA_DIR/learning), last session
 CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+AUTOSAVE_FILE = "session_autosave.json"     # in DATA_DIR: the session on screen, reopened at the next start
 # Fonts: Segoe UI / Consolas only exist on Windows
 UI_FONT = "Helvetica Neue" if IS_MAC else "Segoe UI"
 MONO_FONT = "Menlo" if IS_MAC else "Consolas"
@@ -167,7 +227,7 @@ def download_quality_model(progress):
     """Download Whisper small.en into <app folder>/models/small.en, calling progress(done_bytes, total_bytes)
     as it goes. Each file is written as .part and renamed when complete, so a cut download is never used."""
     import urllib.request
-    dst = quality_download_dir()
+    dst = os.path.join(DATA_DIR, "models", QUALITY_MODEL)     # one copy for every app version
     os.makedirs(dst, exist_ok=True)
     url = "https://huggingface.co/" + QUALITY_REPO + "/resolve/main/"
     head = lambda f: urllib.request.Request(url + f, method="HEAD", headers={"User-Agent": "LiveTranslator"})
@@ -225,12 +285,15 @@ HQ_KEEP_MB = 700
 
 def quality_model_path():
     """Folder of the high-quality Whisper model if it is already on this PC, else None."""
-    for base in (getattr(sys, "_MEIPASS", None), APP_DIR, DATA_DIR):
+    for base in (DATA_DIR, getattr(sys, "_MEIPASS", None), APP_DIR):   # DATA_DIR: kept across updates
         if base:
             p = os.path.join(base, "models", QUALITY_MODEL)
             if os.path.isfile(os.path.join(p, "model.bin")):
                 return p
     return None
+
+
+VOSK_QUIET_TARGET = float(os.environ.get("LT_VOSK_TARGET") or 0.02)   # speech below this (RMS) is raised for Vosk
 
 
 class AudioCleaner:
@@ -245,12 +308,16 @@ class AudioCleaner:
     TARGET = 0.08                      # speech loudness (RMS) the recognisers see
     MAX_GAIN = 10.0
 
-    def __init__(self, cutoff=100.0, sr=SAMPLE_RATE):
+    def __init__(self, cutoff=100.0, sr=SAMPLE_RATE, highpass=True, target=None):
         n = np.arange(self.TAPS) - (self.TAPS - 1) / 2
         low = np.sinc(2 * cutoff / sr * n) * np.hamming(self.TAPS)
         low /= low.sum()
         self.fir = -low
         self.fir[(self.TAPS - 1) // 2] += 1.0          # high-pass = all-pass minus low-pass
+        self.target = target or self.TARGET
+        if not highpass:                               # level boost only (Vosk: the filter hurt it in noise)
+            self.fir = np.zeros(self.TAPS)
+            self.fir[(self.TAPS - 1) // 2] = 1.0
         self.tail = np.zeros(self.TAPS - 1, np.float32)
         self.gain = 1.0
         self.level = None                              # recent speech loudness (after filtering)
@@ -272,7 +339,7 @@ class AudioCleaner:
         if len(speech):
             v = float(np.sqrt((speech ** 2).mean()))
             self.level = v if self.level is None else self.level + (v - self.level) * (0.5 if v > self.level else 0.15)
-            want = min(self.MAX_GAIN, max(1.0, self.TARGET / max(self.level, 1e-5)))
+            want = min(self.MAX_GAIN, max(1.0, self.target / max(self.level, 1e-5)))
             want = min(want, max(1.0, 0.02 / max(floor, 1e-5)))  # noise stays quiet (floor x gain <= 0.02)
             self.gain += (want - self.gain) * (0.6 if want < self.gain else 0.2)   # turn down faster than up
         ramp = np.linspace(start, self.gain, len(y), dtype=np.float32)              # no clicks
@@ -853,9 +920,13 @@ class Recognizer(threading.Thread):
         rec = vosk.KaldiRecognizer(self.vosk_model, SAMPLE_RATE)
         utt = []                       # audio of the current utterance
         utt_len = 0
+        voiced = 0.0                   # how long this utterance was clearly louder than the room
+        held = ""                      # words of a too-short piece, waiting to be joined with the rest
         last_partial = ""
         rms_hist = []                  # recent 30 ms loudness values -> background-noise floor
-        cleaner = AudioCleaner()       # hum/rumble filter + level boost for quiet or far speakers (Whisper only)
+        cleaner = AudioCleaner()       # hum/rumble filter + level boost for quiet or far speakers (Whisper)
+        booster = AudioCleaner(highpass=False, target=VOSK_QUIET_TARGET)   # for Vosk: only a QUIET voice is
+        # raised (a far voice at 1/40 of a close one was silence to it); a normal voice reaches Vosk unchanged
         quiet = 0.0                    # how long it has been quiet (s)
         zero_s, warned_zero = 0.0, False     # seconds of exact-zero audio (no microphone access)
         with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
@@ -892,34 +963,49 @@ class Recognizer(threading.Thread):
                 del rms_hist[:-400]
                 floor = float(np.percentile(rms_hist, 20)) if len(rms_hist) > 30 else 0.004
                 for v in rms:
-                    quiet = quiet + FRAME / SAMPLE_RATE if v < floor * 2.0 + 0.002 else 0.0
+                    quiet = quiet + FRAME / SAMPLE_RATE if v < floor * 2.0 + QUIET_ADD else 0.0
+                    if v > floor * 3.0 + QUIET_ADD * 0.5:
+                        voiced += FRAME / SAMPLE_RATE
                 secs = utt_len / SAMPLE_RATE
 
-                pcm16 = (np.clip(block, -1, 1) * 32767).astype(np.int16).tobytes()
+                pcm16 = (booster.process(block) * 32767).astype(np.int16).tobytes()
                 if rec.AcceptWaveform(pcm16):
-                    self._end_utterance(json.loads(rec.Result()), utt)
-                    utt, utt_len, last_partial = [], 0, ""
+                    words = (held + " " + json.loads(rec.Result()).get("text", "")).strip()
+                    if secs < UTT_MIN and words:          # too short for a sentence: keep listening
+                        held = words
+                    else:
+                        self._end_utterance({"text": words}, utt, voiced)
+                        utt, utt_len, last_partial, voiced, held = [], 0, "", 0.0, ""
                 # (no earlier cut for short sentences: speakers hesitate ~0.4-0.5 s mid-sentence, and cutting
                 # there split sentences into fragments that were recognised and translated worse)
-                elif (secs >= UTT_SOFT and quiet >= 0.2) or secs >= UTT_HARD:
-                    self._end_utterance(json.loads(rec.FinalResult()), utt)
-                    utt, utt_len, last_partial = [], 0, ""
+                elif (secs >= UTT_SOFT and quiet >= 0.2) or secs >= UTT_HARD or (held and quiet >= 0.6):
+                    words = (held + " " + json.loads(rec.FinalResult()).get("text", "")).strip()
+                    self._end_utterance({"text": words}, utt, voiced)
+                    utt, utt_len, last_partial, voiced, held = [], 0, "", 0.0, ""
                 else:
-                    partial = json.loads(rec.PartialResult()).get("partial", "")
+                    partial = (held + " " + json.loads(rec.PartialResult()).get("partial", "")).strip()
                     if partial != last_partial:
                         last_partial = partial
                         self.ui_q.put(("partial", partial))
-            self._end_utterance(json.loads(rec.FinalResult()), utt)
+            self._end_utterance({"text": (held + " " + json.loads(rec.FinalResult()).get("text", "")).strip()},
+                                utt, voiced)
         self.whisper_q.put(None)                  # flush marker: stop -> translate the rest
         self.ui_q.put(("status", "Đã tắt."))
 
-    def _end_utterance(self, result, utt):
+    def _end_utterance(self, result, utt, voiced=1.0):
         draft = result.get("text", "").strip()
-        if draft in ("", "the", "huh", "uh", "um"):    # Vosk heard no real words: skip Whisper
-            self.ui_q.put(("partial", ""))
+        if not utt:
             return
         raw = np.concatenate([u[0] for u in utt])       # as recorded: voiceprints, Whisper small.en
         audio = np.concatenate([u[1] for u in utt])     # cleaned: Whisper base.en
+        if draft in ("", "the", "huh", "uh", "um"):
+            # Vosk heard no words. A quiet or far voice (no microphone) can still be speech that Whisper hears
+            # well: let it decide when the boosted audio has voice-loud parts; real silence is skipped.
+            # (voiced: seconds clearly louder than the room's own noise, measured on the audio as recorded)
+            if len(audio) < 0.6 * SAMPLE_RATE or voiced < 0.4:
+                self.ui_q.put(("partial", ""))
+                return
+            draft = ""
         self.utt_id += 1
         vec = None
         if self.spk_model is not None and len(raw) > SAMPLE_RATE // 2:
@@ -930,7 +1016,8 @@ class Recognizer(threading.Thread):
         sid = self.speakers.assign(vec, len(audio) / SAMPLE_RATE)
         self.utt_spk[self.utt_id] = sid
         self.ui_q.put(("speaker", (self.utt_id, sid, dict(self.speakers.talk), dict(self.speakers.merged))))
-        self.ui_q.put(("draft", (self.utt_id, draft)))
+        if draft:                                       # (no draft: the row appears when Whisper has text)
+            self.ui_q.put(("draft", (self.utt_id, draft)))
         self.whisper_q.put((self.utt_id, draft, audio, sid, raw))
 
     def _whisper_worker(self):
@@ -949,18 +1036,39 @@ class Recognizer(threading.Thread):
                 text = self.transcribe(audio, model)
             except Exception:  # noqa: BLE001
                 text = ""
-            draft = " ".join(x[1] for x in items)
-            n_w, n_d = len(text.split()), len(draft.split())
-            # empty, or far longer than what Vosk heard (Whisper sometimes invents text on cut-off
-            # audio) -> use the live draft instead
-            words = lambda s: set(re.sub(r"[^a-z0-9' ]", " ", s.lower()).split())
-            shared = len(words(text) & words(draft)) / max(1, len(words(draft)))
-            invented = (HALLUCINATION.search(text) and not HALLUCINATION.search(draft)) or \
-                (n_d <= 3 and shared < 0.5)          # a few words heard, Whisper wrote something else
-            if not text.strip(" .,!?-'\"") or n_w > 2 * n_d + 3 or invented:
-                text = draft[:1].upper() + draft[1:]
+            draft = " ".join(x[1] for x in items).strip()
+            text = self.choose_text(draft, text, len(audio) / SAMPLE_RATE)
+            if not text:                                # nothing heard after all (no draft, no Whisper text)
+                continue
+            if not draft:                               # Vosk heard nothing: the row starts with Whisper's text
+                self.ui_q.put(("draft", (ids[0], text)))
             self.context = (self.context + " " + text)[-400:]
             self.on_final(ids, text)
+
+    @staticmethod
+    def choose_text(draft, text, secs):
+        """The text a finished utterance shows: Whisper's, unless it is clearly invented (a known phrase, or more
+        words than anyone says in that time); then Vosk's live draft. Before 1.9.20 a Whisper text much longer
+        than the draft was thrown away - exactly what happens with a far speaker, where Vosk hears little."""
+        cap = lambda s: s[:1].upper() + s[1:]
+        d = draft.strip()
+        clean = text.strip(" .,!?-'\"")
+        n_w, n_d = len(text.split()), len(d.split())
+        if not clean:
+            return cap(d)
+        if HALLUCINATION.search(text) and not HALLUCINATION.search(d):
+            return cap(d)
+        if n_w > 4.5 * secs + 3:                        # faster than anyone speaks: invented
+            return cap(d)
+        if not d:                                       # only Whisper heard it: drop its usual noise guesses
+            if n_w <= 2 and re.fullmatch(r"(you|thank you|thanks|bye|okay|ok|uh|um|hmm|so)[.!?]?", clean.lower()):
+                return ""
+            return text
+        words = lambda s: set(re.sub(r"[^a-z0-9' ]", " ", s.lower()).split())
+        shared = len(words(text) & words(d)) / max(1, len(words(d)))
+        if n_d <= 3 and n_w <= 4 and shared < 0.5:     # a short guess that disagrees with what Vosk heard
+            return cap(d)
+        return text
 
 
 # =====================================================================
@@ -1095,6 +1203,22 @@ def friendly_error(e):
     return f"Lỗi Claude: {str(e)[:160]}"
 
 
+def short_error(e):
+    """A few words for the Vietnamese pane: why this segment has no translation."""
+    s = str(e).lower()
+    if "credit balance" in s:
+        return "tài khoản API hết credit"
+    if isinstance(e, anthropic.AuthenticationError):
+        return "cần đăng nhập lại"
+    if isinstance(e, anthropic.RateLimitError) or "overloaded" in s:
+        return "Claude đang quá tải"
+    if isinstance(e, anthropic.APITimeoutError) or "timed out" in s:
+        return "Claude trả lời quá lâu"
+    if isinstance(e, anthropic.APIConnectionError):
+        return "mất kết nối mạng"
+    return "lỗi Claude"
+
+
 # Translation speed presets (shown in the top bar). Thinking is switched off for speed where the model allows.
 TRANSLATE_PRESETS = {
     "Nhanh (Sonnet 5.5)": ("claude-sonnet-5-5", {"type": "between_tools"}),
@@ -1213,11 +1337,14 @@ class Translator:
                 self.ui_q.put(("vi_replace", (uid, g, out.strip())))
         except Exception as e:  # noqa: BLE001
             if stream:
-                self.ui_q.put(("vi_piece", (uid, g, "[chưa dịch được đoạn này]")))
+                self.ui_q.put(("vi_piece", (uid, g, f"[chưa dịch được: {short_error(e)}]")))
             self.ui_q.put(("error", friendly_error(e)))
         with self.lock:
             if self.gen.get(uid) == g:
                 self.vi[uid] = out.strip()
+
+
+BACKGROUND_HEAD = "Bối cảnh (buổi học / thư viện tài liệu):\n"   # starts the chat's cached background block
 
 
 class Chatter(threading.Thread):
@@ -1231,7 +1358,28 @@ class Chatter(threading.Thread):
               "answer, say so and answer from general knowledge if appropriate. The user may also have a "
               "study library (course documents uploaded from the Learning menu): its catalogue is given in "
               "<learning_library>, and documents from it may be attached to a question. Use them when relevant; "
-              "when tutoring an exercise, guide one step at a time and wait for the user.")
+              "when tutoring an exercise, guide one step at a time and wait for the user. "
+              "You have tools: read_library_documents reads the full text of library documents by their [id] "
+              "(already stored by the app, nothing is uploaded again) - use it when a question needs what a "
+              "document says (summaries, details, quotes); the catalogue descriptions are enough for an overview. "
+              "read_class_record reads the whole class record (English transcript, Vietnamese translation, all "
+              "key takeaways), optionally only the parts that mention a word - use it when the question is about "
+              "something earlier than the recent part you were given.")
+    TOOLS = [
+        {"name": "read_library_documents",
+         "description": "Full text of documents in the user's Learning library, by their ids from the catalogue "
+                        "(e.g. \"a1b2c3d4e5f6\"). At most 5 per call.",
+         "input_schema": {"type": "object", "properties": {"ids": {"type": "array", "items": {"type": "string"}}},
+                          "required": ["ids"]}},
+        {"name": "read_class_record",
+         "description": "The class record kept by the app: part = 'english' (transcript with speakers), "
+                        "'vietnamese' (translation), 'both' (English and Vietnamese line by line) or 'takeaways' "
+                        "(all key takeaways with times). Optional search: only the lines that mention it (with a "
+                        "little context). Without search: the most recent part (up to max_chars).",
+         "input_schema": {"type": "object", "properties": {
+             "part": {"type": "string", "enum": ["english", "vietnamese", "both", "takeaways"]},
+             "search": {"type": "string"}, "max_chars": {"type": "integer"}}, "required": ["part"]}},
+    ]
 
     def __init__(self, client, ui_q, get_context):
         super().__init__(daemon=True)
@@ -1241,49 +1389,167 @@ class Chatter(threading.Thread):
         self.q = queue.Queue()
         self.history = []          # past turns: [{"role": ..., "content": ...}, ...]
         self.get_library = None    # -> catalogue text of the Learning library ("" if empty)
+        self.tool_handler = None   # (name, input) -> text, set by the main window (library documents, class record)
+
+    @staticmethod
+    def doc_key(b):
+        """Identity of an attached document/image block (None for normal text)."""
+        t = b.get("type")
+        if t in ("document", "image"):
+            src = b.get("source") or {}
+            if src.get("file_id"):
+                return "file:" + src["file_id"]
+            data = src.get("data") or src.get("url") or ""
+            return "data:" + hashlib.sha1(str(data).encode("utf-8", "ignore")).hexdigest()
+        if t == "text" and b.get("text", "").startswith("<file "):
+            return "text:" + hashlib.sha1(b["text"].encode("utf-8", "ignore")).hexdigest()
+        return None
+
+    @classmethod
+    def without_repeats(cls, messages):
+        """Each document is sent once per request: a document already attached earlier in the conversation
+        (e.g. the exercise file at every step) is replaced by a one-line note instead of being sent again."""
+        seen, out = set(), []
+        for m in messages:
+            if m["role"] != "user" or not isinstance(m["content"], list):
+                out.append(m)
+                continue
+            content = []
+            for b in m["content"]:
+                k = cls.doc_key(b)
+                if k and k in seen:
+                    name = b.get("title") or (re.match(r'<file name="([^"]*)"', b.get("text", "")) or [None, ""])[1]
+                    content.append({"type": "text", "text": f"(tài liệu {name or 'đính kèm'} đã gửi ở trên)"})
+                    continue
+                if k:
+                    seen.add(k)
+                keep = b.get("type") == "text" and b.get("text", "").startswith(BACKGROUND_HEAD)
+                # old cache points go (only the newest question gets one), but the background block keeps its
+                # own: it is the big part that stays the same from question to question
+                content.append(b if keep else {key: v for key, v in b.items() if key != "cache_control"})
+            out.append({**m, "content": content})
+        return out
 
     @staticmethod
     def _with_cache(messages):
-        """Mark the newest attached file as a cache point, so follow-up questions about the same
-        documents (e.g. step-by-step exercise help) don't pay for them again."""
+        """Cache point at the end of the newest question: the next question (e.g. the next exercise step)
+        then reads the documents and the conversation so far from Claude's cache, at a tenth of the price,
+        instead of paying for them again."""
         out = list(messages)
-        for i in range(len(out) - 1, -1, -1):
-            m = out[i]
-            if m["role"] != "user" or not isinstance(m["content"], list):
-                continue
-            idx = [j for j, b in enumerate(m["content"])
-                   if b.get("type") != "text" or b.get("text", "").startswith("<file ")]
-            if idx:
-                content = list(m["content"])
-                content[idx[-1]] = {**content[idx[-1]], "cache_control": {"type": "ephemeral"}}
-                out[i] = {**m, "content": content}
-                break
+        m = out[-1]
+        if m["role"] == "user":
+            content = m["content"] if isinstance(m["content"], list) else [{"type": "text", "text": m["content"]}]
+            content = list(content)
+            content[-1] = {**content[-1], "cache_control": {"type": "ephemeral"}}
+            out[-1] = {**m, "content": content}
         return out
+
+    def _recent(self, n=20):
+        """The last turns of the conversation, starting at a question (never in the middle of a tool call)."""
+        h = self.history
+        start = max(0, len(h) - n)
+        while start < len(h):
+            m = h[start]
+            c = m["content"]
+            if m["role"] == "user" and not (isinstance(c, list) and c and c[0].get("type") == "tool_result"):
+                break
+            start += 1
+        return h[start:]
+
+    def _stream(self, convo, use_tools, on_piece):
+        """One request (streamed into the pane). Returns (final message or None, text)."""
+        for use_fallback in (True, False):
+            extra = {"output_config": {"effort": "medium"}}
+            headers = None
+            if use_fallback:
+                extra["fallbacks"] = "default"
+                headers = FALLBACK_HEADERS
+            text = ""
+            kw = dict(model=MODEL, max_tokens=16000, system=self.SYSTEM,
+                      messages=self._with_cache(self.without_repeats(convo)), extra_body=extra,
+                      extra_headers=headers)
+            if use_tools:
+                kw["tools"] = self.TOOLS
+            try:
+                with self.client.messages.stream(**kw) as st:
+                    for piece in st.text_stream:
+                        text += piece
+                        on_piece(piece)
+                    final = st.get_final_message() if hasattr(st, "get_final_message") else None
+                return final, text
+            except anthropic.BadRequestError as e:
+                if not use_fallback or text or "fallback" not in str(e).lower():
+                    raise
+        return None, ""
+
+    def _answer(self, messages, use_tools):
+        """Ask, and when Claude wants to read library documents or the class record, give them and continue.
+        Returns (final answer text, the tool messages added to the conversation)."""
+        convo, added = list(messages), []
+        on_piece = lambda p: self.ui_q.put(("chat_piece", p))
+        for _ in range(5):
+            final, text = self._stream(convo, use_tools, on_piece)
+            uses = [b for b in (getattr(final, "content", None) or []) if getattr(b, "type", "") == "tool_use"]
+            if not uses or getattr(final, "stop_reason", "") != "tool_use":
+                return text, added
+            asst = {"role": "assistant", "content": [
+                {"type": "text", "text": b.text} if b.type == "text" else
+                {"type": "tool_use", "id": b.id, "name": b.name, "input": b.input}
+                for b in final.content if (b.type == "text" and b.text) or b.type == "tool_use"]}
+            results = []
+            for u in uses:
+                what = (f"tài liệu {', '.join(u.input.get('ids', []))}" if u.name == "read_library_documents"
+                        else f"bản ghi buổi học ({u.input.get('part', '')}"
+                             f"{', tìm “' + u.input['search'] + '”' if u.input.get('search') else ''})")
+                self.ui_q.put(("status", f"📖 Claude đang đọc {what}..."))
+                try:
+                    out = self.tool_handler(u.name, u.input) or "(trống)"
+                except Exception as e:  # noqa: BLE001
+                    out = f"Không đọc được: {e}"
+                results.append({"type": "tool_result", "tool_use_id": u.id, "content": [{"type": "text", "text": out}]})
+            if text:
+                on_piece("\n")
+            step = [asst, {"role": "user", "content": results}]
+            convo += step
+            added += step
+        return text, added
 
     def run(self):
         while True:
-            question, files = self.q.get()        # files: content blocks (images, PDFs, text)
-            en, vi, summary = self.get_context()
-            context = (f"<transcript_english>\n{en or '(chưa có)'}\n</transcript_english>\n"
-                       f"<translation_vietnamese>\n{vi or '(chưa có)'}\n</translation_vietnamese>\n"
-                       f"<key_takeaways>\n{summary or '(chưa có)'}\n</key_takeaways>")
+            item = self.q.get()
+            question, files = item[0], item[1]     # files: content blocks (images, PDFs, text)
+            with_session = item[2] if len(item) > 2 else True
+            # The background (library catalogue, and the class transcript when needed) goes FIRST, as its own
+            # message: while it does not change (after class, working on exercises) Claude reads it from its
+            # cache at a tenth of the price instead of paying for it again on every question.
             library = self.get_library() if self.get_library else ""
+            context, live = "", False
+            if with_session:
+                en, vi, summary, live = self.get_context()
+                context = (f"<transcript_english>\n{en or '(chưa có)'}\n</transcript_english>\n"
+                           f"<translation_vietnamese_end>\n{vi or '(chưa có)'}\n</translation_vietnamese_end>\n"
+                           f"<key_takeaways>\n{summary or '(chưa có)'}\n</key_takeaways>")
             if library:
-                context += f"\n<learning_library>\n{library}\n</learning_library>"
-            # The latest session context rides on the newest question, so earlier turns stay unchanged.
+                context = f"<learning_library>\n{library}\n</learning_library>\n" + context
+            background = []
+            if context:
+                block = {"type": "text", "text": BACKGROUND_HEAD + context}
+                if not live:                       # while listening it changes every few seconds: no cache
+                    block["cache_control"] = {"type": "ephemeral"}
+                background = [{"role": "user", "content": [block]},
+                              {"role": "assistant", "content": "Đã nắm bối cảnh."}]
             # Files go before the text, and stay in the history so follow-up questions can refer to them.
-            messages = self.history[-20:] + [
-                {"role": "user", "content": files + [
-                    {"type": "text", "text": f"{context}\n\nCâu hỏi của tôi: {question}"}]}]
-            answer = ""
+            new_q = {"role": "user", "content": files + [{"type": "text", "text": f"Câu hỏi của tôi: {question}"}]}
+            messages = background + self._recent() + [new_q]
+            answer, added = "", []
             try:
-                answer = claude_stream(self.client, self.SYSTEM, self._with_cache(messages), "medium",
-                                       lambda p: self.ui_q.put(("chat_piece", p)), max_tokens=16000)
+                answer, added = self._answer(messages, use_tools=with_session and self.tool_handler is not None)
             except Exception as e:  # noqa: BLE001
                 self.ui_q.put(("chat_error", f"[{friendly_error(e)}]"))
             if answer.strip():
-                self.history += [{"role": "user", "content": files + [{"type": "text", "text": question}]},
-                                 {"role": "assistant", "content": answer.strip()}]
+                # kept exactly as sent (with any documents Claude read), so the next question starts with the
+                # same text and reads all of it from the cache
+                self.history += [new_q] + added + [{"role": "assistant", "content": answer.strip()}]
             self.ui_q.put(("chat_end", None))
 
 
@@ -1336,7 +1602,7 @@ class Summarizer(threading.Thread):
                           f"</existing_takeaways>\n"
                           f"<earlier_transcript_end>\n{before[-3000:] or '(none)'}\n</earlier_transcript_end>\n"
                           f"<new_transcript>\n{new}\n</new_transcript>")
-                out = claude_stream(self.client, self.SYSTEM, prompt, "medium").strip()
+                out = claude_stream(self.client, self.SYSTEM, prompt, "medium", model=SUMMARY_MODEL).strip()
                 self.done_n = n
                 if out and out.upper().strip(" .") != "NONE":
                     self.ui_q.put(("summary", out))
@@ -1422,6 +1688,7 @@ class MainWindow:
                       activeforeground="white", cursor="hand2", padx=8)
         tk.Button(top, text="📂 Restore", command=self.restore_session, **bstyle).pack(side="right", padx=(0, 12), pady=5)
         tk.Button(top, text="💾 Backup", command=self.backup_session, **bstyle).pack(side="right", padx=(0, 4), pady=5)
+        tk.Button(top, text="🆕 Phiên mới", command=self.new_session, **bstyle).pack(side="right", padx=(0, 4), pady=5)
 
         # Layout (translation mode):
         #   [strip] | English            | Tiếng Việt          | [strip]
@@ -1593,12 +1860,17 @@ class MainWindow:
         self.recognizer.start()
         self.summarizer.start()
         self.chatter.get_library = self.learning.lib.catalog_text
+        self.chatter.tool_handler = self._chat_tool              # Claude reads library files / the class record
         self.recognizer.glossary = learning.course_terms(self.learning.lib)
         self.summarizer.get_terms = lambda: self.recognizer.glossary      # same words help the takeaways
         if self.quality_var.get() == QUALITY_HIGH:
             self._set_quality(QUALITY_HIGH, startup=True)
         self.chatter.start()
         self.root.after(50, self._poll)
+        # the session survives closing the app: reopened now, saved every minute and when the window closes
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(400, self._reopen_last)
+        self.root.after(60_000, self._autosave_tick)
 
     def _place_sashes(self):
         """Pane sizes by ratio: EN/VI 3/4 + takeaways 1/4; Claude answers ~4/5 + prompt box."""
@@ -1819,7 +2091,10 @@ class MainWindow:
         if job and job["kind"] == "journal":
             self.learning.run_journal(q, job)     # fills the PDF template instead of a normal answer
             return
-        self.chatter.q.put((q, learn_blocks + [b for _, b in files]))
+        # Learning jobs about the documents (Agenda, exercises, a file...) don't need the class transcript:
+        # leaving it out makes them much cheaper. Questions and the class Summary get it.
+        with_session = not job or job["kind"] == "summary"
+        self.chatter.q.put((q, learn_blocks + [b for _, b in files], with_session))
 
     # ---- Backup / Restore of the whole session ----
     def _session_data(self):
@@ -1842,9 +2117,7 @@ class MainWindow:
             "takeaways": self.last_summary,
             "chat": self.chat_log,
             "chat_history": [m if isinstance(m["content"], str) else
-                             {"role": m["role"], "content": " ".join(
-                                 b.get("text", "") if b.get("type") == "text" else f"[file đính kèm: {b.get('title', b.get('type'))}]"
-                                 for b in m["content"])}
+                             {"role": m["role"], "content": " ".join(self._saved_block(b) for b in m["content"])}
                              for m in self.chatter.history],
         }
 
@@ -1867,6 +2140,94 @@ class MainWindow:
                                      detail=f"{len(self.uid_spk)} dòng, {n_take} mốc Key takeaways")
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("Backup lỗi", str(e), parent=self.root)
+
+    # ---- the session survives closing the app: saved every minute and on close, reopened at the next start ----
+    def _autosave(self, force=False):
+        """Save the session on screen to DATA_DIR (only when something changed). Never while a restore is
+        still filling the panes (that would save half a session)."""
+        if self.restoring():
+            return
+        sig = (len(self.uid_spk), len(self.last_summary), len(self.chat_log),
+               sum(len(v or "") for v in self.translator.vi.values()),
+               len(self.chat_log[-1].get("a", "")) if self.chat_log else 0)
+        if not force and sig == getattr(self, "_autosave_sig", None):
+            return
+        path = os.path.join(DATA_DIR, AUTOSAVE_FILE)
+        try:
+            data = self._session_data()
+            if not (data["rows"] or data["takeaways"] or data["chat"]):
+                if os.path.exists(path):
+                    os.remove(path)                   # an empty session: nothing to reopen
+            else:
+                with open(path + ".part", "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False)
+                os.replace(path + ".part", path)
+            self._autosave_sig = sig
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _autosave_tick(self):
+        self._autosave()
+        self.root.after(60_000, self._autosave_tick)
+
+    def _on_close(self):
+        if self.on:
+            self.toggle_onoff()
+        self._autosave(force=True)
+        if IS_MAC:
+            # stop the microphone / speech threads before Python shuts down (else macOS shows a crash report);
+            # also used for Cmd+Q (::tk::mac::Quit), so the session is saved either way
+            self.recognizer.running.clear()
+            self.root.after(400, lambda: (self.root.destroy(), os._exit(0)))
+            return
+        self.root.destroy()
+
+    def _reopen_last(self):
+        """At start: bring back the session that was on screen when the app was closed (its translations,
+        takeaways and answers are not asked from Claude again)."""
+        path = os.path.join(DATA_DIR, AUTOSAVE_FILE)
+        try:
+            data = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else None
+        except Exception:  # noqa: BLE001
+            data = None
+        if not data or data.get("app") != "LiveTranslator" or not (data.get("rows") or data.get("takeaways")
+                                                                    or data.get("chat")):
+            return
+
+        def done(problems):
+            self._autosave_sig = None
+            self.status.config(text=f"↺ Đã mở lại phiên trước ({len(data.get('rows', []))} dòng, lưu lúc "
+                                    f"{data.get('saved', '?')}). Bấm 🆕 Phiên mới để bắt đầu buổi khác.",
+                               fg="#7ee2a8" if not problems else "#ffd479")
+        self.load_session(data, done)
+
+    def new_session(self):
+        """Start an empty session; the current one is kept as a backup file first."""
+        from tkinter import messagebox
+        if self.restoring():
+            return
+        data = self._session_data()
+        if data["rows"] or data["takeaways"] or data["chat"]:
+            if not messagebox.askyesno("Phiên mới", "Lưu phiên hiện tại vào Backup rồi bắt đầu một phiên trống?",
+                                       parent=self.root):
+                return
+            folder = output_dir("Backup") or os.path.join(DATA_DIR, "backups")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, f"LiveTranslator_backup_{time.strftime('%Y%m%d_%H%M%S')}.json")
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=1)
+                self.learning.add_output("backup", path, f"Backup phiên nghe {time.strftime('%d/%m/%Y %H:%M')}",
+                                         detail=f"{len(self.uid_spk)} dòng (trước khi mở phiên mới)")
+            except Exception as e:  # noqa: BLE001
+                messagebox.showerror("Không lưu được backup", str(e), parent=self.root)
+                return
+        if self.on:
+            self.toggle_onoff()
+        self.load_session({"app": "LiveTranslator", "rows": [], "transcript": [], "takeaways": "", "chat": [],
+                           "chat_history": [], "speakers": {}},
+                          lambda p: (self._autosave(force=True),
+                                     self.status.config(text="🆕 Phiên mới — nhấn ON để bắt đầu.", fg="#ddd")))
 
     def restoring(self):
         """True while a restore is still putting rows in or lining them up (tells the user to wait)."""
@@ -2210,11 +2571,68 @@ class MainWindow:
         if self.take_follow:
             self.root.after_idle(lambda: w.see("end"))
 
+    @staticmethod
+    def _saved_block(b):
+        """How one message block is kept in the saved session (short text; files and documents are read again
+        from the library when needed, not stored twice)."""
+        t = b.get("type")
+        if t == "text":
+            return b.get("text", "")
+        if t == "tool_use":
+            return f"(Claude đọc: {b.get('name')} {json.dumps(b.get('input', {}), ensure_ascii=False)})"
+        if t == "tool_result":
+            return "(nội dung đã đọc — đọc lại khi cần)"
+        return f"[file đính kèm: {b.get('title', t)}]"
+
+    def _chat_tool(self, name, inp):
+        """What Claude asked to read (called from the chat thread): library documents by id, from the text the
+        app already keeps (nothing uploaded again), or the whole class record, optionally searched."""
+        if name == "read_library_documents":
+            lib, out, total = self.learning.lib, [], 0
+            for key in (inp.get("ids") or [])[:5]:
+                key = str(key).strip().strip("[]")
+                d = lib.get(key) or next((x for x in lib.docs() if key.lower() in
+                                          (x["name"] + " " + (x.get("title") or "")).lower()), None)
+                if not d:
+                    out.append(f'<document id="{key}">(không có trong thư viện)</document>')
+                    continue
+                text = lib.text(d) or "(file không có chữ đọc được, ví dụ ảnh hoặc PDF scan)"
+                text = text[:max(2000, 150_000 - total)][:60_000]
+                total += len(text)
+                out.append(f'<document id="{d["id"]}" name="{d["name"]}" title="{d.get("title") or ""}">\n'
+                           f'{text}\n</document>')
+            return "\n\n".join(out)
+        if name == "read_class_record":
+            part = inp.get("part") or "english"
+            limit = max(2000, min(int(inp.get("max_chars") or 30_000), 100_000))
+            if part == "takeaways":
+                text = self.last_summary
+            elif part == "english":
+                text = self.transcript_text()
+            else:
+                pairs = list(self.translator.history)
+                text = "\n".join(v for _, v in pairs) if part == "vietnamese" else \
+                    "\n".join(f"EN: {e}\nVI: {v}" for e, v in pairs)
+            if not text.strip():
+                return "(chưa có nội dung)"
+            term = (inp.get("search") or "").strip().lower()
+            if term:
+                lines = text.splitlines()
+                keep = sorted({j for i, l in enumerate(lines) if term in l.lower()
+                               for j in range(max(0, i - 1), min(len(lines), i + 2))})
+                if not keep:
+                    return f"(không có dòng nào nhắc tới “{inp.get('search')}”)"
+                text = "\n".join(lines[j] for j in keep)
+                return text[:limit] + ("\n…(còn nữa)" if len(text) > limit else "")
+            return ("…(phần trước còn nữa)\n" if len(text) > limit else "") + text[-limit:]
+        return "(không rõ công cụ)"
+
     def _chat_context(self):
-        """What Claude knows about the session when answering (read from the UI thread's data)."""
+        """What Claude knows about the session when answering (read from the UI thread's data). The Vietnamese
+        translation repeats the English, so only its end is sent (it would cost as much again)."""
         en = self.transcript_text()[-40000:]
-        vi = "\n".join(v for _, v in self.translator.history)[-20000:]
-        return en, vi, self.last_summary
+        vi = "\n".join(v for _, v in self.translator.history)[-3000:]
+        return en, vi, self.last_summary[-8000:], self.on
 
     # ---- events ----
     def _on_english(self, ids, text):
@@ -2737,11 +3155,25 @@ def selftest():
         msg = (f"OK v{APP_VERSION} models loaded in {time.time() - t:.1f}s\nwhisper: {whisper_model_path()}\n"
                f"vosk: {model_dir(VOSK_MODEL)}\nvoiceprints: {_PRELOAD['spk'] is not None}\n"
                f"native input box: {__import__('importlib').util.find_spec('native_edit') is not None}\n"
-               f"ant: {find_ant()}")
+               f"ant: {find_ant()}\n"
+               f"qr reader: {_qr_selftest()}\n"
+               f"feedback window: {__import__('importlib').util.find_spec('feedback_browser') is not None}")
     except Exception as e:  # noqa: BLE001
         msg = f"FAIL {e!r}"
     with open(os.path.join(DATA_DIR, "selftest.txt"), "w", encoding="utf-8") as f:
         f.write(msg)
+
+
+def _qr_selftest():
+    """Can the bundled QR reader read a small generated code? (Feedback menu)"""
+    try:
+        import zxingcpp
+        from PIL import Image
+        img = Image.new("RGB", (40, 40), "white")
+        zxingcpp.read_barcodes(img)
+        return "ok"
+    except Exception as e:  # noqa: BLE001
+        return f"missing ({e})"
 
 
 def main():
@@ -2766,7 +3198,8 @@ def main():
             # stop the microphone / speech threads before Python shuts down (else macOS shows a crash report)
             mw = getattr(root, "_main_window", None)
             if mw is not None:
-                mw.recognizer.running.clear()
+                mw._on_close()                    # saves the session, stops listening, then exits
+                return
             root.after(400, lambda: (root.destroy(), os._exit(0)))
         root.protocol("WM_DELETE_WINDOW", quit_app)
         root.createcommand("::tk::mac::Quit", quit_app)

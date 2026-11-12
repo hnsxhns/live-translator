@@ -15,3 +15,7 @@ config.json
 selftest.txt
 # Learning library created when running from source
 /learning/
+# Session saved on close (reopened at the next start) and its backups
+session_autosave.json
+backups/
+learning/

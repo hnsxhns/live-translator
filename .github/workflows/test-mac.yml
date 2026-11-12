@@ -116,6 +116,7 @@ jobs:
           "$PY" -m venv .venv-mac
           .venv-mac/bin/python -m pip install -q --upgrade pip
           .venv-mac/bin/python -m pip install -q -r requirements.txt
+          .venv-mac/bin/python -m pip install -q qrcode       # test-only: makes the QR the Feedback reader must read
 
       - name: Cache models
         id: models
@@ -149,6 +150,7 @@ jobs:
           mk a1 "$VA" "Good morning everyone. Today we will talk about machine learning and how computers understand speech. Please open your notebooks and write down the key ideas."
           mk b1 "$VB" "Thank you teacher. I have a question about the homework. Should we finish all the exercises before Friday, or only the first part?"
           mk a2 "$VA" "Good question. Please finish all of them before Friday. If you have more questions, send me an email and I will answer tonight."
+          mk c1 "$VA" "The final exam will be held next Wednesday in the main library, so please arrive ten minutes early."
           ls -l a1.wav b1.wav a2.wav
 
       - name: Run the app window with the fake microphone
@@ -157,7 +159,8 @@ jobs:
         run: |
           set -uo pipefail
           defaults write org.python.python NSAppSleepDisabled -bool YES   # same as the .app's Info.plist key
-          .venv-mac/bin/python tests/mac_e2e_test.py shots A:a1.wav B:b1.wav A:a2.wav | tee e2e.log
+          # c1 is played at 3% level: a speaker far from the microphone (v1.9.20 listening change)
+          .venv-mac/bin/python tests/mac_e2e_test.py shots A:a1.wav B:b1.wav A:a2.wav A:c1.wav:0.03 | tee e2e.log
           CODE=${PIPESTATUS[0]}
           .venv-mac/bin/python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
           import json
