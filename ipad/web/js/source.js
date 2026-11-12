@@ -13,12 +13,12 @@
 import { ROOT } from "./updates.js";
 
 /** The bookmark's code: one line, no "%" (iOS bookmarks treat it as an escape). app: the app's root URL. */
-export function bookmarklet(app = ROOT) {
+export function bookmarklet(app = ROOT, mode = "") {
   /* eslint-disable */
-  const fn = async function (APP) {
+  const fn = async function (APP, MODE) {
     const ORIGIN = new URL(APP).origin, VERSION = 3;
     /* a second tap on the same page runs again with what the first one learned (tab clicks, the screen before) */
-    if (window.__ltAgent) { window.__ltAgent.run(); return; }
+    if (window.__ltAgent) { window.__ltAgent.run(MODE); return; }
     const A = window.__ltAgent = { busy: false };
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const KEY = "lt_src_clicks:" + location.origin + location.pathname;
@@ -429,10 +429,18 @@ export function bookmarklet(app = ROOT) {
       }
     };
     /* ---------- what to do on this page ---------- */
-    A.run = async () => {
+    A.run = async (mode) => {
       bar.style.display = "";
       btns.replaceChildren();
       if (isLogin()) { say("đây là trang đăng nhập — hãy đăng nhập, rồi chạy lại dấu trang."); return; }
+      if (mode === "survey") {                 /* the Feedback bookmark (ltfeedback): always the survey */
+        if (readQuestions().length) { survey(); return; }
+        say("đang chờ trang khảo sát tải xong...");
+        await settle();
+        if (readQuestions().length) survey();
+        else say("không thấy câu hỏi nào trên trang này — mở trang khảo sát (sau khi đăng nhập nếu cần) rồi chạy lại dấu trang ltfeedback.");
+        return;
+      }
       const qs = readQuestions().length, docs = items(scope()).map(docOf).filter(Boolean).length;
       if (qs && docs) {                        /* both: the user says which */
         say("trang này có " + qs + " câu hỏi và " + docs + " tài liệu:");
@@ -441,14 +449,20 @@ export function bookmarklet(app = ROOT) {
       } else if (qs >= 2) survey();
       else materials();
     };
-    A.run();
+    A.run(MODE);
   };
   /* eslint-enable */
   // one line, comments dropped (shorter to paste into a bookmark)
   const code = fn.toString().replace(/\/\*[^*]*\*\//g, "").replace(/\n\s*/g, " ").replace(/ {2,}/g, " ");
   if (code.includes("%")) throw new Error("bookmarklet must not contain a percent sign");
-  return `javascript:(${code})(${JSON.stringify(app)});void 0`;
+  return `javascript:(${code})(${JSON.stringify(app)},${JSON.stringify(mode)});void 0`;
 }
+
+/** The bookmark of each place in the app: "ltsource" (materials, also surveys) and "ltfeedback" (surveys). */
+export const BOOKMARKS = {
+  source: { name: "ltsource", mode: "", title: "📥 Cài dấu trang Live Translator (Source)" },
+  feedback: { name: "ltfeedback", mode: "survey", title: "📝 Cài dấu trang Feedback (ltfeedback)" },
+};
 
 /** Receives documents from the bookmark (see the top of this file). */
 export class SourceBridge {
@@ -463,6 +477,10 @@ export class SourceBridge {
     const d = e.data;
     if (d && d.type === "lt-survey" && Array.isArray(d.questions)) {     // a survey page (Learning → Feedback)
       await this.app.learning.ready;
+      if (e.origin === location.origin && /\/bm-test(-feedback)?\.html/.test(String(d.url || ""))) {   // the test form: it works
+        this.app.learning.bookmarkWorks(d.questions.length, "feedback");
+        return;
+      }
       this.app.learning.feedback.receive(e.source, e.origin, d);
       return;
     }

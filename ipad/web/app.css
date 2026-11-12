@@ -571,3 +571,5 @@ audio.vMedia { background: none; }
 .fbQ select, .fbQ textarea { width: 100%; font-size: 16px; padding: 8px 10px; border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm); background: #fff; }
 .fbChecks { display: grid; gap: 4px; font-size: 15px; }
+.fbBookmark { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  background: #eef4fb; border: 1px solid #c9dcf1; color: #1f3f63; border-radius: var(--radius-sm); padding: 10px 12px; font-size: 14.5px; }

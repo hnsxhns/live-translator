@@ -9,6 +9,7 @@
 // 5. The user checks the page and presses the survey's own Next / Submit (the app never sends it).
 
 import { askJson, friendlyError } from "./claude.js";
+import { BOOKMARK_VERSION } from "./source.js";
 
 const ROOT = new URL("../../../", import.meta.url).href;
 const PDFJS = ROOT + "lib/pdfjs-4.10.38/";
@@ -179,9 +180,20 @@ export class Feedback {
     };
     const dayRow = el("label", "fbDayRow");
     dayRow.append(el("span", "", "Khảo sát của buổi:"), daySel);
-    const note = el("p", "hint", "Sau khi mở: ở trang khảo sát hãy chạy dấu trang ltsource (Chrome: gõ ltsource vào thanh địa chỉ, " +
-      "chạm gợi ý ☆). Nó đọc câu hỏi và gửi về đây; Claude soạn câu trả lời tích cực, cụ thể; bạn duyệt / sửa từng câu; " +
-      "app điền vào form. Bạn tự bấm Next / Submit của trang — app không bao giờ tự gửi.");
+    const note = el("p", "hint", "Sau khi mở: ở trang khảo sát hãy chạy dấu trang ltfeedback (Chrome: gõ ltfeedback vào thanh địa " +
+      "chỉ, chạm gợi ý ☆; Safari: mở Dấu trang và chạm). Nó đọc câu hỏi và gửi về đây; Claude soạn câu trả lời tích cực, cụ thể; " +
+      "bạn duyệt / sửa từng câu; app điền vào form. Bạn tự bấm Next / Submit của trang — app không bao giờ tự gửi.");
+    // the Feedback bookmark (ltfeedback): installed / tested here; ltsource also works on surveys
+    const data = this.L.lib.data, ver = data.feedback_bookmark_version || 0;
+    const bmBox = el("div", "fbBookmark");
+    const bmText = el("span", "", !ver ? "Chưa cài dấu trang ltfeedback — cần cài một lần để đọc và điền khảo sát."
+      : ver < BOOKMARK_VERSION ? "Có bản dấu trang ltfeedback mới — cập nhật một lần."
+      : data.feedback_bookmark_tested ? `✓ Dấu trang ltfeedback đã cài và chạy tốt (${data.feedback_bookmark_tested}).`
+      : "Dấu trang ltfeedback đã copy — bấm 🧪 Thử để chắc nó chạy.");
+    const bmBtn = el("button", !ver || ver < BOOKMARK_VERSION ? "primary" : "",
+      !ver ? "📝 Cài dấu trang ltfeedback" : ver < BOOKMARK_VERSION ? "📝 Cập nhật dấu trang" : "📝 Dấu trang (cài / thử)");
+    bmBtn.onclick = () => this.L.bookmarkSetup("feedback");
+    bmBox.append(bmText, bmBtn);
     const row = el("div", "actions");
     const cancel = el("button", "", "Đóng");
     cancel.onclick = () => this.app.closeSheet();
@@ -192,10 +204,11 @@ export class Feedback {
       this.session = { url: u, day: +daySel.value || 0 };
       window.open(u, "_blank");              // not noopener: the bookmark sends the questions straight back
       this.app.closeSheet();
-      this.app.setStatus("📝 Ở trang khảo sát, chạy dấu trang ltsource để đọc câu hỏi.", "ok");
+      this.app.setStatus("📝 Ở trang khảo sát, chạy dấu trang ltfeedback (Chrome: gõ ltfeedback vào thanh địa chỉ) để đọc câu hỏi.", "ok");
     };
+    if (!ver) { go.className = ""; }           // first the bookmark, then the survey
     row.append(el("span", "spacer"), cancel, go);
-    body.append(pickRow, input, url, list, dayRow, note, row);
+    body.append(bmBox, pickRow, input, url, list, dayRow, note, row);
     this.app.sheet("📝 Feedback — khảo sát buổi học", body, true);
   }
 

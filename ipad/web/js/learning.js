@@ -12,7 +12,7 @@
 import { askJson, uploadFile, ClaudeError, friendlyError } from "./claude.js";
 import { fileToBlock, docxText } from "./files.js";
 import { openFile, shareFile, mimeOf } from "./viewer.js";
-import { bookmarklet, BOOKMARK_VERSION } from "./source.js";
+import { bookmarklet, BOOKMARK_VERSION, BOOKMARKS } from "./source.js";
 import { Feedback } from "./feedback.js";
 
 const ROOT = new URL("../../../", import.meta.url).href;
@@ -1574,9 +1574,11 @@ export class LearningUI {
     this.app.sheet("🌐 Source — tài liệu từ trang khóa học", body, true);
   }
 
-  /** How to add the bookmark "📥 Live Translator" (once). */
-  bookmarkSetup() {
-    const code = bookmarklet();
+  /** How to add a bookmark (once): kind "source" = ltsource (materials, also surveys), "feedback" = ltfeedback. */
+  bookmarkSetup(kind = "source") {
+    const bm = BOOKMARKS[kind] || BOOKMARKS.source, name = bm.name, fb = kind === "feedback";
+    const code = bookmarklet(undefined, bm.mode);
+    const flag = fb ? "feedback_bookmark_version" : "bookmark_version";
     const body = el("div", "lform srcPanel");
     const copyRow = el("div", "actions");
     const copy = el("button", "primary", "📋 Copy mã dấu trang");
@@ -1584,11 +1586,11 @@ export class LearningUI {
     copy.onclick = async () => {
       try { await navigator.clipboard.writeText(code); note.textContent = "✓ Đã copy — làm tiếp các bước dưới."; }
       catch { prompt("Copy mã này:", code); }
-      this.lib.data.bookmark_ready = true;
-      this.lib.data.bookmark_version = BOOKMARK_VERSION;
+      if (!fb) this.lib.data.bookmark_ready = true;
+      this.lib.data[flag] = BOOKMARK_VERSION;
       this.lib.save();
     };
-    const drag = el("a", "srcDrag", "📥 Live Translator");
+    const drag = el("a", "srcDrag", fb ? "📝 " + name : "📥 Live Translator");
     drag.href = code;
     drag.title = "Máy tính: kéo nút này lên thanh dấu trang";
     drag.onclick = (e) => { e.preventDefault(); note.textContent = "Trên máy tính: kéo nút này lên thanh dấu trang. Trên iPad: dùng nút Copy."; };
@@ -1602,50 +1604,58 @@ export class LearningUI {
       return box;
     };
     body.append(
-      el("p", "", "Dấu trang này là một nút nhỏ chạy ngay trong trang khóa học bạn đang đăng nhập, nên tải được cả tài liệu " +
-        "cần đăng nhập rồi gửi về Live Translator. Chỉ cần cài một lần."),
+      el("p", "", fb
+        ? "Dấu trang ltfeedback là một nút nhỏ chạy ngay trong trang khảo sát: nó đọc các câu hỏi, gửi về Live Translator " +
+          "để Claude soạn câu trả lời, rồi điền những câu bạn đã duyệt vào form. Chỉ cần cài một lần."
+        : "Dấu trang này là một nút nhỏ chạy ngay trong trang khóa học bạn đang đăng nhập, nên tải được cả tài liệu " +
+          "cần đăng nhập rồi gửi về Live Translator. Chỉ cần cài một lần."),
       copyRow,
       guide("Chrome trên iPad", [
         "Bấm Copy mã ở trên.",
         "Mở một trang bất kỳ → ⋯ → Thêm vào dấu trang. Rồi ⋯ → Dấu trang → chạm giữ dấu trang đó → Sửa dấu trang → " +
-          "đặt tên ltsource → xoá hết ô URL, chạm giữ → Dán → Xong.",
-        "Dùng (quan trọng): chạm vào thanh địa chỉ, gõ ltsource rồi chạm gợi ý có hình ngôi sao ☆. " +
+          `đặt tên ${name} → xoá hết ô URL, chạm giữ → Dán → Xong.`,
+        `Dùng (quan trọng): chạm vào thanh địa chỉ, gõ ${name} rồi chạm gợi ý có hình ngôi sao ☆. ` +
           "Chrome trên iPad KHÔNG chạy dấu trang khi mở từ danh sách Dấu trang — chạm ở đó sẽ không thấy gì.",
       ]),
       guide("Safari trên iPad", [
         "Bấm Copy mã ở trên.",
-        "Mở một trang bất kỳ trong Safari → nút Chia sẻ (□↑) → Thêm dấu trang → đặt tên ltsource → Lưu.",
+        `Mở một trang bất kỳ trong Safari → nút Chia sẻ (□↑) → Thêm dấu trang → đặt tên ${name} → Lưu.`,
         "Mở Dấu trang (biểu tượng quyển sách) → Sửa → chạm dấu trang vừa tạo → xoá địa chỉ, chạm giữ → Dán → Xong.",
-        "Dùng: mở Dấu trang và chạm ltsource (hoặc gõ ltsource vào thanh địa chỉ).",
+        `Dùng: mở Dấu trang và chạm ${name} (hoặc gõ ${name} vào thanh địa chỉ).`,
       ]),
-      el("p", "hint", "Dùng app và trang khóa học trong CÙNG một trình duyệt (cùng Chrome hoặc cùng Safari): mỗi trình duyệt " +
-        "có thư viện và đăng nhập riêng. Sau khi cài, bấm 🧪 Thử dấu trang để chắc nó chạy."));
+      el("p", "hint", `Dùng app và trang ${fb ? "khảo sát" : "khóa học"} trong CÙNG một trình duyệt (cùng Chrome hoặc cùng Safari): ` +
+        "mỗi trình duyệt có thư viện và đăng nhập riêng. Sau khi cài, bấm 🧪 Thử dấu trang để chắc nó chạy."));
     const row = el("div", "actions");
-    const back = el("button", "", "‹ Quay lại Source");
-    back.onclick = () => this.sourcePanel(this.lib.data.source_url || "");
+    const back = el("button", "", fb ? "‹ Quay lại Feedback" : "‹ Quay lại Source");
+    back.onclick = () => (fb ? this.feedback.open() : this.sourcePanel(this.lib.data.source_url || ""));
     const test = el("button", "primary", "🧪 Thử dấu trang");
-    // opened as a tab of this app (opener = app): tapping the bookmark there says whether it works
-    test.onclick = () => { window.open(new URL("bm-test.html", location.href).href, "_blank"); this.app.closeSheet(); };
+    // opened as a tab of this app (opener = app): running the bookmark there says whether it works
+    test.onclick = () => { window.open(new URL(fb ? "bm-test-feedback.html" : "bm-test.html", location.href).href, "_blank"); this.app.closeSheet(); };
     row.append(back, el("span", "spacer"), test);
     body.append(row);
-    this.app.sheet("📥 Cài dấu trang Live Translator", body, true);
+    this.app.sheet(bm.title, body, true);
   }
 
-  /** The bookmark was tapped on the test page and reached the app. */
-  bookmarkWorks(n) {
-    this.lib.data.bookmark_tested = stamp();
-    this.lib.data.bookmark_version = Math.max(this.lib.data.bookmark_version || 0, BOOKMARK_VERSION);
+  /** The bookmark was run on the test page and reached the app (kind "source" or "feedback"). */
+  bookmarkWorks(n, kind = "source") {
+    const fb = kind === "feedback";
+    this.lib.data[fb ? "feedback_bookmark_tested" : "bookmark_tested"] = stamp();
+    const flag = fb ? "feedback_bookmark_version" : "bookmark_version";
+    this.lib.data[flag] = Math.max(this.lib.data[flag] || 0, BOOKMARK_VERSION);
     this.lib.save();
     const body = el("div", "lform srcPanel");
-    body.append(el("p", "", `✓ Dấu trang chạy tốt trong trình duyệt này${n ? " (đã nhận tài liệu mẫu)" : ""}. ` +
-      "Giờ mở trang khóa học, vào phần tài liệu và chạm dấu trang như vừa làm."));
+    body.append(el("p", "", fb
+      ? `✓ Dấu trang ltfeedback chạy tốt trong trình duyệt này (đọc được ${n} câu hỏi mẫu). ` +
+        "Giờ mở khảo sát của buổi học và chạy dấu trang như vừa làm."
+      : `✓ Dấu trang chạy tốt trong trình duyệt này${n ? " (đã nhận tài liệu mẫu)" : ""}. ` +
+        "Giờ mở trang khóa học, vào phần tài liệu và chạm dấu trang như vừa làm."));
     const row = el("div", "actions");
-    const ok = el("button", "primary", "🌐 Về Source");
-    ok.onclick = () => this.sourcePanel(this.lib.data.source_url || "");
+    const ok = el("button", "primary", fb ? "📝 Về Feedback" : "🌐 Về Source");
+    ok.onclick = () => (fb ? this.feedback.open() : this.sourcePanel(this.lib.data.source_url || ""));
     row.append(el("span", "spacer"), ok);
     body.append(row);
     this.app.sheet("🧪 Thử dấu trang", body, true);
-    this.chatNote("🧪 Dấu trang 📥 chạy tốt trong trình duyệt này.");
+    this.chatNote(fb ? "🧪 Dấu trang ltfeedback chạy tốt trong trình duyệt này." : "🧪 Dấu trang 📥 chạy tốt trong trình duyệt này.");
   }
 
   /** The bookmark sent documents: ask once (any page that can open this app could send files). */
