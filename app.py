@@ -1,7 +1,7 @@
 """Live Translator (multilingual, offline): pick the language you hear and the language to translate into,
 then press ON:
   - left pane:   live transcript from the microphone (Vosk + Whisper, on this PC)
-  - right pane:  live translation (NLLB-200, on this PC)
+  - right pane:  live translation (EnViT5 for English <-> Vietnamese, NLLB-200 for the rest, on this PC)
   - bottom pane: running key takeaways (Qwen2.5, on this PC)
 Only the Claude panel (questions about the session) uses the internet and a Claude login.
 """
@@ -31,13 +31,14 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")        # models are local files: ne
 import anthropic
 import numpy as np
 
+import domain
 import local_ai
 import pdf_export
 from local_ai import AUTO, LANGS, lang_name
 
 # ---------------- Settings ----------------
 APP_NAME = "LiveTranslatorML"     # multilingual offline edition (own data folder, own build name)
-APP_VERSION = "2.0.1"             # shown in the title bar and used in the portable build's name
+APP_VERSION = "2.1.0"             # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # The login client waits at most 20 s for data. Chat sends whole documents, and Claude can read/think longer than that before the first word: give them more time.
 LONG_TIMEOUT = anthropic.Timeout(300.0, connect=15.0)
@@ -99,6 +100,7 @@ AUTOSAVE_FILE = "session_autosave.json"     # in DATA_DIR: the session on screen
 UI_FONT = "Segoe UI"
 # language packs: downloaded into DATA_DIR/models; bundled ones are inside the .exe / next to app.py
 STORE = local_ai.Store(DATA_DIR, (getattr(sys, "_MEIPASS", None), APP_DIR, LEGACY_DATA))
+DOMAIN = domain.DomainLibrary(os.path.join(DATA_DIR, "domain"))    # specialist documents + glossary
 
 
 def whisper_model_path():
@@ -581,6 +583,11 @@ def get_fast_asr(pid):
     return m
 
 
+def have_mt(src, tgt):
+    """A translation model for src -> tgt is on this PC."""
+    return local_ai.mt_pack_for("en" if src == local_ai.AUTO else src, tgt, STORE.have) is not None
+
+
 def unload_whisper(pid):
     with _MODELS_LOCK:
         _MODELS.pop(pid, None)
@@ -735,6 +742,7 @@ class Recognizer(threading.Thread):
         self.whisper = None
         self.whisper_pid = None
         self.context = ""
+        self.glossary = ""                  # the field's words (📚 documents): Whisper hears them better
         self.utt_id = 0
         self.spk_model = None
         self.speakers = SpeakerTracker()
@@ -832,8 +840,8 @@ class Recognizer(threading.Thread):
                 segs, _ = model.transcribe(audio, language=got, **kw)
             lang = got
         else:
-            segs, _ = model.transcribe(audio, language=LANGS[lang][1],
-                                       initial_prompt=self.context[-150:] or None, **kw)
+            prompt = ((self.glossary + ". ") if self.glossary and lang == self.lang else "") + self.context[-150:]
+            segs, _ = model.transcribe(audio, language=LANGS[lang][1], initial_prompt=prompt or None, **kw)
         out = []
         for s in segs:
             if s.no_speech_prob > 0.6 and s.avg_logprob < -1.0:
@@ -1203,7 +1211,8 @@ def friendly_error(e):
 
 
 class Translator:
-    """Translates each spoken segment on this PC (NLLB-200) as soon as the speaker pauses.
+    """Translates each spoken segment on this PC (EnViT5 for English <-> Vietnamese, NLLB-200 for every other
+    pair) as soon as the speaker pauses.
 
     * The fast Vosk draft of a segment is translated immediately (no waiting for Whisper). When Whisper's
       accurate text arrives, the segment is re-translated only if the words differ noticeably.
@@ -1221,9 +1230,11 @@ class Translator:
         self.gen = {}       # uid -> generation (a re-translation makes older output stale)
         self.lang = {}      # uid -> source language of that segment
         self.src, self.tgt = src, tgt
-        self.mt = None
+        self.mts = {}       # pack id -> loaded model (EnViT5 for English <-> Vietnamese, NLLB for the rest)
         self.mt_error = None
         self._loading = threading.Lock()
+        self.matcher = None                 # glossary (📚) for self.src -> self.tgt
+        self.pending = 0                    # translations waiting or running (the takeaways model waits)
 
     def set_languages(self, src, tgt):
         self.src, self.tgt = src, tgt
@@ -1238,15 +1249,21 @@ class Translator:
         """Load the translation model in the background, so the first sentence is not slower."""
         self.pool.submit(self._model)
 
-    def _model(self):
+    def _model(self, src=None, tgt=None):
+        """The translation model for src -> tgt (default: the top-bar choice), loaded once."""
+        src, tgt = src or self.src, tgt or self.tgt
+        if src == local_ai.AUTO:
+            src = "en" if tgt != "en" else "vi"
+        pid = local_ai.mt_pack_for(src, tgt, STORE.have)
+        if not pid:
+            raise FileNotFoundError(local_ai.mt_packs(src, tgt)[0])
         with self._loading:
-            if self.mt is None:
-                path = STORE.path("nllb-600m")
-                if not path:
-                    raise FileNotFoundError("nllb-600m")
-                self.mt = local_ai.NLLB(path, threads=local_ai.free_threads() + 1)
-                self.mt.translate("Hello.", "en", "vi")          # warm-up
-            return self.mt
+            if pid not in self.mts:
+                cls = local_ai.EnViT5 if pid == "envit5" else local_ai.NLLB
+                mt = cls(STORE.path(pid), threads=local_ai.free_threads() + 1)
+                mt.translate("Hello.", "en", "vi")              # warm-up
+                self.mts[pid] = mt
+            return self.mts[pid]
 
     # called on the UI thread
     def draft(self, uid, text, lang):
@@ -1255,7 +1272,7 @@ class Translator:
             self.gen[uid] = 1
             self.lang[uid] = lang
         self.ui_q.put(("vi_slot", uid))
-        self.pool.submit(self._translate, uid, 1, text)
+        self._submit(uid, 1, text)
 
     def final(self, ids, text, lang):
         """Whisper's accurate text for one or more segments."""
@@ -1279,7 +1296,19 @@ class Translator:
             self.lang[first] = lang
             g = self.gen[first]
         # the draft's translation stays on screen until the corrected one is ready, then it is swapped in
-        self.pool.submit(self._translate, first, g, text, False)
+        self._submit(first, g, text, False)
+
+    def _submit(self, *args):
+        with self.lock:
+            self.pending += 1
+        self.pool.submit(self._translate_counted, *args)
+
+    def _translate_counted(self, *args):
+        try:
+            self._translate(*args)
+        finally:
+            with self.lock:
+                self.pending -= 1
 
     def _translate(self, uid, g, text, stream=True):
         with self.lock:
@@ -1294,10 +1323,18 @@ class Translator:
             elif src == tgt:
                 out = text                             # same language: nothing to translate
             elif stream:                               # words appear as they are decoded (like live captions)
-                out = self._model().stream(text, src, tgt, lambda p: self.ui_q.put(("vi_piece", (uid, g, p))))
+                piece = lambda p: self.ui_q.put(("vi_piece", (uid, g, p)))
+                matcher = self.matcher if src == self.src and tgt == self.tgt else None
+                if matcher:
+                    out, ok = self._model(src, tgt).stream_terms(text, src, tgt, piece, matcher)
+                    if not ok:                         # a sentence was redone after it was shown: show the redone
+                        stream = False
+                else:
+                    out = self._model(src, tgt).stream(text, src, tgt, piece)
                 out = out or "—"
             else:
-                out = self._model().translate(text, src, tgt)
+                matcher = self.matcher if src == self.src and tgt == self.tgt else None
+                out = self._model(src, tgt).translate(text, src, tgt, matcher=matcher)
             self.mt_error = None
             if src in (AUTO, tgt):
                 self.ui_q.put(("vi_piece" if stream else "vi_replace", (uid, g, out.strip() or "—")))
@@ -1305,11 +1342,11 @@ class Translator:
                 self.ui_q.put(("vi_replace", (uid, g, out.strip() or "—")))
             elif out == "—":
                 self.ui_q.put(("vi_piece", (uid, g, out)))
-        except FileNotFoundError:
+        except FileNotFoundError as e:
             self.ui_q.put(("vi_piece" if stream else "vi_replace", (uid, g, "[chưa có gói Dịch offline]")))
             if not self.mt_error:
                 self.mt_error = "missing"
-                self.ui_q.put(("need_packs", "nllb-600m"))
+                self.ui_q.put(("need_packs", str(e) or "nllb-600m"))
         except Exception as e:  # noqa: BLE001
             self.ui_q.put(("vi_piece" if stream else "vi_replace", (uid, g, "[chưa dịch được]")))
             self.ui_q.put(("error", f"Lỗi mô hình dịch: {str(e)[:160]}"))
@@ -1334,7 +1371,10 @@ class Chatter(threading.Thread):
               "answer, say so and answer from general knowledge if appropriate. "
               "You have a tool: read_class_record reads the whole session record (original transcript, "
               "translation, all key takeaways), optionally only the parts that mention a word - use it when the "
-              "question is about something earlier than the recent part you were given.")
+              "question is about something earlier than the recent part you were given. The user may also have "
+              "added specialist documents of their field: search_documents finds the passages about a topic in "
+              "them, and the glossary of the field's terms is in the background - use both for questions about "
+              "the subject and its terminology.")
     TOOLS = [
         {"name": "read_class_record",
          "description": "The session record kept by the app: part = 'english' (original transcript with speakers, "
@@ -1345,6 +1385,11 @@ class Chatter(threading.Thread):
          "input_schema": {"type": "object", "properties": {
              "part": {"type": "string", "enum": ["english", "vietnamese", "both", "takeaways"]},
              "search": {"type": "string"}, "max_chars": {"type": "integer"}}, "required": ["part"]}},
+        {"name": "search_documents",
+         "description": "Search the user's specialist documents (added in the app's 📚 window): the passages that "
+                        "mention the query words, with the document names.",
+         "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
+                          "required": ["query"]}},
     ]
 
     def __init__(self, client, ui_q, get_context):
@@ -1468,7 +1513,8 @@ class Chatter(threading.Thread):
                 for b in final.content if (b.type == "text" and b.text) or b.type == "tool_use"]}
             results = []
             for u in uses:
-                what = (f"bản ghi phiên nghe ({u.input.get('part', '')}"
+                what = (f"tài liệu chuyên ngành (tìm “{u.input.get('query', '')}”)" if u.name == "search_documents" else
+                        f"bản ghi phiên nghe ({u.input.get('part', '')}"
                         f"{', tìm “' + u.input['search'] + '”' if u.input.get('search') else ''})")
                 self.ui_q.put(("status", f"📖 Claude đang đọc {what}..."))
                 try:
@@ -1493,8 +1539,10 @@ class Chatter(threading.Thread):
             # again on every question.
             context, live = "", False
             if with_session:
-                en, vi, summary, live, langs = self.get_context()
-                context = (f"<languages>{langs}</languages>\n"
+                en, vi, summary, live, langs, gloss = self.get_context()
+                context = (f"<languages>{langs}</languages>\n" +
+                           (f"<field_documents_and_glossary>\n{gloss}\n</field_documents_and_glossary>\n"
+                            if gloss else "") +
                            f"<transcript_original>\n{en or '(chưa có)'}\n</transcript_original>\n"
                            f"<translation_end>\n{vi or '(chưa có)'}\n</translation_end>\n"
                            f"<key_takeaways>\n{summary or '(chưa có)'}\n</key_takeaways>")
@@ -1538,6 +1586,8 @@ class Summarizer(threading.Thread):
         self.lang = "vi"                          # language of the notes
         self.llm, self.llm_pack = None, None
         self.warned = False
+        self.terms = []                           # glossary words in the notes' language (📚)
+        self.yield_to = None                      # () -> True while live translation needs the CPU
 
     def _model(self):
         if self.llm is None or self.llm_pack != self.pack:
@@ -1568,12 +1618,17 @@ class Summarizer(threading.Thread):
                     continue
                 llm = self._model()
                 lang = local_ai.LANG_NAMES_EN.get(self.lang, "English")
+                low = new.lower()
+                used = [t for t in self.terms if t.lower() in low][:15]
                 prompt = (f"Existing takeaways:\n{(self.get_takeaways() or '')[-1500:] or '(none yet)'}\n\n"
-                          f"NEW part of the transcript:\n{new[-6000:]}\n\n"
+                          f"NEW part of the transcript:\n{new[-6000:]}\n\n" +
+                          (f"Terms of the field (write them exactly like this): {', '.join(used)}\n\n"
+                           if used else "") +
                           f"Write the new key takeaways in {lang}.")
                 self.ui_q.put(("busy", ("takeaways", "Đang viết Key takeaways trên máy...")))
                 try:
-                    out = llm.chat(local_ai.TAKEAWAY_SYSTEM.format(lang=lang), prompt, max_new=350)
+                    out = llm.chat(local_ai.TAKEAWAY_SYSTEM.format(lang=lang), prompt, max_new=350,
+                                   yield_to=self.yield_to)
                 finally:
                     self.ui_q.put(("busy", ("takeaways", None)))
                 self.done_n = n
@@ -1653,6 +1708,10 @@ class MainWindow:
         tk.Button(top, text="📦 Gói ngôn ngữ", command=self.open_packs, font=("Segoe UI", 9), relief="flat",
                   bg="#3a3a3a", fg="#ddd", activebackground="#4a4a4a", activeforeground="white", cursor="hand2",
                   padx=8).pack(side="right", padx=(0, 6), pady=5)
+        self.domain_btn = tk.Button(top, text="📚 Thuật ngữ", command=self.open_domain, font=("Segoe UI", 9),
+                                    relief="flat", bg="#3a3a3a", fg="#ddd", activebackground="#4a4a4a",
+                                    activeforeground="white", cursor="hand2", padx=8)
+        self.domain_btn.pack(side="right", padx=(0, 6), pady=5)
         # languages: what is spoken -> what to translate into (remembered); every one runs on this PC
         self.src_lang = cfg.get("src_lang", "en") if cfg.get("src_lang", "en") in LANGS or             cfg.get("src_lang") == AUTO else "en"
         self.tgt_lang = cfg.get("tgt_lang", "vi") if cfg.get("tgt_lang", "vi") in LANGS else "vi"
@@ -1835,15 +1894,17 @@ class MainWindow:
 
         self.recognizer = Recognizer(self.ui_q, self._on_english, self.src_lang)
         self.translator = Translator(self.ui_q, self.src_lang, self.tgt_lang)
-        if self.src_lang != self.tgt_lang and STORE.have("nllb-600m"):
+        if self.src_lang != self.tgt_lang and have_mt(self.src_lang, self.tgt_lang):
             self.translator.warm()
         self.summarizer = Summarizer(self.ui_q, self.transcript_range, lambda: self.last_summary)
         self.summarizer.lang = self.tgt_lang
+        self.summarizer.yield_to = lambda: self.translator.pending > 0
         self.summarizer.pack = cfg.get("takeaways_pack") if cfg.get("takeaways_pack") in local_ai.LLM_PACKS else             local_ai.LLM_PACKS[0]
         self.chatter = Chatter(client, self.ui_q, self._chat_context)
         self.recognizer.start()
         self.summarizer.start()
         self.chatter.tool_handler = self._chat_tool              # Claude reads the session record
+        self.apply_glossary()
         self._set_pane_titles()
         if self.quality_var.get() == QUALITY_HIGH:
             self._set_quality(QUALITY_HIGH, startup=True)
@@ -2613,6 +2674,10 @@ class MainWindow:
                 text = "\n".join(lines[j] for j in keep)
                 return text[:limit] + ("\n…(còn nữa)" if len(text) > limit else "")
             return ("…(phần trước còn nữa)\n" if len(text) > limit else "") + text[-limit:]
+        if name == "search_documents":
+            if not DOMAIN.docs:
+                return "(người dùng chưa thêm tài liệu chuyên ngành nào)"
+            return DOMAIN.search(inp.get("query") or "") or f"(không có đoạn nào nói về “{inp.get('query')}”)"
         return "(không rõ công cụ)"
 
     def _chat_context(self):
@@ -2621,7 +2686,19 @@ class MainWindow:
         en = self.transcript_text()[-40000:]
         vi = "\n".join(v for _, v in self.translator.history)[-3000:]
         langs = f"spoken: {lang_name(self.src_lang)}; translated into: {lang_name(self.tgt_lang)}"
-        return en, vi, self.last_summary[-8000:], self.on, langs
+        return en, vi, self.last_summary[-8000:], self.on, langs, self._glossary_for_claude()
+
+    def _glossary_for_claude(self):
+        """The user's specialist documents (names) and glossary, for Claude's background (small)."""
+        if not DOMAIN.docs and not DOMAIN.pairs:
+            return ""
+        names = ", ".join(d["name"] for d in DOMAIN.docs[:30])
+        pairs = DOMAIN.pairs_for(self.src_lang, self.tgt_lang)[:150] if self.src_lang != AUTO else []
+        out = f"Documents: {names}\n" if names else ""
+        if pairs:
+            out += (f"Glossary ({lang_name(self.src_lang)} -> {lang_name(self.tgt_lang)}):\n" +
+                    "\n".join(f"{a} = {b}" for a, b in pairs))
+        return out
 
     # ---- events ----
     def _on_english(self, ids, text, lang):
@@ -2786,6 +2863,60 @@ class MainWindow:
         self._schedule_align(uid)
         self._follow()
 
+    # a pause in the middle of a sentence cuts it into two rows; the translator does much better with the
+    # whole sentence (and it reads better), so a piece that clearly continues the row before is joined to it
+    _CONT_EN = {"and", "but", "or", "which", "who", "whom", "whose", "where", "that", "so", "because", "called",
+                "while", "whereas", "than", "though", "although", "including", "especially", "like", "to", "of",
+                "for", "with", "without", "plus", "nor", "unless", "until"}
+    _COMMA_EN = {"which", "who", "whom", "whose", "where", "called", "including", "especially"}
+    _OPEN_EN = {"if", "when", "although", "though", "because", "while", "since", "once", "unless", "whenever"}
+
+    def _join_sentence(self, ids, text, lang):
+        """(ids, text) to show and translate: this piece alone, or joined to the previous row when it is the
+        rest of the same sentence (same speaker, the row just before, not too long)."""
+        prev = getattr(self, "_last_final", None)
+        self._last_final = (list(ids), text, lang)
+        if not prev or not text.strip():
+            return ids, text
+        p_ids, p_text, p_lang = prev
+        words = text.split()
+        first = re.sub(r"\W", "", words[0]).lower() if words else ""
+        p_words = p_text.split()
+        same = (p_lang == lang and ids[0] > p_ids[-1] and len(p_ids) < 4 and len(p_words) + len(words) <= 45 and
+                self._res(self.uid_spk.get(p_ids[0], 1)) == self._res(self.uid_spk.get(ids[0], 1)) and
+                self.left.tag_ranges(f"u{p_ids[0]}"))
+        if not same:
+            return ids, text
+        p_end = p_text.rstrip()[-1:]
+        cont = p_end not in ".?!。！？…" or p_end == ","
+        if lang == "en":
+            p_first = re.sub(r"\W", "", p_words[0]).lower() if p_words else ""
+            cont = cont or first in self._CONT_EN or (p_first in self._OPEN_EN and "," not in p_text)
+        else:
+            cont = cont or (words and words[0][:1].islower())
+        if not cont:
+            return ids, text
+        a = p_text.rstrip()
+        if a.endswith(".") and not a.endswith(".."):
+            a = a[:-1]
+        b = text.strip()
+        if lang == "en" and first in self._CONT_EN | self._OPEN_EN and b[:1].isupper() and words[0] != "I":
+            b = b[0].lower() + b[1:]
+        sep = "" if lang in local_ai.NO_SPACES else (", " if lang == "en" and first in self._COMMA_EN and
+                                                     not a.endswith(",") else " ")
+        all_ids, joined = p_ids + list(ids), a + sep + b
+        # the transcript keeps one entry per row (the takeaways read it)
+        keep = [i for i, t in enumerate(self.transcript) if len(t) > 2 and t[2] in all_ids]
+        if keep:
+            first_i = keep[0]
+            self.transcript[first_i] = (self.transcript[first_i][0], joined, all_ids[0])
+            for i in reversed(keep[1:]):
+                del self.transcript[i]
+                if i < self.summarizer.done_n:
+                    self.summarizer.done_n -= 1
+        self._last_final = (all_ids, joined, lang)
+        return all_ids, joined
+
     def _finalize(self, ids, text):
         w = self.left
         w.configure(state="normal")
@@ -2797,7 +2928,8 @@ class MainWindow:
             w.delete(rng[0], rng[1])
             if uid == ids[0]:
                 _, spk_tag = self._spk_tags(w, self.uid_spk.get(uid, 1))
-                w.insert(a, split_sentences(text.strip()), (spk_tag, f"b{uid}"))
+                # u<uid> stays: the next piece of the same sentence may still be joined to this row
+                w.insert(a, split_sentences(text.strip()), (spk_tag, f"b{uid}", f"u{uid}"))
         w.configure(state="disabled")
         for uid in ids:
             self._schedule_align(uid)
@@ -3037,6 +3169,7 @@ class MainWindow:
         self.translator.mt_error = None
         self.summarizer.lang = tgt
         self._set_pane_titles()
+        self.apply_glossary()
         was_on = self.on
         if self.missing_packs():
             if was_on:
@@ -3048,7 +3181,7 @@ class MainWindow:
         if changed_src and self.quality_var.get() == QUALITY_HIGH:
             self.recognizer.quality = QUALITY_FAST
             self._set_quality(QUALITY_HIGH)
-        if src != tgt and STORE.have("nllb-600m"):
+        if src != tgt and have_mt(src, tgt):
             self.translator.warm()
         self.status.config(text=f"Nghe {lang_name(src)} → dịch sang {lang_name(tgt)}"
                                 + (" (đang nạp mô hình...)" if was_on and changed_src else ""), fg="#ddd")
@@ -3185,6 +3318,7 @@ class MainWindow:
         m = self.gear_menu
         m.delete(0, "end")
         m.add_command(label="📦  Gói ngôn ngữ (offline)...", command=self.open_packs)
+        m.add_command(label="📚  Tài liệu chuyên ngành & thuật ngữ...", command=self.open_domain)
         m.add_separator()
         m.add_command(label="Key takeaways viết bằng:", state="disabled")
         for pid in local_ai.LLM_PACKS:
@@ -3200,6 +3334,309 @@ class MainWindow:
         else:
             m.add_command(label="Đăng nhập Claude (chỉ khung hỏi Claude cần internet)...",
                           command=self.login_claude)
+
+    # ------------------------------------------------------------ 📚 specialist documents and glossary
+    def apply_glossary(self):
+        """Give the glossary of the current languages to listening (Whisper's prompt), translation (terms kept
+        as the glossary says) and Key takeaways. Called at start, after a language change, after every edit."""
+        src, tgt = self.src_lang, self.tgt_lang
+        self.recognizer.glossary = DOMAIN.prompt_terms(src) if src != AUTO else ""
+        pairs = DOMAIN.pairs_for(src, tgt) if src not in (AUTO, tgt) else []
+        self.translator.matcher = domain.TermMatcher(pairs, src) if pairs else None
+        self.summarizer.terms = [t for _, t in pairs]
+        n = len(pairs)
+        if getattr(self, "domain_btn", None):
+            self.domain_btn.config(text=f"📚 Thuật ngữ ({n})" if n else "📚 Thuật ngữ")
+
+    def open_domain(self):
+        """The 📚 window: add specialist documents, see and edit the glossary they gave."""
+        from tkinter import ttk
+        w = getattr(self, "_dom_win", None)
+        if w and w.winfo_exists():
+            w.lift()
+            self._refresh_domain_win()
+            return
+        w = self._dom_win = tk.Toplevel(self.root)
+        w.title("Tài liệu chuyên ngành & thuật ngữ")
+        w.geometry("940x680")
+        w.minsize(700, 500)
+        w.transient(self.root)
+        bg = "#faf9f5"
+        w.configure(bg=bg)
+        tk.Label(w, text="Tài liệu chuyên ngành & thuật ngữ", font=(UI_FONT, 13, "bold"), bg=bg).pack(
+            anchor="w", padx=14, pady=(12, 0))
+        tk.Label(w, text="Thêm tài liệu của ngành bạn nghe (PDF, Word, PowerPoint, Excel/CSV, TXT). App đọc chúng ngay "
+                         "trên máy, tìm các thuật ngữ và bản dịch của chúng — từ bảng thuật ngữ 2 cột, hoặc từ tài liệu "
+                         "có ghi thuật ngữ gốc trong ngoặc, ví dụ “học tăng cường (reinforcement learning)”. Thuật ngữ "
+                         "giúp nghe đúng từ chuyên ngành hơn, được dịch đúng như bảng, và dùng trong Key takeaways. "
+                         "Tài liệu không gửi đi đâu; chỉ khung Claude đọc khi bạn hỏi Claude.",
+                 font=(UI_FONT, 9), fg="#555", bg=bg, wraplength=900, justify="left").pack(anchor="w", padx=14,
+                                                                                          pady=(2, 8))
+        style = dict(font=(UI_FONT, 9), relief="flat", cursor="hand2", padx=10, pady=3)
+        # documents
+        top = tk.Frame(w, bg=bg)
+        top.pack(fill="x", padx=14)
+        docs = self._dom_docs = ttk.Treeview(top, columns=("lang", "terms", "pairs", "added"), show="tree headings",
+                                             height=5, selectmode="extended")
+        docs.heading("#0", text="Tài liệu")
+        docs.heading("lang", text="Ngôn ngữ")
+        docs.heading("terms", text="Thuật ngữ tìm thấy")
+        docs.heading("pairs", text="Cặp dịch")
+        docs.heading("added", text="Thêm lúc")
+        docs.column("#0", width=380)
+        for c, wd in (("lang", 110), ("terms", 120), ("pairs", 80), ("added", 120)):
+            docs.column(c, width=wd, anchor="center")
+        docs.pack(side="left", fill="x", expand=True)
+        side = tk.Frame(top, bg=bg)
+        side.pack(side="left", fill="y", padx=(8, 0))
+        tk.Button(side, text="＋ Thêm tài liệu...", bg="#27ae60", fg="white", activebackground="#1e8449",
+                  command=self._domain_pick_files, **style).pack(fill="x")
+        tk.Button(side, text="🗑 Xoá tài liệu", bg="#eee", command=self._domain_remove_docs, **style).pack(fill="x", pady=4)
+        tk.Button(side, text="📂 Mở thư mục", bg="#eee",
+                  command=lambda: (os.makedirs(DOMAIN.files, exist_ok=True), pdf_export.open_path(DOMAIN.files)),
+                  **style).pack(fill="x")
+        # glossary
+        head = tk.Frame(w, bg=bg)
+        head.pack(fill="x", padx=14, pady=(12, 2))
+        self._dom_title = tk.Label(head, text="", font=(UI_FONT, 11, "bold"), bg=bg)
+        self._dom_title.pack(side="left")
+        self._dom_filter = tk.StringVar()
+        self._dom_filter.trace_add("write", lambda *a: self._refresh_domain_win())
+        tk.Entry(head, textvariable=self._dom_filter, width=28, font=(UI_FONT, 10)).pack(side="right")
+        tk.Label(head, text="🔍", bg=bg).pack(side="right")
+        mid = tk.Frame(w, bg=bg)
+        mid.pack(fill="both", expand=True, padx=14)
+        tree = self._dom_tree = ttk.Treeview(mid, columns=("use", "term", "tr", "origin", "count"), show="headings",
+                                             selectmode="extended")
+        for c, t, wd, anchor in (("use", "Dùng", 50, "center"), ("term", "Thuật ngữ", 300, "w"),
+                                 ("tr", "Bản dịch", 300, "w"), ("origin", "Nguồn", 140, "w"),
+                                 ("count", "Số lần", 70, "center")):
+            tree.heading(c, text=t)
+            tree.column(c, width=wd, anchor=anchor)
+        sb = tk.Scrollbar(mid, command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        tree.pack(side="left", fill="both", expand=True)
+        tree.tag_configure("off", foreground="#aaa")
+        tree.tag_configure("none", foreground="#8a6d00")
+        tree.bind("<Double-1>", lambda e: self._domain_edit())
+        btns = tk.Frame(w, bg=bg)
+        btns.pack(fill="x", padx=14, pady=(6, 4))
+        tk.Button(btns, text="＋ Thêm thuật ngữ", bg="#3a7bd5", fg="white", activebackground="#2f66b3",
+                  command=lambda: self._domain_edit(new=True), **style).pack(side="left")
+        tk.Button(btns, text="✏ Sửa bản dịch", bg="#eee", command=self._domain_edit, **style).pack(side="left", padx=4)
+        tk.Button(btns, text="✓/✗ Dùng / không dùng", bg="#eee", command=self._domain_toggle, **style).pack(side="left")
+        tk.Button(btns, text="🗑 Xoá", bg="#eee", command=self._domain_delete, **style).pack(side="left", padx=4)
+        tk.Button(btns, text="🤖 Gợi ý bản dịch còn thiếu (offline)", bg="#eee", command=self._domain_suggest,
+                  **style).pack(side="left")
+        tk.Button(btns, text="⬇ Xuất CSV", bg="#eee", command=self._domain_export, **style).pack(side="right")
+        self._dom_status = tk.Label(w, text="", font=(UI_FONT, 9), fg="#1a5fb4", bg=bg, anchor="w", justify="left",
+                                    wraplength=900)
+        self._dom_status.pack(fill="x", padx=14, pady=(0, 10))
+        self._refresh_domain_win()
+
+    def _refresh_domain_win(self):
+        w = getattr(self, "_dom_win", None)
+        if not (w and w.winfo_exists()):
+            return
+        docs = self._dom_docs
+        docs.delete(*docs.get_children())
+        for d in DOMAIN.docs:
+            docs.insert("", "end", iid=d["id"], text=d["name"],
+                        values=(lang_name(d["lang"]) if d["lang"] in LANGS else d["lang"], d["terms"], d["pairs"],
+                                d["added"]))
+        src, tgt = self.src_lang, self.tgt_lang
+        tree = self._dom_tree
+        tree.delete(*tree.get_children())
+        if src == AUTO:
+            self._dom_title.config(text="Chọn ngôn ngữ nghe cụ thể (không phải Tự nhận diện) để dùng bảng thuật ngữ.")
+            return
+        flt = self._dom_filter.get().strip().lower()
+        rows = DOMAIN.rows(src, tgt)
+        used = 0
+        self._dom_rows = {}
+        for i, (term, tr, origin, cnt, on) in enumerate(rows):
+            if flt and flt not in term.lower() and flt not in tr.lower():
+                continue
+            used += bool(on and tr)
+            label = {"tìm thấy": "tìm thấy (chưa dịch)", "gợi ý": "gợi ý — nên kiểm tra"}.get(origin, origin)
+            iid = f"r{i}"
+            self._dom_rows[iid] = (term, tr)
+            tree.insert("", "end", iid=iid, values=("✓" if on else "✗", term, tr, label, cnt or ""),
+                        tags=("off",) if not on else (("none",) if not tr else ()))
+        n_pairs = sum(1 for r in rows if r[4] and r[1])
+        self._dom_title.config(text=f"Thuật ngữ {lang_name(src)} → {lang_name(tgt)}: {n_pairs} cặp đang dùng, "
+                                    f"{sum(1 for r in rows if not r[1])} từ chuyên ngành chưa có bản dịch")
+
+    def _dom_say(self, text, color="#1a5fb4"):
+        w = getattr(self, "_dom_win", None)
+        if w and w.winfo_exists():
+            self._dom_status.config(text=text, fg=color)
+
+    def _domain_pick_files(self):
+        from tkinter import filedialog
+        paths = filedialog.askopenfilenames(
+            parent=self._dom_win, title="Chọn tài liệu chuyên ngành",
+            filetypes=[("Tài liệu", " ".join("*" + e for e in domain.SUPPORTED)), ("Tất cả", "*.*")])
+        if paths:
+            self.add_domain_files(list(paths))
+
+    def add_domain_files(self, paths):
+        """Read documents in the background (the offline translator helps pair terms in brackets)."""
+        self.busy("domain", "Đang đọc tài liệu chuyên ngành...")
+
+        def say(msg):
+            self.ui_q.put(("call", lambda: (self._dom_say(msg), self.busy("domain", msg))))
+
+        def work():
+            def translate(texts, sl, tl):
+                return self.translator._model(sl, tl).translate_many(texts, sl, tl)
+            if not any(STORE.have(p) for p in local_ai.MT_PACKS):
+                translate = None
+            done, failed = [], []
+            for p in paths:
+                try:
+                    done.append(DOMAIN.add_file(p, translate, progress=say))
+                except Exception as e:  # noqa: BLE001
+                    failed.append(f"{os.path.basename(p)}: {e}")
+
+            def finish():
+                self.done("domain")
+                self.apply_glossary()
+                self._refresh_domain_win()
+                msg = "; ".join(f"{d['name']}: {d['terms']} thuật ngữ, {d['pairs']} cặp dịch" for d in done)
+                if failed:
+                    msg = (msg + " — " if msg else "") + "Không đọc được: " + "; ".join(failed)
+                self._dom_say(("✓ " if done else "") + msg, "#27ae60" if not failed else "#c0392b")
+            self.ui_q.put(("call", finish))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _domain_remove_docs(self):
+        from tkinter import messagebox
+        ids = list(self._dom_docs.selection())
+        if not ids:
+            return
+        names = [d["name"] for d in DOMAIN.docs if d["id"] in ids]
+        if messagebox.askyesno("Xoá tài liệu", "Xoá khỏi app (cùng các thuật ngữ tìm thấy trong đó; thuật ngữ bạn tự "
+                                               "nhập vẫn giữ):\n\n" + "\n".join("• " + n for n in names),
+                               parent=self._dom_win):
+            for i in ids:
+                DOMAIN.remove_doc(i)
+            self.apply_glossary()
+            self._refresh_domain_win()
+
+    def _dom_selected(self):
+        return [self._dom_rows[i] for i in self._dom_tree.selection() if i in getattr(self, "_dom_rows", {})]
+
+    def _domain_edit(self, new=False):
+        """Small dialog: the term and its translation (empty translation = no translation)."""
+        sel = [] if new else self._dom_selected()
+        if not new and not sel:
+            return
+        term0, tr0 = sel[0] if sel else ("", "")
+        d = tk.Toplevel(self._dom_win)
+        d.title("Thuật ngữ")
+        d.transient(self._dom_win)
+        d.configure(bg="#faf9f5", padx=14, pady=12)
+        tk.Label(d, text=f"Thuật ngữ ({lang_name(self.src_lang)}):", bg="#faf9f5").grid(row=0, column=0, sticky="w")
+        e1 = tk.Entry(d, width=50, font=(UI_FONT, 11))
+        e1.insert(0, term0)
+        e1.grid(row=1, column=0, pady=(0, 8))
+        tk.Label(d, text=f"Bản dịch ({lang_name(self.tgt_lang)}):", bg="#faf9f5").grid(row=2, column=0, sticky="w")
+        e2 = tk.Entry(d, width=50, font=(UI_FONT, 11))
+        e2.insert(0, tr0)
+        e2.grid(row=3, column=0, pady=(0, 10))
+        (e2 if term0 else e1).focus_set()
+
+        def save(_=None):
+            t, tr = e1.get().strip(), e2.get().strip()
+            if not t:
+                return
+            if term0 and t.lower() != term0.lower():
+                DOMAIN.delete(term0, self.src_lang, self.tgt_lang)
+            if tr:
+                DOMAIN.set_pair(t, self.src_lang, tr, self.tgt_lang, "tự nhập")
+            else:
+                DOMAIN.set_pair(t, self.src_lang, "", self.tgt_lang)
+            d.destroy()
+            self.apply_glossary()
+            self._refresh_domain_win()
+        tk.Button(d, text="Lưu", command=save, bg="#27ae60", fg="white", relief="flat", padx=16).grid(row=4, column=0,
+                                                                                                    sticky="e")
+        d.bind("<Return>", save)
+        d.bind("<Escape>", lambda e: d.destroy())
+
+    def _domain_toggle(self):
+        for term, _ in self._dom_selected():
+            DOMAIN.toggle(term, self.src_lang, self.tgt_lang)
+        self.apply_glossary()
+        self._refresh_domain_win()
+
+    def _domain_delete(self):
+        sel = self._dom_selected()
+        for term, _ in sel:
+            DOMAIN.delete(term, self.src_lang, self.tgt_lang)
+        if sel:
+            self.apply_glossary()
+            self._refresh_domain_win()
+
+    def _domain_export(self):
+        import csv
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(parent=self._dom_win, defaultextension=".csv",
+                                            initialdir=output_dir(""), initialfile="thuat_ngu.csv",
+                                            filetypes=[("CSV", "*.csv")])
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            wr = csv.writer(f)
+            wr.writerow([lang_name(self.src_lang), lang_name(self.tgt_lang)])
+            for term, tr, origin, cnt, on in DOMAIN.rows(self.src_lang, self.tgt_lang):
+                if tr:
+                    wr.writerow([term, tr])
+        self._dom_say(f"✓ Đã lưu {path}", "#27ae60")
+
+    def _domain_suggest(self):
+        """Ask the local model (the Key takeaways model) for translations of the terms that have none. They
+        are marked "gợi ý" so the user can check them."""
+        src, tgt = self.src_lang, self.tgt_lang
+        if src in (AUTO, tgt):
+            return
+        if not STORE.have(self.summarizer.pack):
+            self._dom_say("Cần gói Key takeaways offline để gợi ý — bấm 📦 Gói ngôn ngữ để tải.", "#c0392b")
+            return
+        items = DOMAIN.missing_translation(src, tgt, limit=40)
+        if not items:
+            self._dom_say("Mọi thuật ngữ đang dùng đều đã có bản dịch.", "#27ae60")
+            return
+        examples = DOMAIN.pairs_for(src, tgt)[:8]
+        topic = ", ".join(d["name"] for d in DOMAIN.docs[:6])
+        self.busy("domain", "Đang gợi ý bản dịch thuật ngữ...")
+
+        def work():
+            got = 0
+            try:
+                llm = self.summarizer._model()
+                for i in range(0, len(items), 8):
+                    batch = items[i:i + 8]
+                    self.ui_q.put(("call", lambda i=i: self._dom_say(
+                        f"Đang gợi ý bản dịch... {i}/{len(items)} thuật ngữ")))
+                    for term, tr in domain.suggest(llm, batch, local_ai.LANG_NAMES_EN.get(src, src),
+                                                   local_ai.LANG_NAMES_EN.get(tgt, tgt), topic, examples).items():
+                        DOMAIN.set_pair(term, src, tr, tgt, origin="gợi ý")
+                        got += 1
+                msg, color = (f"✓ Đã gợi ý {got} bản dịch (đánh dấu “gợi ý — nên kiểm tra”; nhấp đúp để sửa).",
+                              "#27ae60")
+            except Exception as e:  # noqa: BLE001
+                msg, color = f"Không gợi ý được: {str(e)[:160]}", "#c0392b"
+
+            def finish():
+                self.done("domain")
+                self.apply_glossary()
+                self._refresh_domain_win()
+                self._dom_say(msg, color)
+            self.ui_q.put(("call", finish))
+        threading.Thread(target=work, daemon=True).start()
 
     def open_packs(self):
         """The 📦 window: every pack, whether it is on this PC, download / delete, open the folder."""
@@ -3266,8 +3703,8 @@ class MainWindow:
                 for i in ids:
                     unload_whisper(i)
                     STORE.remove(i)
-                if "nllb-600m" in ids:
-                    self.translator.mt = None
+                for i in ids:
+                    self.translator.mts.pop(i, None)
                 if self.summarizer.llm_pack in ids:
                     self.summarizer.llm, self.summarizer.llm_pack = None, None
                 self.recognizer.loaded = None
@@ -3365,6 +3802,7 @@ class MainWindow:
                     self.translator.draft(*val, lang)    # translate right away, don't wait for Whisper
                 elif kind == "final":
                     ids, text, lang = val
+                    ids, text = self._join_sentence(ids, text, lang)
                     self._finalize(ids, text)
                     self.translator.final(ids, text, lang)   # re-translates only if the words changed
                 elif kind == "flush":
@@ -3413,7 +3851,7 @@ class MainWindow:
                     self._quality_back()
                     self.status.config(text=val, fg="#ffd479")
                 elif kind == "need_packs":          # a model this choice needs is not on this PC yet
-                    if self.on or val == "nllb-600m":
+                    if self.on or val in local_ai.MT_PACKS:
                         self.ensure_packs(start=self.on or self._start_after_packs)
                     else:
                         self.status.config(text="Chưa có gói ngôn ngữ cho lựa chọn này — bấm 📦 Gói ngôn ngữ "
@@ -3448,17 +3886,25 @@ def selftest():
                      f"ant: {find_ant()}\npdf: {__import__('importlib').util.find_spec('pymupdf') is not None}\n"
                      f"packs folder: {STORE.dir}\n"
                      f"packs here: {', '.join(p for p in local_ai.PACKS if STORE.have(p)) or '(none)'}")
-        if STORE.have("nllb-600m"):
+        tests = {"envit5": (("en", "vi", "Today we will talk about how neural networks learn from data."),
+                            ("vi", "en", "Hôm nay chúng ta sẽ nói về cách mạng nơ-ron học từ dữ liệu.")),
+                 "nllb-600m": (("en", "vi", "Today we will talk about how neural networks learn from data."),
+                               ("en", "ja", "The meeting starts at nine. Please bring your laptop."),
+                               ("zh", "vi", "我们今天讨论机器学习。"))}
+        for pid, cases in tests.items():
+            if not STORE.have(pid):
+                continue
             t = time.time()
-            mt = local_ai.NLLB(STORE.path("nllb-600m"), threads=4)
-            lines.append(f"translation model loaded in {time.time() - t:.1f}s")
-            for src, tgt, text in (("en", "vi", "Today we will talk about how neural networks learn from data."),
-                                   ("vi", "en", "Hôm nay chúng ta sẽ nói về cách mạng nơ-ron học từ dữ liệu."),
-                                   ("en", "ja", "The meeting starts at nine. Please bring your laptop."),
-                                   ("zh", "vi", "我们今天讨论机器学习。")):
+            mt = (local_ai.EnViT5 if pid == "envit5" else local_ai.NLLB)(STORE.path(pid), threads=4)
+            lines.append(f"translation model {pid} loaded in {time.time() - t:.1f}s")
+            gl = domain.TermMatcher([("neural network", "mạng thần kinh nhân tạo")], "en")
+            for src, tgt, text in cases:
                 t = time.time()
                 out = mt.translate(text, src, tgt)
                 lines.append(f"translate {src}->{tgt} ({time.time() - t:.2f}s): {out}")
+            out = mt.translate(cases[0][2], "en", "vi", matcher=gl)
+            lines.append(f"glossary 'neural network'='mạng thần kinh nhân tạo': "
+                         f"{'OK' if 'mạng thần kinh nhân tạo' in out else 'MISSING'} — {out}")
         for pid in local_ai.LLM_PACKS:
             if STORE.have(pid):
                 t = time.time()

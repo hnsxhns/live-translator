@@ -7,7 +7,7 @@ them by copying that folder from another PC (the 📦 Gói ngôn ngữ window op
 Engines (all through ctranslate2, already used by Whisper - no PyTorch, no internet, no public LLM):
   speech      Vosk (live words) + Whisper (accurate text); English models are bundled in the .exe;
               Vietnamese: Zipformer (k2-fsa, through sherpa-onnx) - 15x faster than Whisper small, as accurate
-  translate   NLLB-200 distilled 600M (int8): one model for every language pair
+  translate   EnViT5 (int8) for English <-> Vietnamese; NLLB-200 distilled 600M (int8) for every other pair
   takeaways   Qwen2.5 Instruct 1.5B (int8) - or 3B for better notes on a strong PC
 """
 import json
@@ -86,6 +86,9 @@ def _add(p):
 
 _add(Pack("nllb-600m", "Dịch offline — NLLB-200 (mọi cặp ngôn ngữ)", 630, "JustFrederik/nllb-200-distilled-600M-ct2-int8",
           ["config.json", "shared_vocabulary.txt", "tokenizer.json", "model.bin"], group="Dịch"))
+_add(Pack("envit5", "Dịch Anh ↔ Việt — EnViT5 (hay hơn và nhanh gấp 3 lần NLLB)", 280,
+          "luigi000/envit5-translation-ct2-int8",
+          ["config.json", "shared_vocabulary.json", "spiece.model", "model.bin"], group="Dịch"))
 _add(Pack("qwen2.5-1.5b", "Key takeaways offline — Qwen2.5 1.5B (nhanh)", 1560, "jncraton/Qwen2.5-1.5B-Instruct-ct2-int8",
           ["config.json", "vocabulary.json", "tokenizer.json", "tokenizer_config.json", "model.bin"], group="Ý chính"))
 _add(Pack("qwen2.5-3b", "Key takeaways offline — Qwen2.5 3B (hay hơn, cần máy mạnh)", 3100,
@@ -112,6 +115,23 @@ for _c, _s in VOSK_SIZES.items():
     PACKS[f"vosk-{_c}"].size_mb = _s
 
 LLM_PACKS = ["qwen2.5-1.5b", "qwen2.5-3b"]
+MT_PACKS = ["envit5", "nllb-600m"]           # translation models, the better one for a pair first
+EN_VI = {"en", "vi"}
+
+
+def mt_packs(src, tgt):
+    """Translation packs a choice needs: English <-> Vietnamese has its own model (EnViT5); every other pair,
+    and speech in any language ("auto"), uses NLLB-200."""
+    if {src, tgt} == EN_VI:
+        return ["envit5"]
+    return (["envit5"] if src == AUTO and tgt in EN_VI else []) + ["nllb-600m"]
+
+
+def mt_pack_for(src, tgt, have):
+    """Which installed translation pack to use for src -> tgt (have(pid) -> bool), else None."""
+    if {src, tgt} == EN_VI and have("envit5"):
+        return "envit5"
+    return "nllb-600m" if have("nllb-600m") else None
 BUNDLED = {"base.en", "vosk-en-small", "spk-onnx"}      # inside the .exe
 
 
@@ -156,7 +176,7 @@ class Store:
             if src != AUTO and f"vosk-{src}" in PACKS:
                 out.append(f"vosk-{src}")
         if src != tgt:
-            out.append("nllb-600m")
+            out.extend(mt_packs(src, tgt))
         if takeaways:
             out.append(takeaways)
         return [p for p in out if p]
@@ -372,43 +392,106 @@ class FastASR:
 # ---------------------------------------------------------------------------------------------------------
 # Local translation: NLLB-200 through ctranslate2
 # ---------------------------------------------------------------------------------------------------------
-class NLLB:
-    MAX_TOKENS = 200                 # NLLB was trained on sentences: longer input is split first
+class CT2MT:
+    """A translation model run by CTranslate2 on this PC. Subclasses say how text becomes tokens (encode),
+    tokens become text (decode) and which language pairs they know (supports)."""
+    MAX_TOKENS = 200                 # trained on sentences: longer input is split first
+    beam = 2
 
     def __init__(self, path, threads=4):
         import ctranslate2
-        from tokenizers import Tokenizer
-        self.tok = Tokenizer.from_file(os.path.join(path, "tokenizer.json"))
         self.model = ctranslate2.Translator(path, device="cpu", compute_type="int8", inter_threads=1,
                                             intra_threads=threads)
         self.lock = threading.Lock()
 
-    def _pieces(self, text):
-        return self.tok.encode(text, add_special_tokens=False).tokens
+    # ---- what a subclass provides
+    def supports(self, src, tgt):
+        return src in LANGS and tgt in LANGS
 
-    def translate(self, text, src, tgt, sentences=None):
+    def encode(self, text, src, tgt):
+        """(source tokens, target prefix tokens)"""
+        raise NotImplementedError
+
+    def decode(self, tokens):
+        raise NotImplementedError
+
+    def skip(self, token):
+        return token == "</s>" or (token.startswith("<") and token.endswith(">"))
+
+    # ---- shared
+    def _run(self, texts, src, tgt, max_len=256):
+        enc = [self.encode(t, src, tgt) for t in texts]
+        with self.lock:
+            res = self.model.translate_batch([e[0] for e in enc], target_prefix=[e[1] or None for e in enc],
+                                             beam_size=self.beam, max_decoding_length=max_len,
+                                             repetition_penalty=1.1, no_repeat_ngram_size=4, max_batch_size=16)
+        out = []
+        for (_, prefix), r in zip(enc, res):
+            toks = r.hypotheses[0][len(prefix):] if prefix and r.hypotheses[0][:len(prefix)] == prefix else \
+                r.hypotheses[0]
+            out.append(self.decode([t for t in toks if not self.skip(t)]).strip())
+        return out
+
+    def translate(self, text, src, tgt, sentences=None, matcher=None):
         """Translate `text` (a segment of speech) from language code src into tgt. Long segments are cut into
-        sentences, translated together in one batch, and joined again."""
+        sentences, translated together in one batch, and joined again. matcher (domain.TermMatcher): glossary
+        terms are kept out of the model's hands (placeholders) and put back translated as the glossary says."""
         text = text.strip()
         if not text or src == tgt:
             return text
-        s_code, t_code = LANGS[src][2], LANGS[tgt][2]
+        if matcher:
+            return self._translate_terms(text, src, tgt, matcher)
         parts = sentences or split_for_mt(text, src)
-        batch = []
-        for p in parts:
-            toks = self._pieces(p)[: self.MAX_TOKENS]
-            batch.append([s_code] + toks + ["</s>"])
-        with self.lock:
-            res = self.model.translate_batch(batch, target_prefix=[[t_code]] * len(batch), beam_size=2,
-                                             max_decoding_length=256, repetition_penalty=1.1,
-                                             no_repeat_ngram_size=4)
-        out = []
-        for r in res:
-            toks = [t for t in r.hypotheses[0] if t != t_code and t != "</s>"]
-            out.append(self.tok.decoder.decode(toks).strip() if self.tok.decoder else
-                       "".join(toks).replace("▁", " ").strip())
         joiner = "" if tgt in NO_SPACES else " "
-        return joiner.join(o for o in out if o)
+        return joiner.join(o for o in self._run(parts, src, tgt) if o)
+
+    def translate_many(self, texts, src, tgt):
+        """Short texts (terms) translated in one batch: [translation per text]."""
+        if not texts or src == tgt:
+            return list(texts)
+        return self._run(list(texts), src, tgt, max_len=64)
+
+    def _translate_terms(self, text, src, tgt, matcher):
+        import domain
+        parts = split_for_mt(text, src)
+        masked = [matcher.mask(p) for p in parts]
+        raws = self._run([m for m, _, _ in masked], src, tgt)
+        outs = []
+        for (m, vals, switched), raw in zip(masked, raws):
+            if not vals:
+                outs.append(raw)
+                continue
+            fixed, ok = domain.unmask(raw, vals)
+            # the model lost or doubled a placeholder: translate the sentence with the terms already in place
+            outs.append(fixed if ok else self._run([switched], src, tgt)[0])
+        joiner = "" if tgt in NO_SPACES else " "
+        return joiner.join(o for o in outs if o)
+
+    def stream_terms(self, text, src, tgt, on_piece, matcher):
+        """stream() with the glossary (see translate). Returns (full text, ok): ok False = a sentence had to be
+        translated again after it was streamed, so the caller replaces what was shown with the full text."""
+        import domain
+        space = "" if tgt in NO_SPACES else " "
+        full, all_ok = [], True
+        for p in split_for_mt(text.strip(), src):
+            m, vals, switched = matcher.mask(p)
+            lead = [bool(full)]
+
+            def emit(piece):
+                if lead[0] and piece.strip():
+                    piece = space + piece.lstrip()
+                    lead[0] = False
+                on_piece(piece)
+            if not vals:
+                full.append(self.stream(m, src, tgt, emit))
+                continue
+            um = domain.StreamUnmasker(vals, emit)
+            self.stream(m, src, tgt, um.feed)
+            out, ok = um.close()
+            if not ok:
+                out, all_ok = self._run([switched], src, tgt)[0], False
+            full.append(out)
+        return space.join(o for o in full if o).strip(), all_ok
 
     def stream(self, text, src, tgt, on_piece):
         """Like translate(), but each word is handed to on_piece(text) as soon as it is decoded (the first
@@ -417,17 +500,20 @@ class NLLB:
         if not text or src == tgt:
             on_piece(text)
             return text
-        s_code, t_code = LANGS[src][2], LANGS[tgt][2]
         space = "" if tgt in NO_SPACES else " "
         full = ""
         with self.lock:
             for p in split_for_mt(text, src):
-                toks = [s_code] + self._pieces(p)[: self.MAX_TOKENS] + ["</s>"]
-                first = True
-                for step in self.model.generate_tokens(toks, target_prefix=[t_code], max_decoding_length=256,
+                toks, prefix = self.encode(p, src, tgt)
+                first, n = True, 0
+                for step in self.model.generate_tokens(toks, target_prefix=prefix or None, max_decoding_length=256,
                                                        repetition_penalty=1.1, no_repeat_ngram_size=4):
                     t = step.token
-                    if t in (t_code, "</s>") or (t.startswith("<") and t.endswith(">")):
+                    if n < len(prefix) and t == prefix[n]:          # the forced start (language tag, "vi:")
+                        n += 1
+                        continue
+                    n = len(prefix)
+                    if self.skip(t):
                         continue
                     piece = t.replace("▁", space)
                     if first:
@@ -439,6 +525,44 @@ class NLLB:
                         full += piece
                         on_piece(piece)
         return full.strip()
+
+
+class NLLB(CT2MT):
+    """NLLB-200 (Meta): one model for every pair of the app's languages."""
+
+    def __init__(self, path, threads=4):
+        super().__init__(path, threads)
+        from tokenizers import Tokenizer
+        self.tok = Tokenizer.from_file(os.path.join(path, "tokenizer.json"))
+
+    def _pieces(self, text):
+        return self.tok.encode(text, add_special_tokens=False).tokens
+
+    def encode(self, text, src, tgt):
+        return [LANGS[src][2]] + self._pieces(text)[: self.MAX_TOKENS] + ["</s>"], [LANGS[tgt][2]]
+
+    def decode(self, tokens):
+        return self.tok.decoder.decode(tokens) if self.tok.decoder else "".join(tokens).replace("▁", " ")
+
+
+class EnViT5(CT2MT):
+    """EnViT5 (VietAI): English <-> Vietnamese only, trained on far more English-Vietnamese text than NLLB.
+    Input "en: <text>" -> output "vi: <text>" (and the other way round)."""
+
+    def __init__(self, path, threads=4):
+        super().__init__(path, threads)
+        import sentencepiece as spm
+        self.sp = spm.SentencePieceProcessor(model_file=os.path.join(path, "spiece.model"))
+        self.prefix = {lang: self.sp.encode(f"{lang}:", out_type=str) for lang in ("en", "vi")}
+
+    def supports(self, src, tgt):
+        return {src, tgt} == {"en", "vi"}
+
+    def encode(self, text, src, tgt):
+        return self.sp.encode(f"{src}: {text}", out_type=str)[: self.MAX_TOKENS] + ["</s>"], self.prefix[tgt]
+
+    def decode(self, tokens):
+        return re.sub(r"^\s*(vi|en)\s*:\s*", "", self.sp.decode(tokens))
 
 
 _MT_SPLIT = re.compile(r"(?<=[.!?…。！？])\s*")
@@ -469,7 +593,9 @@ class LocalLLM:
         self.model = ctranslate2.Generator(path, device="cpu", compute_type="int8", intra_threads=threads)
         self.lock = threading.Lock()
 
-    def chat(self, system, user, max_new=400, temperature=0.0):
+    def chat(self, system, user, max_new=400, temperature=0.0, yield_to=None):
+        """yield_to() -> True while something more urgent needs the CPU (live translation): writing pauses
+        between words until it is False again (at most 30 s in all, so takeaways still come)."""
         prompt = (f"<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n"
                   f"<|im_start|>assistant\n")
         toks = self.tok.encode(prompt, add_special_tokens=False).tokens
@@ -477,6 +603,15 @@ class LocalLLM:
                   repetition_penalty=1.08, no_repeat_ngram_size=6)
         if temperature > 0:
             kw.update(sampling_temperature=temperature, sampling_topk=20)
+        if yield_to:
+            waited = [0.0]
+
+            def step(_):
+                while yield_to() and waited[0] < 30:
+                    time.sleep(0.05)
+                    waited[0] += 0.05
+                return False
+            kw["callback"] = step
         with self.lock:
             res = self.model.generate_batch([toks], **kw)
         return self.tok.decode(res[0].sequences_ids[0], skip_special_tokens=True).strip()

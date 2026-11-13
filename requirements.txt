@@ -2,6 +2,7 @@ anthropic
 faster-whisper
 ctranslate2==4.6.0
 tokenizers
+sentencepiece
 setuptools<81
 vosk
 sounddevice
