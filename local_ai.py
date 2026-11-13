@@ -126,10 +126,14 @@ class Store:
 
     def path(self, pid):
         """Folder of an installed pack (or bundled model), else None."""
-        check = PACKS[pid].check if pid in PACKS else ""
+        pack = PACKS.get(pid)
+        check = pack.check if pack else ""
+        # a cut download leaves a model file much smaller than the real one: that pack is not installed
+        min_bytes = int(pack.size_mb * 0.8e6) if pack and pack.repo and check == "model.bin" else 0
         for r in self.roots:
             p = os.path.join(r, pid)
-            if os.path.isdir(p) and (not check or os.path.exists(os.path.join(p, check))):
+            f = os.path.join(p, check) if check else ""
+            if os.path.isdir(p) and (not check or (os.path.exists(f) and os.path.getsize(f) >= min_bytes)):
                 return p
         return None
 
@@ -184,6 +188,12 @@ class Store:
                 done += sizes[f]
                 continue
             done = self._fetch(HF.format(repo=p.repo, file=f), final, done, total, progress, cancel)
+        for f in p.files:                          # every file whole, or the pack is not finished
+            final = os.path.join(dst, f)
+            if sizes[f] and os.path.getsize(final) != sizes[f]:
+                os.remove(final)
+                raise OSError(f"tải {f} chưa đủ ({os.path.getsize(final) if os.path.exists(final) else 0} / "
+                              f"{sizes[f]} byte), hãy tải lại")
         progress(total, total)
         return dst
 
@@ -211,6 +221,13 @@ class Store:
         with urllib.request.urlopen(req, timeout=60) as r:
             if have and r.status != 206:             # server ignored the range: start over
                 have = 0
+            # the whole file's size: the server may close the connection early without an error
+            whole = 0
+            rng = r.headers.get("Content-Range") or ""
+            if "/" in rng and rng.rsplit("/", 1)[1].strip().isdigit():
+                whole = int(rng.rsplit("/", 1)[1])
+            elif r.headers.get("Content-Length"):
+                whole = have + int(r.headers["Content-Length"])
             done += have
             with open(part, "ab" if have else "wb") as out:
                 while True:
@@ -222,6 +239,8 @@ class Store:
                     out.write(chunk)
                     done += len(chunk)
                     progress(done, total)
+        if whole and os.path.getsize(part) < whole:          # cut short: the retry resumes from here
+            raise OSError(f"connection closed at {os.path.getsize(part)} of {whole} bytes")
         os.replace(part, final)
         return done
 

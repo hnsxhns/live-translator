@@ -37,7 +37,7 @@ from local_ai import AUTO, LANGS, lang_name
 
 # ---------------- Settings ----------------
 APP_NAME = "LiveTranslatorML"     # multilingual offline edition (own data folder, own build name)
-APP_VERSION = "2.0.0"             # shown in the title bar and used in the portable build's name
+APP_VERSION = "2.0.1"             # shown in the title bar and used in the portable build's name
 MODEL = os.environ.get("TRANSLATE_MODEL", "claude-opus-5-5")
 # The login client waits at most 20 s for data. Chat sends whole documents, and Claude can read/think longer than that before the first word: give them more time.
 LONG_TIMEOUT = anthropic.Timeout(300.0, connect=15.0)
