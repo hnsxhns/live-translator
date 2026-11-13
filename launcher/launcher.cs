@@ -14,14 +14,15 @@ using System.Windows.Forms;
 static class Launcher
 {
     const string Version = "__VERSION__";
+    const string AppName = "__APPNAME__";
     const string Magic = "LTPAYLD1";
 
     [STAThread]
     static void Main(string[] args)
     {
-        string name = "LiveTranslator_v" + Version;
+        string name = AppName + "_v" + Version;
         string root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                                   "LiveTranslator", "v" + Version);
+                                   AppName, "v" + Version);
         string exe = Path.Combine(root, name, name + ".exe");
         string done = Path.Combine(root, ".complete");
         string argLine = string.Join(" ", Array.ConvertAll(args, a => "\"" + a + "\""));
@@ -77,7 +78,7 @@ static class Launcher
     static void Extract(string root, string done)
     {
         string self = Process.GetCurrentProcess().MainModule.FileName;
-        string tmpZip = Path.Combine(Path.GetTempPath(), "LiveTranslator_" + Version + "_" + Guid.NewGuid().ToString("N") + ".zip");
+        string tmpZip = Path.Combine(Path.GetTempPath(), AppName + "_" + Version + "_" + Guid.NewGuid().ToString("N") + ".zip");
         string staging = root + ".partial";
         try
         {

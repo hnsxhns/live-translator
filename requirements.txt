@@ -1,6 +1,7 @@
 anthropic
 faster-whisper
 ctranslate2==4.6.0
+tokenizers
 setuptools<81
 vosk
 sounddevice
@@ -8,6 +9,3 @@ numpy
 sherpa-onnx
 pymupdf
 pillow
-pyyaml
-pywebview
-zxing-cpp

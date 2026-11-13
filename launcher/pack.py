@@ -1,9 +1,9 @@
 """Make the single-file portable exe: launcher + appended zip of the built app folder.
 
-usage: python launcher/pack.py <version>
-input : dist/LiveTranslator_v<version>/      (PyInstaller output)
-output: dist/LiveTranslator_v<version>.exe   (one file, double-click to run)
-        dist/LiveTranslator_v<version>.zip   (same app as a plain zip)
+usage: python launcher/pack.py <version> [app name, default LiveTranslator]
+input : dist/<name>_v<version>/      (PyInstaller output)
+output: dist/<name>_v<version>.exe   (one file, double-click to run)
+        dist/<name>_v<version>.zip   (same app as a plain zip)
 """
 import os
 import struct
@@ -12,8 +12,9 @@ import sys
 import zipfile
 
 ver = sys.argv[1]
+app_name = sys.argv[2] if len(sys.argv) > 2 else "LiveTranslator"
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-name = f"LiveTranslator_v{ver}"
+name = f"{app_name}_v{ver}"
 app_dir = os.path.join(root, "dist", name)
 out_zip = os.path.join(root, "dist", name + ".zip")
 out_exe = os.path.join(root, "dist", name + ".exe")
@@ -30,7 +31,7 @@ with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
 print("zip:", out_zip, os.path.getsize(out_zip) // 2**20, "MB")
 
 # 2) compile the launcher with the version baked in (C# compiler ships with Windows)
-src = open(os.path.join(root, "launcher", "launcher.cs"), encoding="utf-8").read().replace("__VERSION__", ver)
+src = open(os.path.join(root, "launcher", "launcher.cs"), encoding="utf-8").read().replace("__VERSION__", ver).replace("__APPNAME__", app_name)
 gen = os.path.join(root, "build", "launcher_gen.cs")
 os.makedirs(os.path.dirname(gen), exist_ok=True)
 open(gen, "w", encoding="utf-8").write(src)
